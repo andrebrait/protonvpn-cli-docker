@@ -165,11 +165,8 @@ class OpenModeTest(WebuiCase):
             by_env["SERVER"],
             {"env": "SERVER", "value": "NL#914", "locked": False, "source": "file", "kind": "text"},
         )
-        self.assertEqual(
-            (by_env["KILL_SWITCH"]["value"], by_env["KILL_SWITCH"]["source"]), ("standard", "default")
-        )
         self.assertEqual(by_env["P2P"]["kind"], "bool")
-        self.assertEqual(len(state["settings"]), 14)
+        self.assertNotIn("KILL_SWITCH", by_env)
 
     def test_warning_logged_at_startup(self):
         self.assertIn(WARNING, self.out.getvalue().splitlines())
@@ -388,10 +385,10 @@ class SettingsTest(WebuiCase):
         self.assertEqual((status, body), (422, {"error": "Error: invalid choice"}))
 
     def test_locked_setting_409(self):
-        self.environ["KILL_SWITCH"] = "off"
-        status, body, _ = self.post("/api/v1/settings", {"env": "KILL_SWITCH", "value": "standard"})
+        self.environ["NETSHIELD"] = "off"
+        status, body, _ = self.post("/api/v1/settings", {"env": "NETSHIELD", "value": "malware-only"})
         self.assertEqual(status, 409)
-        self.assertIn("KILL_SWITCH", body["error"])
+        self.assertIn("NETSHIELD", body["error"])
         self.assertEqual(self.sup.calls, [])
 
     def test_unsaveable_store_is_500(self):
@@ -408,7 +405,7 @@ class SettingsTest(WebuiCase):
             {"env": "CITY", "value": " -x"},
             {"env": "CITY", "value": "line\nbreak"},
             {"env": "NETSHIELD", "value": "bogus"},
-            {"env": "KILL_SWITCH", "value": "on"},
+            {"env": "KILL_SWITCH", "value": "off"},  # protection is not a public setting
             {"env": "P2P", "value": "maybe"},
             {"env": "NOPE", "value": "x"},
             {"env": "SERVER", "value": 5},

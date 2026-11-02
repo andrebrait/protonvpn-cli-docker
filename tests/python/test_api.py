@@ -92,12 +92,12 @@ class ApiTest(WebuiCase):
         self.assertEqual(self.api("GET", "/api/v1/traffic")[1], {"rx_bytes": 0, "tx_bytes": 0, "samples": []})
 
     def test_error_shape_at_http_boundary(self):
-        self.environ["KILL_SWITCH"] = "off"
+        self.environ["NETSHIELD"] = "off"
         cases = [
             ("GET", "/api/v1/status", None, "wrong", 401),
             ("GET", "/api/v1/missing", None, None, 404),
             ("POST", "/api/v1/settings", {}, None, 400),
-            ("POST", "/api/v1/settings", {"env": "KILL_SWITCH", "value": "standard"}, None, 409),
+            ("POST", "/api/v1/settings", {"env": "NETSHIELD", "value": "malware-only"}, None, 409),
         ]
         for method, path, payload, token, expected in cases:
             resp, data = self.api(method, path, payload, token=token)

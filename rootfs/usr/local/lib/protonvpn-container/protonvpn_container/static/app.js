@@ -13,7 +13,7 @@
     { title: "Connection target", envs: ["SERVER", "COUNTRY", "CITY", "P2P", "SECURE_CORE", "TOR"] },
     {
       title: "Preferences",
-      envs: ["NETSHIELD", "PORT_FORWARDING", "VPN_ACCELERATOR", "MODERATE_NAT", "IPV6", "CUSTOM_DNS", "KILL_SWITCH", "ANONYMOUS_CRASH_REPORTS"],
+      envs: ["NETSHIELD", "PORT_FORWARDING", "VPN_ACCELERATOR", "MODERATE_NAT", "IPV6", "CUSTOM_DNS", "ANONYMOUS_CRASH_REPORTS"],
     },
   ];
   const FIELDS = {
@@ -29,8 +29,13 @@
     MODERATE_NAT: { label: "Moderate NAT" },
     IPV6: { label: "IPv6" },
     CUSTOM_DNS: { label: "Custom DNS", placeholder: "on --dns 1.1.1.1,8.8.8.8", hint: "Or off." },
-    KILL_SWITCH: { label: "Kill switch", hint: "Changes only while disconnected." },
     ANONYMOUS_CRASH_REPORTS: { label: "Anonymous crash reports" },
+  };
+  const CHOICE_LABELS = {
+    off: "Off",
+    on: "On",
+    "malware-only": "Malware only",
+    "malware-ads-trackers": "Malware, ads & trackers",
   };
 
   const fields = {}; // env -> { setting, input, note, dirty, result }
@@ -274,7 +279,7 @@
       if (setting.kind === "choice") {
         input = el("select");
         for (const value of ["", ...setting.choices]) {
-          const option = el("option", value || "Default");
+          const option = el("option", CHOICE_LABELS[value] || value || "Default");
           option.value = value;
           input.append(option);
         }

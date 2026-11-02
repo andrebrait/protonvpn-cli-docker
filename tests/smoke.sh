@@ -84,11 +84,28 @@ reboot() {
   wait_ready "$1"
 }
 
-# What a connection leaves behind: NM's resolver file with the tunnel's DNS, copied over resolv.conf by the real dispatcher.
+# resolver_is <container> <nameserver lines>: what resolv.conf, the file the resolver reads, currently names.
+resolver_is() { [ "$(docker exec "$1" grep '^nameserver' /etc/resolv.conf)" = "$2" ]; }
+# What a connection leaves behind: NM's resolver file with the tunnel's DNS, copied over resolv.conf by NM's real dispatcher
+# (D-Bus activated, no systemd). The profile never autoconnects, so a restarted NM does not bring it back.
 tunnel_dns_populated() {
-  docker exec "$C" sh -c 'echo "nameserver 10.2.0.1" > /run/NetworkManager/resolv.conf &&
-    /etc/NetworkManager/dispatcher.d/50-resolv proton0 dns-change' || return 1
-  [ "$(docker exec "$C" grep '^nameserver' /etc/resolv.conf)" = "nameserver 10.2.0.1" ]
+  docker exec "$C" nmcli con add type dummy ifname smoketun0 con-name smoketun connection.autoconnect no \
+    ipv4.method manual ipv4.addresses 10.250.3.1/32 ipv4.dns 10.2.0.1 ipv6.method disabled >/dev/null || return 1
+  docker exec "$C" nmcli con up smoketun >/dev/null || return 1
+  eventually 10 resolver_is "$C" "nameserver 10.2.0.1"
+}
+# A managed connection's DNS reaches resolv.conf through NM's real dispatcher, and Docker's resolver returns when it goes down.
+managed_dns_follows_connection() {
+  orig=$(docker exec "$C" grep '^nameserver' /run/protonvpn-container/resolv.conf.docker) || return 1
+  [ -n "$orig" ] || return 1
+  docker exec "$C" nmcli con add type dummy ifname smokedns0 con-name smokedns connection.permissions user:root \
+    ipv4.method manual ipv4.addresses 10.250.2.1/32 ipv4.dns 10.99.0.53 ipv6.method disabled >/dev/null || return 1
+  ok=0
+  eventually 10 resolver_is "$C" "nameserver 10.99.0.53" || ok=1
+  docker exec "$C" nmcli con down smokedns >/dev/null || ok=1
+  eventually 10 resolver_is "$C" "$orig" || ok=1
+  docker exec "$C" nmcli con delete smokedns >/dev/null 2>&1
+  return "$ok"
 }
 docker_resolver_restored() {
   saved=$(docker exec "$C" grep '^nameserver' /run/protonvpn-container/resolv.conf.docker) || return 1
@@ -144,6 +161,87 @@ bad_lan_fails_closed() {
   [ "$(docker inspect -f '{{.State.Running}}' "t5b-$$-bad")" = false ] || return 1
   [ "$(docker inspect -f '{{.State.ExitCode}}' "t5b-$$-bad")" -ne 0 ] || return 1
   docker logs "t5b-$$-bad" 2>&1 | grep -qF '[firewall]'
+}
+
+# Connected tunnel helpers. NM's WireGuard policy sends every flow without the tunnel's fwmark into the tunnel,
+# the WebUI's replies and LAN_NETWORKS flows included.
+# wg_up <container>: a real NM WireGuard profile (dummy endpoint, no handshake needed) installs the same policy rules as Proton's.
+# Named wgsim0, so the filter's "-o proton0" accept does not cover it.
+wg_up() {
+  docker exec -i "$1" sh -s <<'EOF'
+key=$(wg genkey); pub=$(echo "$key" | wg pubkey)
+f=/run/NetworkManager/system-connections/wgsim.nmconnection
+cat > "$f" <<KF
+[connection]
+id=wgsim
+uuid=0c3d1b8e-6f0a-4a4e-9d2f-5b7f6a1c2e11
+type=wireguard
+interface-name=wgsim0
+autoconnect=false
+
+[wireguard]
+private-key=$key
+
+[wireguard-peer.$pub]
+endpoint=192.0.2.1:51820
+allowed-ips=0.0.0.0/0;::/0;
+
+[ipv4]
+method=manual
+address1=10.99.1.2/32
+
+[ipv6]
+method=manual
+address1=fd99::2/128
+KF
+chmod 600 "$f" && nmcli con load "$f" && nmcli con up wgsim
+EOF
+}
+# tunnel_policy_setup: $GW becomes the default gateway of $HOLD's namespace and owns 10.55.0.9, 10.56.0.9, fd55::9 and fd56::9 (on lo):
+# reachable only through that default route, which the policy suppresses while the tunnel is up. $POL's LAN_NETWORKS are 10.55.0.0/24 and fd55::/64.
+tunnel_policy_setup() {
+  gw4=$(docker inspect -f "{{(index .NetworkSettings.Networks \"t5b-$$-v6\").IPAddress}}" "$GW") &&
+    gw6=$(docker inspect -f "{{(index .NetworkSettings.Networks \"t5b-$$-v6\").GlobalIPv6Address}}" "$GW") &&
+    docker exec "$GW" sh -c 'ip addr add 10.55.0.9/32 dev lo && ip addr add 10.56.0.9/32 dev lo &&
+      ip -6 addr add fd55::9/128 dev lo && ip -6 addr add fd56::9/128 dev lo' &&
+    docker exec "$HOLD" sh -c "ip route replace default via $gw4 dev eth0 && ip -6 route replace default via $gw6 dev eth0 metric 1024"
+}
+# ks_up <container>: a stand-in for Proton's kill-switch interface, which NM keeps up with its own default routes in the main table
+# (live: IPv6 metric 95, against Docker's 1024 on eth0), so a lookup in the main table picks it over eth0.
+ks_up() {
+  docker exec "$1" nmcli con add type dummy ifname pvpnksintrf0 con-name pvpn-ks \
+    ipv4.method manual ipv4.addresses 100.85.0.1/24 ipv4.gateway 100.85.0.2 ipv4.route-metric 98 \
+    ipv6.method manual ipv6.addresses fdeb:446c:912d:8da::2/64 ipv6.gateway fdeb:446c:912d:8da::1 ipv6.route-metric 95 >/dev/null
+}
+# ks_defaults_in_main <container>: both families' main tables carry the kill-switch default, so the scenario really is the live one.
+ks_defaults_in_main() {
+  docker exec "$1" ip -4 route show default | grep -q pvpnksintrf0 && docker exec "$1" ip -6 route show default | grep -q pvpnksintrf0
+}
+# route_dev <container> <dev> <ip args...>: the kernel's route for that flow ("<dst> [via <gw>] dev <dev> ...") leaves through <dev>.
+route_dev() {
+  c=$1 dev=$2; shift 2
+  [ "$(docker exec "$c" ip "$@" | sed -n '1s/.* dev \([^ ]*\).*/\1/p')" = "$dev" ]
+}
+# tcp_from_addr <container> <source address> <host> <port>: connect as a client behind the gateway.
+tcp_from_addr() {
+  docker exec "$1" python3 -c 'import socket, sys
+s = socket.socket(socket.AF_INET); s.bind((sys.argv[1], 0)); s.settimeout(5); s.connect((sys.argv[2], int(sys.argv[3])))' "$2" "$3" "$4"
+}
+# policy_rules_once <container>: the WebUI and LAN_NETWORKS rules exist exactly once per family.
+policy_rules_once() {
+  r4=$(docker exec "$1" ip -4 rule show) && r6=$(docker exec "$1" ip -6 rule show) || return 1
+  [ "$(echo "$r4" | grep -c 'sport 8788 lookup [0-9]')" = 1 ] && [ "$(echo "$r4" | grep -c 'to 10.55.0.0/24 lookup [0-9]')" = 1 ] &&
+    [ "$(echo "$r6" | grep -c 'sport 8788 lookup [0-9]')" = 1 ] && [ "$(echo "$r6" | grep -c 'to fd55::/64 lookup [0-9]')" = 1 ]
+}
+# egress_table_eth0_only <container>: the table the WebUI rule selects, per family, has a default route and routes through eth0 only:
+# no kill-switch or tunnel route, even when an earlier run left them in the main table.
+egress_table_eth0_only() {
+  for f in 4 6; do
+    t=$(docker exec "$1" ip -"$f" rule show | sed -n 's/.*sport 8788 lookup \([0-9][0-9]*\).*/\1/p') && [ -n "$t" ] || return 1
+    routes=$(docker exec "$1" ip -"$f" route show table "$t") || return 1
+    echo "$routes" | grep -q '^default' || return 1
+    ! echo "$routes" | grep -qv ' dev eth0\( \|$\)' || return 1
+  done
 }
 
 # Task 4 helpers: supervisor, health, shutdown.
@@ -246,6 +344,9 @@ assert "restart boots" reboot "$C" restart
 assert "restart boots: nm running" nm_running
 assert "restart boots: cli disconnected" cli_disconnected
 
+# NM's real dispatcher carries a managed connection's DNS to resolv.conf and Docker's resolver back.
+assert "managed connection dns reaches resolv.conf, Docker's returns" managed_dns_follows_connection
+
 # A connection left tunnel DNS populated, then the container is killed and started: lookups work again before any signin.
 assert "dns works before" dns_from "$C"
 assert "tunnel dns populated" tunnel_dns_populated
@@ -296,6 +397,50 @@ run_container "t5b-$$-v6n" --network "t5b-$$-v6" || { echo "FAIL v6n boot"; exit
 attach "t5b-$$-v6n-att" "t5b-$$-v6n" || { echo "FAIL attach"; exit 1; }
 assert "ipv6 lan blocked without LAN_NETWORKS" blocked_from "t5b-$$-v6n-att" "$V6PEER" 9
 assert "bad LAN fails closed" bad_lan_fails_closed
+
+# Connected tunnel (needs the IPv6 network above): the WebUI answers and LAN_NETWORKS stay reachable, all else goes into the tunnel,
+# with the kill-switch interface's default routes in the main table. $HOLD owns the namespace, so it outlives $POL's restarts.
+GW=t5b-$$-gw HOLD=t5b-$$-hold POL=t5b-$$-pol
+CONTAINERS="$CONTAINERS $GW $HOLD $POL"
+docker run -d --name "$GW" --network "t5b-$$-v6" --cap-add NET_ADMIN --entrypoint sleep "$IMAGE" infinity >/dev/null
+docker run -d --name "$HOLD" --network "t5b-$$-v6" --cap-add NET_ADMIN --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+  --entrypoint sleep "$IMAGE" infinity >/dev/null
+docker run -d --name "$POL" --network "container:$HOLD" --cap-add NET_ADMIN --device /dev/net/tun -v "$TMP:/config" \
+  -e LAN_NETWORKS=10.55.0.0/24,fd55::/64 "$IMAGE" >/dev/null || { echo "FAIL tunnel policy start"; exit 1; }
+wait_ready "$POL" || { echo "FAIL tunnel policy boot"; exit 1; }
+tunnel_policy_setup || { echo "FAIL tunnel policy setup"; exit 1; }
+ks_up "$POL" || { echo "FAIL kill-switch stand-in"; exit 1; }
+# The restart takes the snapshot of eth0's routes (the gateway above) with the kill-switch routes already in the main table.
+reboot "$POL" restart || { echo "FAIL tunnel policy restart"; exit 1; }
+assert "kill switch defaults are in the main table" eventually 10 ks_defaults_in_main "$POL"
+assert "kill switch present: egress table holds eth0 routes only" egress_table_eth0_only "$POL"
+assert "kill switch present: WebUI replies select eth0" route_dev "$POL" eth0 -6 route get fd56::9 ipproto tcp sport 8788 dport 54321
+assert "kill switch present: IPv6 LAN_NETWORKS select eth0" route_dev "$POL" eth0 -6 route get fd55::9
+assert "tunnel down: LAN reachable through the gateway" reachable_from "$POL" 10.55.0.9 9
+assert "tunnel down: IPv6 LAN reachable through the gateway" reachable_from "$POL" fd55::9 9
+wg_up "$POL" >/dev/null || { echo "FAIL tunnel up"; exit 1; }
+POLIP=$(docker inspect -f "{{(index .NetworkSettings.Networks \"t5b-$$-v6\").IPAddress}}" "$HOLD")
+assert "tunnel up: ordinary traffic selects the tunnel" route_dev "$POL" wgsim0 route get 1.1.1.1
+assert "tunnel up: IPv6 ordinary traffic selects the tunnel" route_dev "$POL" wgsim0 -6 route get 2001:db8::1
+assert "tunnel up: unconfigured network selects the tunnel" route_dev "$POL" wgsim0 route get 10.56.0.9
+assert "tunnel up: unconfigured network is blocked" blocked_from "$POL" 10.56.0.9 9
+assert "tunnel up: unconfigured IPv6 network is blocked" blocked_from "$POL" fd56::9 9
+assert "tunnel up: LAN_NETWORKS select eth0" route_dev "$POL" eth0 route get 10.55.0.9
+assert "tunnel up: IPv6 LAN_NETWORKS select eth0" route_dev "$POL" eth0 -6 route get fd55::9
+assert "tunnel up: LAN reachable" reachable_from "$POL" 10.55.0.9 9
+assert "tunnel up: IPv6 LAN reachable" reachable_from "$POL" fd55::9 9
+assert "tunnel up: WebUI replies select eth0" route_dev "$POL" eth0 route get 10.56.0.9 ipproto tcp sport 8788 dport 54321
+assert "tunnel up: IPv6 WebUI replies select eth0" route_dev "$POL" eth0 -6 route get fd56::9 ipproto tcp sport 8788 dport 54321
+assert "tunnel up: other source ports still select the tunnel" route_dev "$POL" wgsim0 route get 10.56.0.9 ipproto tcp sport 8789 dport 54321
+assert "tunnel up: WebUI answers a client outside LAN_NETWORKS" eventually 20 tcp_from_addr "$GW" 10.56.0.9 "$POLIP" 8788
+
+# The namespace outlives the container and still holds the kill switch and tunnel: a restart must not stack the rules,
+# and the leftovers must stay out of the egress table.
+assert "namespace restarts" reboot "$POL" restart
+assert "restart: policy rules once" policy_rules_once "$POL"
+assert "restart: egress table holds eth0 routes only" egress_table_eth0_only "$POL"
+assert "restart: WebUI replies select eth0" route_dev "$POL" eth0 -6 route get fd56::9 ipproto tcp sport 8788 dport 54321
+assert "restart: IPv6 LAN_NETWORKS select eth0" route_dev "$POL" eth0 -6 route get fd55::9
 
 # Task 4: supervisor while signed out.
 run_container "t5b-$$-main" || { echo "FAIL supervisor boot"; exit 1; }

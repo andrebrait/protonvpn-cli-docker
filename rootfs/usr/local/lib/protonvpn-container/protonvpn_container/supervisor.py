@@ -6,11 +6,15 @@ check due; the loop thread does the work.
 """
 
 import collections
+import http.client
+import ipaddress
+import json
 import os
 import sys
 import threading
 import time
 import traceback
+import urllib.request
 
 from . import cli
 from .config import DEFAULTS, SETTINGS, SettingsStore, connect_args, is_true, settings_pairs
@@ -31,15 +35,19 @@ HINT_EVERY = 60
 BACKOFF = (30, 60, 120, 300)
 NATPMP_EVERY = 45
 NATPMP_LEASE = 60  # seconds a mapping lives without a renewal
-# While a lease is held, CLI calls end this long before it does, leaving time for the renewal (two natpmpc calls of up to 10 s).
-RENEW_HEADROOM = 20
+# Proton's own location service, the same API the CLI uses: it answers, unauthenticated, with the IP it sees the request from.
+LOCATION_URL = "https://vpn-api.proton.me/vpn/v1/location"
+LOCATION_TIMEOUT = 5
+LOCATION_MAX = 4096  # bytes of the reply read; a real one is ~150
 TRAFFIC_EVERY = 5
 TRAFFIC_KEEP = 180  # 15 minutes
 # Cap for `protonvpn disconnect` during shutdown; the caller's total budget may be shorter.
 STOP_DISCONNECT_TIMEOUT = 5
 SIGNOUT_TIMEOUT = 30  # it holds the CLI lock: a hung signout must not block the loop for the default 120 s
 KILL_SWITCH_KEY = "kill-switch"  # the CLI refuses it while a connection is up
-CLI_REJECTED = (1, 2)  # click ClickException / UsageError; anything else (124, 127, ...) is transient
+# Always Proton's Standard kill switch, never a setting: the container's own firewall is what fails closed.
+KILL_SWITCH_PAIR = (KILL_SWITCH_KEY, ["standard"])
+CLI_USAGE_ERROR = 2  # click UsageError: the value is invalid. Any other rc (1: network, local agent; 124; 127) is transient
 # Checks a connect waits for settings that keep failing transiently; the tunnel has priority.
 SETTINGS_RETRIES = 3
 
@@ -51,6 +59,20 @@ def log(message: str) -> None:
 def say(out: str) -> None:
     for line in out.splitlines():
         log(f"[protonvpn] {line}")
+
+
+def proton_exit_ip() -> str:
+    """The public IP Proton sees this container at: the tunnel's exit while it is up. Only the IP is kept of its reply.
+
+    Raises OSError (network), http.client.HTTPException or ValueError (an unexpected reply).
+    shortcut: urllib's timeout does not cover DNS resolution, so a broken resolver can hold the loop longer; bound it then.
+    """
+    with urllib.request.urlopen(LOCATION_URL, timeout=LOCATION_TIMEOUT) as reply:
+        body = json.loads(reply.read(LOCATION_MAX))
+    ip = body.get("IP") if isinstance(body, dict) and body.get("Code") == 1000 else None
+    if not isinstance(ip, str):
+        raise ValueError("unexpected reply from Proton's location service")
+    return str(ipaddress.ip_address(ip))
 
 
 def decide(signed_in: bool, connected: bool, user_disconnected: bool) -> str:
@@ -72,9 +94,11 @@ class Supervisor:
         port_file: str = PORT_FILE,
         exit_fn=os._exit,
         timer=threading.Timer,
+        locate=proton_exit_ip,
     ):
         self._store, self._run, self._tool, self._clock = store, run, tool, clock
         self._interval, self._port_file, self._exit, self._timer = interval, port_file, exit_fn, timer
+        self._locate = locate
         self._thread = None
         self._stop = threading.Event()
         self._cli_lock = threading.Lock()  # one CLI mutation at a time: tick vs apply_setting
@@ -89,7 +113,7 @@ class Supervisor:
         self._settings_errors: dict[str, str] = {}
         self._user_disconnected = self._disconnect_pending = False
         # Loop state, only touched under _cli_lock (or by single float stores from requests).
-        self._was_connected = self._reapply = False
+        self._was_connected = False
         self._applied: set[str] = set()  # CLI setting keys applied in this signed-in session
         self._failures = self._unapplied_checks = 0
         self._next_check = self._next_hint = self._next_traffic = self._next_natpmp = 0.0
@@ -150,8 +174,9 @@ class Supervisor:
         self._next_check = 0.0
 
     def notify_signed_in(self) -> None:
-        self._drop_connection()  # a new session: nothing about the previous one is current
-        self._reapply = True
+        """The WebUI's signin finished. The CLI saves the account before it exits, so the tick may have seen it already,
+        applied the settings and connected: this only brings the next state check forward and never resets or drops anything.
+        Lock-free on purpose: the tick can be in a minutes-long connect and the signin reply must not wait for it."""
         self._next_check = 0.0
 
     def sign_out(self) -> tuple[bool, str]:
@@ -185,7 +210,7 @@ class Supervisor:
             words = (value or DEFAULTS.get(env, "")).split()
             message = "saved; the CLI keeps its current value"
             if words:
-                res = self._cli("config", "set", setting.cli_key, *words)
+                res = self._run("config", "set", setting.cli_key, *words)
                 if res.rc != 0:
                     return False, res.out.strip() or f"config set {setting.cli_key} failed (exit code {res.rc})"
                 message = res.out.strip()
@@ -236,7 +261,7 @@ class Supervisor:
 
     def _check(self, now: float) -> None:
         self._next_check = now + self._interval
-        info, status = self._cli("info"), self._cli("status")
+        info, status = self._run("info"), self._run("status")
         if info.rc != 0 or status.rc != 0:
             failed = info if info.rc != 0 else status
             message = f"state check failed (rc {failed.rc}): {failed.out.strip()}"
@@ -248,9 +273,6 @@ class Supervisor:
             self._next_natpmp = 0.0  # the port is requested again at the first good check
             return
         account, st = parse_account(info.out), parse_status(status.out)
-        if self._reapply:
-            self._reapply = False
-            self._new_session()
         with self._lock:
             self._signed_in, self._account, self._st, self._check_error = bool(account), account, st, ""
             disconnect, self._disconnect_pending = self._disconnect_pending, False
@@ -258,6 +280,8 @@ class Supervisor:
         if disconnect and account and st.connected:
             say(self._run("disconnect").out)
             st = self._read_status()
+        if not st.connected:
+            self._drop_connection()
         action = decide(bool(account), st.connected, user_disconnected)
         pending: list[str] = []
         if action == "wait_signin":
@@ -269,7 +293,7 @@ class Supervisor:
             pending = self._apply_settings(st.connected)
             if pending:
                 self._unapplied_checks += 1
-            elif all(key in self._applied for key, _ in settings_pairs(self._store)):
+            elif all(key in self._applied for key, _ in self._wanted()):
                 self._unapplied_checks = 0  # not while a kill-switch is only deferred: that is not a success
         hold = bool(pending) and self._unapplied_checks < SETTINGS_RETRIES
         if action == "connect" and hold:
@@ -292,12 +316,15 @@ class Supervisor:
             self._failures = 0
             if not self._was_connected:
                 self._new_connection()
+            self._find_exit_ip()
         else:
             self._set_port(None)
+            with self._lock:
+                self._exit_ip = ""  # the next connection, ours or adopted, has its own
         self._was_connected = connected
 
     def _read_status(self) -> Status:
-        st = parse_status(self._cli("status").out)
+        st = parse_status(self._run("status").out)
         with self._lock:
             self._st = st
         return st
@@ -314,6 +341,27 @@ class Supervisor:
             self._new_connection()
         return ok
 
+    def _find_exit_ip(self) -> None:
+        """Ask Proton for the exit IP of a connection that came without connect output of ours (adopted at start or after a drop).
+
+        Called only on a state check that just showed it connected, so the answer is the tunnel's, not the host's.
+        Nothing but the IP is kept; a failure changes nothing else and is tried again at the next check.
+        """
+        with self._lock:
+            if self._exit_ip or not self._st.connected:
+                return
+        try:
+            ip = self._locate()
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            log(f"[protonvpn] exit IP lookup failed (retried at the next state check): {exc}")
+            return
+        with self._lock:
+            found = self._st.connected  # not dropped by a disconnect request while the lookup ran
+            if found:
+                self._exit_ip = ip
+        if found:
+            log(f"[protonvpn] exit IP {ip}")
+
     def _new_connection(self) -> None:
         with self._lock:
             self._traffic.clear()
@@ -325,25 +373,28 @@ class Supervisor:
         with self._lock:
             self._settings_errors = {}
 
+    def _wanted(self) -> list[tuple[str, list[str]]]:
+        return [*settings_pairs(self._store), KILL_SWITCH_PAIR]
+
     def _apply_settings(self, connected: bool) -> list[str]:
-        """Apply the effective settings not yet applied in this session.
+        """Apply the effective settings, and the kill switch, not yet applied in this session.
 
         Returns the CLI keys a transient CLI failure left pending; they are retried at every check.
         `kill-switch` waits for a disconnected moment, before the next connect.
         """
         env_of = {s.cli_key: s.env for s in SETTINGS if s.cli_key}
         pending = []
-        for key, words in settings_pairs(self._store):
+        for key, words in self._wanted():
             if key in self._applied or (connected and key == KILL_SWITCH_KEY):
                 continue
-            env = env_of[key]
-            res = self._cli("config", "set", key, *words)
-            message = res.out.strip()
+            env = env_of.get(key)  # None for the kill switch: a fixed valid value, so no rc is "the value is invalid"
+            res = self._run("config", "set", key, *words)
+            message = res.out.strip() or f"exit code {res.rc}"
             if res.rc == 0:
                 say(res.out)
                 with self._lock:
                     self._settings_errors.pop(env, None)
-            elif res.rc in CLI_REJECTED:
+            elif res.rc == CLI_USAGE_ERROR and env:
                 log(f"[protonvpn] setting {env} rejected: {message}")
                 if self._store.source(env) == "env":
                     log(f"[protonvpn] {env} comes from the container environment; exiting")
@@ -351,7 +402,10 @@ class Supervisor:
                 with self._lock:
                     self._settings_errors[env] = message
             else:
-                log(f"[protonvpn] setting {env} not applied (rc {res.rc}); will retry: {message}")
+                log(f"[protonvpn] setting {env or key} not applied (rc {res.rc}); will retry: {message}")
+                if env:
+                    with self._lock:
+                        self._settings_errors[env] = message  # shown until a retry works
                 pending.append(key)
                 continue  # one hung key must not starve the rest
             self._applied.add(key)
@@ -374,13 +428,6 @@ class Supervisor:
             self._set_port(None)
         elif self._clock() >= self._next_natpmp:
             self._refresh_port()
-
-    def _cli(self, *args: str) -> cli.Result:
-        """`protonvpn`, cut short to leave time to renew the lease while a port is published."""
-        end = self._lease_end
-        if end is None:
-            return self._run(*args)
-        return self._run(*args, timeout=max(1.0, min(cli.TIMEOUT, end - self._clock() - RENEW_HEADROOM)))
 
     def _drop_connection(self, ended: bool = True) -> None:
         """Forget the status and forwarded port of a connection that is going away or can no longer be vouched for.

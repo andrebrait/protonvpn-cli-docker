@@ -331,7 +331,7 @@
                   "$ref": "#/components/schemas/Error"
                 },
                 "example": {
-                  "error": "KILL_SWITCH is set by the container config"
+                  "error": "NETSHIELD is set by the container config"
                 }
               }
             }
@@ -1614,7 +1614,6 @@
               "MODERATE_NAT",
               "IPV6",
               "CUSTOM_DNS",
-              "KILL_SWITCH",
               "ANONYMOUS_CRASH_REPORTS"
             ]
           },
@@ -1792,7 +1791,6 @@
               "MODERATE_NAT",
               "IPV6",
               "CUSTOM_DNS",
-              "KILL_SWITCH",
               "ANONYMOUS_CRASH_REPORTS"
             ]
           },

@@ -109,9 +109,9 @@ Settings resolve in this order:
 
 1. A **non-empty environment variable** wins and locks that field in the WebUI.
 2. Otherwise, the value saved by the WebUI in `/config/settings.json` wins.
-3. Otherwise, Python startup defaults apply: `KILL_SWITCH=standard`, `ANONYMOUS_CRASH_REPORTS=off`; other settings are left to the CLI.
+3. Otherwise, Python's `ANONYMOUS_CRASH_REPORTS=off` startup default applies; other configurable settings are left to the CLI.
 
-Those two startup defaults are **not Docker `ENV` values** and do not lock the fields. Leave setting variables empty to configure them in the WebUI. Accepted changes apply live while signed in; signed-out changes are saved for the next sign-in. To change environment variables, recreate the container with the new configuration; `docker restart` does not change its environment.
+That startup default is **not a Docker `ENV` value** and does not lock the field. Leave setting variables empty to configure them in the WebUI. Accepted changes apply live while signed in; signed-out changes are saved for the next sign-in. To change environment variables, recreate the container with the new configuration; `docker restart` does not change its environment.
 
 ### Environment variables
 
@@ -136,7 +136,6 @@ CLI settings accept the following values. Empty means use saved settings, then t
 | `MODERATE_NAT` | `moderate-nat` | `off`, `on` | CLI default |
 | `IPV6` | `ipv6` | `off`, `on` | CLI default |
 | `CUSTOM_DNS` | `custom-dns` | `off`, or `on --dns 1.1.1.1,8.8.8.8` (comma-separated IPv4/IPv6 addresses) | CLI default |
-| `KILL_SWITCH` | `kill-switch` | `off`, `standard` | `standard` |
 | `ANONYMOUS_CRASH_REPORTS` | `anonymous-crash-reports` | `off`, `on` | `off` |
 
 Container-only configuration is not editable in the WebUI:
@@ -169,7 +168,11 @@ The firewall covers **accidental leaks**, not hostile code in an attached contai
 
 IPv4 and IPv6 filter rules load before NetworkManager starts and remain installed while the namespace exists. Attached applications can use the tunnel and explicitly allowed LAN networks, but cannot use the VPN container's disconnected internet exceptions. Docker's embedded DNS at `127.0.0.11` is also blocked for attached containers to prevent it forwarding queries outside the tunnel.
 
-Only the VPN container's own cgroup, including `docker exec` sessions, can use direct TCP 443 for Proton API access and UDP/TCP 53 to the startup DNS resolvers while disconnected. Loopback, WebUI replies, encrypted WireGuard packets, and IPv6 neighbor discovery have the necessary firewall exceptions. This is not a destination allow-list for Proton domains. Proton's own `standard` kill switch is an additional layer; changing `KILL_SWITCH` does not remove the container firewall.
+Only the VPN container's own cgroup, including `docker exec` sessions, can use direct TCP 443 for Proton API access and UDP/TCP 53 to the startup DNS resolvers while disconnected. Loopback, WebUI replies, encrypted WireGuard packets, and IPv6 neighbor discovery have the necessary firewall exceptions. This is not a destination allow-list for Proton domains.
+
+Proton's additional kill switch is fixed to **Standard**, not exposed as an environment variable, WebUI field, or API setting. Standard blocks traffic after an accidental VPN drop but restores it after an intentional disconnect. The container firewall remains enforced in both cases: intentionally disconnecting does **not** give attached applications an unprotected internet route. Neither protection layer can be disabled through the WebUI or API.
+
+The WebUI uses readable labels such as **Default**, **On**, and **Off**. CLI/API values remain lowercase. When a running tunnel is adopted after a restart, its missing exit address is recovered from Proton's own location API; this lookup does not determine VPN health.
 
 ## Port forwarding
 

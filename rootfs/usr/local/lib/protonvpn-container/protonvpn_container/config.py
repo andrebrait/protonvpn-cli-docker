@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 DEFAULT_PATH = "/config/settings.json"
-DEFAULTS = {"KILL_SWITCH": "standard", "ANONYMOUS_CRASH_REPORTS": "off"}
+DEFAULTS = {"ANONYMOUS_CRASH_REPORTS": "off"}
 BANNER_KEY = "_banner_dismissed"
 TRUE_VALUES = {"true", "1", "yes", "on"}
 
@@ -34,7 +34,6 @@ SETTINGS = (
     Setting("MODERATE_NAT", "moderate-nat", "choice"),
     Setting("IPV6", "ipv6", "choice"),
     Setting("CUSTOM_DNS", "custom-dns", "text"),
-    Setting("KILL_SWITCH", "kill-switch", "choice"),
     Setting("ANONYMOUS_CRASH_REPORTS", "anonymous-crash-reports", "choice"),
 )
 
@@ -46,7 +45,6 @@ CHOICES = {
     "VPN_ACCELERATOR": ON_OFF,
     "MODERATE_NAT": ON_OFF,
     "IPV6": ON_OFF,
-    "KILL_SWITCH": ("off", "standard"),
     "ANONYMOUS_CRASH_REPORTS": ON_OFF,
 }
 

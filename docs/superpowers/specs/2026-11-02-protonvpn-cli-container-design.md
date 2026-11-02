@@ -189,13 +189,12 @@ Settings (each runs `protonvpn config set <key> <value>` on start/signin):
 | `MODERATE_NAT` | `moderate-nat` | unset |
 | `IPV6` | `ipv6` | unset |
 | `CUSTOM_DNS` | `custom-dns` | unset |
-| `KILL_SWITCH` | `kill-switch` | `standard` |
 | `ANONYMOUS_CRASH_REPORTS` | `anonymous-crash-reports` | `off` |
 
 Values pass through unmodified; the CLI validates them:
 
-- Environment value rejected by the CLI at start or signin → log the CLI's error and exit non-zero
-  (a misconfiguration is visible instead of silently ignored).
+- Invalid environment syntax rejected with CLI usage exit code 2 → log the error and exit non-zero.
+  Other CLI failures, including runtime exit code 1, remain visible and retry without killing the WebUI.
 - WebUI change while signed in → applied immediately (`config set`, or a reconnect when the
   connection target changes); saved to `settings.json` only when the CLI accepts it; the CLI's
   error is shown in the WebUI otherwise.
@@ -247,7 +246,9 @@ rules apply to them too.
     HTTPS/DNS exception. That is intended (signin runs there).
 - No hostname allow-list and no re-resolution: the exception is scoped by origin, not
   destination.
-- The CLI's own `standard` kill switch stays enabled as defence in depth.
+- The CLI's own kill switch is fixed to **Standard** as defence in depth, applied internally
+  while disconnected before connecting. It is not configurable through the environment, UI or API.
+  Standard restores internet after an intentional disconnect; the container firewall does not.
 - OUTPUT `ESTABLISHED,RELATED` on `eth0` is accepted only for this container's own cgroup, plus
   replies from `WEBUI_PORT` (a lingering flow from an attached container must not keep leaving
   `eth0` after the tunnel drops). IPv6 neighbour discovery is accepted on `eth0` so IPv6
@@ -282,10 +283,12 @@ A thread in the Python service, every `RECONNECT_INTERVAL` seconds:
    `natpmpc -a 1 0 udp 60 -g 10.2.0.1` and `natpmpc -a 1 0 tcp 60 -g 10.2.0.1`, parse
    `Mapped public port N` (exit code 0 and 1..65535 required), and publish N in `/config/forwarded_port`
    and the API only when both protocols return the same N; log when N changes. Otherwise log why and
-   empty the file. The mapping is a 60 s lease: renewals run before the state check, CLI calls
-   leave the time to renew, and a timer empties the port if the lease runs out unrenewed. The
-   published port, the connected state and the exit IP are dropped at once on signout, disconnect,
-   reconnect and new signin, and a failed state check shows as an error instead of the last good state.
+   empty the file. The mapping is a 60 s lease: renewals run before state checks, and a timer
+   empties the port if its lease runs out unrenewed, even during a blocked CLI call. Normal CLI
+   timeouts do not shrink with lease age. Signout, disconnect
+   and reconnect immediately invalidate connection-specific state. Duplicate completion of an
+   already-observed sign-in does not reapply settings or drop a healthy connection. Failed state
+   checks show an error instead of silently presenting the last success as current.
 5. Every 5 s while connected: read `wg show proton0 transfer`, keep the last 15 minutes of
    samples in memory (180 points), reset on a new connection.
 6. On `SIGTERM`: `protonvpn disconnect`, stop the WebUI, NM and D-Bus, exit 0. The firewall stays
@@ -300,7 +303,8 @@ All output goes to stdout with `[protonvpn]`, `[natpmp]`, `[firewall]`, `[webui]
   CDN (it must work while the tunnel is down). JSON API under `/api/v1/`; the page polls
   `/api/v1/state` every 5 s.
 - Shows: connection state; server, city and country, load, protocol (from `protonvpn status`);
-  exit IP (from the connect output, kept until the next connect); forwarded port with a copy
+  exit IP (from connect output, or a bounded Proton `/vpn/v1/location` lookup when adopting an
+  already-connected tunnel; lookup failure does not affect CLI-derived health); forwarded port with a copy
   button; traffic totals since connect and a live up/down rate graph (inline SVG) over the last
   15 minutes; account name (`protonvpn info`); last error from the CLI.
 - Actions: sign in (username, password, 2FA code step), sign out, connect, disconnect, save

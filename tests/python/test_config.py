@@ -33,14 +33,14 @@ class SettingsStoreTest(unittest.TestCase):
 
     def test_file_then_default(self):
         store = SettingsStore(self.path, {})
-        self.write_file({"COUNTRY": "CH", "KILL_SWITCH": "off"})  # read per call, not cached
+        self.write_file({"COUNTRY": "CH", "ANONYMOUS_CRASH_REPORTS": "on"})  # read per call, not cached
         self.assertEqual(store.effective("COUNTRY"), "CH")
         self.assertEqual(store.source("COUNTRY"), "file")
         self.assertFalse(store.locked("COUNTRY"))
-        self.assertEqual(store.effective("KILL_SWITCH"), "off")
+        self.assertEqual(store.effective("ANONYMOUS_CRASH_REPORTS"), "on")
         self.write_file({"COUNTRY": "CH"})
-        self.assertEqual(store.effective("KILL_SWITCH"), "standard")
-        self.assertEqual(store.source("KILL_SWITCH"), "default")
+        self.assertEqual(store.effective("ANONYMOUS_CRASH_REPORTS"), "off")
+        self.assertEqual(store.source("ANONYMOUS_CRASH_REPORTS"), "default")
         self.assertEqual(store.effective("NETSHIELD"), "")
 
     def test_save_locked_raises(self):
@@ -68,7 +68,6 @@ class SettingsStoreTest(unittest.TestCase):
         out = io.StringIO()
         with redirect_stdout(out):
             self.assertEqual(store.effective("COUNTRY"), "")
-            self.assertEqual(store.effective("KILL_SWITCH"), "standard")
             self.assertFalse(store.banner_dismissed())
         self.assertEqual(out.getvalue().count("[webui]"), 1)
         with open(self.path) as f:
@@ -104,12 +103,6 @@ class SettingsStoreTest(unittest.TestCase):
         store = SettingsStore(self.path, {"SECURE_CORE": "Yes", "TOR": "0"})
         self.assertEqual(connect_args(store), ["--securecore"])
 
-    def test_settings_pairs_order(self):
-        store = SettingsStore(self.path, {})
-        self.assertEqual(
-            settings_pairs(store),
-            [("kill-switch", ["standard"]), ("anonymous-crash-reports", ["off"])],
-        )
 
     def test_settings_pairs_custom_dns(self):
         store = SettingsStore(self.path, {"CUSTOM_DNS": "on 1.1.1.1"})
@@ -117,7 +110,6 @@ class SettingsStoreTest(unittest.TestCase):
             settings_pairs(store),
             [
                 ("custom-dns", ["on", "1.1.1.1"]),
-                ("kill-switch", ["standard"]),
                 ("anonymous-crash-reports", ["off"]),
             ],
         )

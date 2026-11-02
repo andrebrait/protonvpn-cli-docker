@@ -1,3 +1,4 @@
+import http.client
 import io
 import json
 import os
@@ -5,11 +6,13 @@ import stat
 import tempfile
 import threading
 import unittest
+import urllib.error
 from contextlib import redirect_stdout
+from unittest import mock
 
 from protonvpn_container.cli import Result
 from protonvpn_container.config import SettingsStore
-from protonvpn_container.supervisor import HINT, Supervisor, decide
+from protonvpn_container.supervisor import HINT, Supervisor, decide, proton_exit_ip
 
 STATUS_UP = "Status: Connected\nServer: NL#914 in Amsterdam, Netherlands\nLoad: 31%\nProtocol: wireguard\n"
 CONNECT_OUT = "Connected to NL#914 in Amsterdam, Netherlands. \nYour new IP address is 205.147.16.78.\n"
@@ -45,15 +48,17 @@ class FakeCli:
         self.connected = False
         self.connect_rc = 0
         self.connect_duration = 0
-        self.hung = set()  # argv that block for their whole timeout, as a CLI that never answers does
+        self.slow = {}  # argv -> seconds the call takes; a call given a shorter timeout is cut off at it, as the real one is
         self.during = {}  # argv -> fn(), run while that call is blocked: time passes, timers fire
 
     def __call__(self, *args, timeout=120):
         self.calls.append((self.clock.now, args))
         self.timeouts.append((args, timeout))
-        if args in self.hung:
+        duration = self.slow.get(args, 0)
+        if duration > timeout:
             self.clock.now += timeout
             return Result(124, f"protonvpn timed out after {timeout}s\n")
+        self.clock.now += duration
         if args in self.during:
             self.during[args]()
         reply = self.responses.get(args)
@@ -137,6 +142,24 @@ class FakeTimers:
                 timer.fire()
 
 
+class FakeLocate:
+    """`proton_exit_ip`: `replies` are IPs or exceptions to raise, consumed in order (the last repeats)."""
+
+    def __init__(self):
+        self.replies = [OSError("not scripted")]
+        self.calls = 0
+        self.during = None  # fn(), run inside the call
+
+    def __call__(self):
+        self.calls += 1
+        if self.during is not None:
+            self.during()
+        reply = self.replies[min(self.calls, len(self.replies)) - 1]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
 class SupervisorCase(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -149,8 +172,9 @@ class SupervisorCase(unittest.TestCase):
         self.exits = []
         self.out = io.StringIO()
         self.timers = FakeTimers()
+        self.locate = FakeLocate()
 
-    def make(self, environ=None, file=None):
+    def make(self, environ=None, file=None, locate=None):
         path = os.path.join(self.dir, "settings.json")
         if file is not None:
             with open(path, "w") as f:
@@ -165,6 +189,7 @@ class SupervisorCase(unittest.TestCase):
             port_file=self.port_file,
             exit_fn=self.exits.append,
             timer=self.timers,
+            locate=locate or self.locate,
         )
         return self.sup
 
@@ -236,6 +261,31 @@ class SigninTest(SupervisorCase):
         self.tick()
         self.assertEqual(self.cli.argvs("connect"), [])
         self.assertIn("timed out", self.out.getvalue())
+
+    def test_a_signin_notice_after_the_tick_saw_the_signin_changes_nothing(self):
+        # The CLI saves the account before `protonvpn signin` exits: the tick applies the settings and connects, then
+        # the WebUI's notice arrives. A second `config set` on the live connection fails, as it did for real.
+        self.cli.signed_in = False
+        self.tool.responses[UDP] = self.tool.responses[TCP] = mapped(41404)
+        self.make(environ={"PORT_FORWARDING": "on"})
+        port_forwarding = ("config", "set", "port-forwarding", "on")
+        self.cli.responses[port_forwarding] = [Result(0, "ok\n"), Result(1, "An unexpected error occurred.\n")]
+        self.tick()  # signed out
+        self.cli.signed_in = True
+        self.tick(30)
+        applied = self.cli.argvs("config")
+        self.assertEqual(applied.count(port_forwarding), 1)
+        self.assertEqual((self.sup.snapshot()["connected"], self.read_port_file()), (True, "41404\n"))
+        self.sup.notify_signed_in()
+        snap = self.sup.snapshot()  # before any tick
+        self.assertEqual((snap["connected"], snap["forwarded_port"], self.read_port_file()), (True, 41404, "41404\n"))
+        self.tick(1)  # the notice brought the check forward
+        self.tick(30)
+        self.assertEqual(self.cli.argvs("config"), applied)
+        self.assertEqual((self.exits, len(self.cli.argvs("connect")), self.cli.argvs("disconnect")), ([], 1, []))
+        snap = self.sup.snapshot()
+        self.assertEqual((snap["connected"], snap["forwarded_port"], snap["settings_errors"]), (True, 41404, {}))
+        self.assertEqual(self.read_port_file(), "41404\n")
 
 
 class ConnectTest(SupervisorCase):
@@ -381,6 +431,20 @@ class SignoutTest(SupervisorCase):
         self.tick(30)
         self.assertEqual(len(self.cli.argvs("config")), 2 * count)
 
+    def test_a_webui_signin_after_a_signout_applies_the_settings_and_connects_at_once(self):
+        self.make()
+        self.tick()
+        count = len(self.cli.argvs("config"))
+        self.assertTrue(self.sup.sign_out()[0])
+        self.tick(1)
+        self.assertEqual(len(self.cli.argvs("connect")), 1)  # signed out: nothing reconnects
+        self.cli.signed_in = True  # the CLI saved the account; the WebUI says so
+        self.sup.notify_signed_in()
+        self.tick(1)  # far sooner than the 30 s check interval
+        self.assertEqual(len(self.cli.argvs("config")), 2 * count)
+        self.assertEqual(len(self.cli.argvs("connect")), 2)
+        self.assertTrue(self.sup.snapshot()["connected"])
+
     def test_failed_signout_changes_nothing(self):
         self.make()
         self.tick()
@@ -422,12 +486,12 @@ class ConnectionStateTest(SupervisorCase):
         self.tick(1)
         self.assertEqual(self.consumer(), (False, None, ""))
 
-    def test_new_session(self):
-        self.sup.notify_signed_in()
-        self.assertEqual(self.consumer(), (False, None, ""))
-        self.fail_next_check()
-        self.tick(1)
-        self.assertEqual(self.consumer(), (False, None, ""))
+    def test_detected_drop_clears_port_before_reconnect(self):
+        self.cli.connected = False
+        seen = []
+        self.cli.during[("connect",)] = lambda: seen.append(self.consumer())
+        self.tick(30)
+        self.assertEqual(seen, [(False, None, "")])
 
     def test_reconnect_for_a_new_target(self):
         seen = []
@@ -461,11 +525,6 @@ class ApplySettingsTest(SupervisorCase):
         self.assertIn(("config", "set", "kill-switch", "standard"), applied)
         self.tick(30)
         self.assertEqual(self.cli.argvs("config"), applied)
-        self.sup.notify_signed_in()
-        self.tick(1)
-        again = self.cli.argvs("config")[len(applied) :]
-        # Connected now, so the kill switch (refused by the CLI while a connection is up) waits.
-        self.assertEqual(again, [a for a in applied if a[2] != "kill-switch"])
 
     def test_reapplied_after_signout_and_signin(self):
         self.make()
@@ -477,13 +536,14 @@ class ApplySettingsTest(SupervisorCase):
         self.tick(30)
         self.assertEqual(len(self.cli.argvs("config")), 2 * count)
 
-    def test_env_kill_switch_while_connected_does_not_exit(self):
-        self.make(environ={"KILL_SWITCH": "off"})
+    def test_kill_switch_is_always_standard_and_waits_while_a_connection_lingers(self):
+        self.make()
         self.cli.connected = True  # a connection lingers into the first signed-in tick
         self.tick()
         self.assertEqual(self.exits, [])
+        ks = ("config", "set", "kill-switch", "standard")
         calls = [a for _, a in self.cli.calls]
-        self.assertNotIn(("config", "set", "kill-switch", "off"), calls)
+        self.assertNotIn(ks, calls)  # the CLI refuses it while connected
         self.assertIn(("config", "set", "anonymous-crash-reports", "off"), calls)
         self.assertEqual(self.sup.snapshot()["settings_errors"], {})
         # Applied once the connection is gone, before the next connect.
@@ -491,7 +551,38 @@ class ApplySettingsTest(SupervisorCase):
         self.tick(30)
         calls = [a for _, a in self.cli.calls]
         self.assertEqual(self.exits, [])
-        self.assertLess(calls.index(("config", "set", "kill-switch", "off")), calls.index(("connect",)))
+        self.assertLess(calls.index(ks), calls.index(("connect",)))
+        self.tick(30)
+        self.assertEqual(self.cli.argvs("config").count(ks), 1)  # once per session
+
+    def test_a_kill_switch_value_in_the_environment_is_ignored(self):
+        self.make(environ={"KILL_SWITCH": "off"})
+        self.tick()
+        self.assertEqual(
+            [a for a in self.cli.argvs("config") if a[2] == "kill-switch"], [("config", "set", "kill-switch", "standard")]
+        )
+        self.assertEqual(self.exits, [])
+
+    def test_a_failing_kill_switch_is_logged_retried_and_never_fatal(self):
+        ks = ("config", "set", "kill-switch", "standard")
+        # rc 2 is the CLI refusing it while connected: the value is fixed and valid, so no rc means "invalid".
+        for rc in (1, 2):
+            with self.subTest(rc=rc):
+                self.cli, self.out, self.exits = FakeCli(self.clock), io.StringIO(), []
+                self.make()
+                self.cli.responses[ks] = Result(rc, "Error: it failed\n")
+                self.tick()
+                self.assertEqual(self.exits, [])
+                self.assertIn(f"setting kill-switch not applied (rc {rc})", self.out.getvalue())
+                self.assertEqual(self.sup.snapshot()["settings_errors"], {})  # not a public setting
+                self.assertEqual(self.cli.argvs("connect"), [])  # the same bounded hold as any setting
+                self.tick(30)
+                self.tick(30)
+                self.assertEqual(len(self.cli.argvs("connect")), 1)
+                self.assertIn("connecting without kill-switch", self.out.getvalue())
+                self.assertEqual(self.cli.argvs("config").count(ks), 3)
+                self.assertEqual(self.exits, [])
+                self.assertTrue(self.sup.snapshot()["connected"])
 
     def test_transient_cli_failure_is_retried(self):
         self.make(environ={"NETSHIELD": "malware"})
@@ -499,14 +590,35 @@ class ApplySettingsTest(SupervisorCase):
         self.cli.responses[key] = [Result(124, "protonvpn timed out after 120s\n"), Result(0, "ok\n")]
         self.tick()
         self.assertEqual(self.exits, [])  # not a rejection, although the value comes from the environment
-        self.assertEqual(self.sup.snapshot()["settings_errors"], {})
+        self.assertEqual(self.sup.snapshot()["settings_errors"], {"NETSHIELD": "protonvpn timed out after 120s"})
         self.assertEqual(self.cli.argvs("connect"), [])  # nothing connects with settings half applied
         self.tick(30)
         self.assertEqual([a for a in self.cli.argvs("config") if a == key], [key, key])
         self.assertEqual(self.exits, [])
         self.assertTrue(self.sup.snapshot()["connected"])
+        self.assertEqual(self.sup.snapshot()["settings_errors"], {})  # the retry worked: nothing left to show
         self.tick(30)
         self.assertEqual([a for a in self.cli.argvs("config") if a == key], [key, key])  # applied: not again
+
+    def test_env_setting_failing_with_rc1_is_transient_not_fatal(self):
+        # rc 1 is any runtime failure of the CLI (here the local agent timing out), not proof that the value is invalid.
+        self.make(environ={"PORT_FORWARDING": "on"})
+        key = ("config", "set", "port-forwarding", "on")
+        failure = "An unexpected error occurred. Please try again later."
+        self.cli.responses[key] = Result(1, failure + "\n")
+        self.tick()
+        self.assertEqual(self.exits, [])
+        self.assertEqual(self.sup.snapshot()["settings_errors"], {"PORT_FORWARDING": failure})  # visible in the WebUI
+        self.assertEqual(self.cli.argvs("connect"), [])  # the same bounded hold as any transient failure
+        self.tick(30)
+        self.tick(30)
+        self.assertEqual(len(self.cli.argvs("connect")), 1)
+        self.assertIn("connecting without port-forwarding", self.out.getvalue())
+        self.assertEqual(self.exits, [])
+        self.cli.responses[key] = Result(0, "Port forwarding has been enabled\n")
+        self.tick(30)  # still retried while connected, until it works
+        self.assertEqual(self.sup.snapshot()["settings_errors"], {})
+        self.assertEqual(self.exits, [])
 
     def test_missing_cli_binary_is_transient_too(self):
         self.make(environ={"NETSHIELD": "malware"})
@@ -780,18 +892,23 @@ class LeaseTest(SupervisorCase):
         self.assertEqual(self.consumer(), (41404, "41404\n"))  # renewed once the loop came back
         self.assertEqual(self.timers.created[-1].interval, 60)
 
-    def test_cli_calls_leave_time_to_renew(self):
-        self.tick()
-        self.tick(30)  # the lease ends at 1060 and the renewal needs 20 s
-        info = [timeout for argv, timeout in self.cli.timeouts if argv == ("info",)]
-        self.assertEqual(info, [120, 10])  # no lease yet, then the time left minus the renewal
+    def test_a_healthy_cli_call_slower_than_a_second_late_in_the_lease_is_no_failure(self):
+        self.tick()  # the lease runs 1000 to 1060
+        self.cli.slow[("info",)] = self.cli.slow[("status",)] = 1.1
+        self.tick(39)  # a state check at lease age 39 s
+        snap = self.sup.snapshot()
+        self.assertEqual((snap["connected"], snap["last_error"]), (True, ""))
+        self.assertEqual(self.consumer(), (41404, "41404\n"))
 
-    def test_a_hung_cli_returns_before_the_lease_ends(self):
+    def test_a_settings_save_late_in_the_lease_succeeds_and_persists(self):
         self.tick()
-        self.cli.hung.add(("info",))
-        self.tick(30)
-        self.assertLess(self.clock.now, 1060)
-        self.assertEqual(self.consumer(), (None, ""))  # the failed check is shown, not the old port
+        key = ("config", "set", "netshield", "malware")
+        self.cli.slow[key] = 1.1
+        self.cli.responses[key] = Result(0, "NetShield has been set to malware\n")
+        self.clock.now += 39  # lease age 39 s
+        self.assertEqual(self.apply("NETSHIELD", "malware"), (True, "NetShield has been set to malware"))
+        self.assertEqual(self.store.effective("NETSHIELD"), "malware")
+        self.assertEqual(self.consumer(), (41404, "41404\n"))
 
     def test_a_renewal_comes_before_a_due_state_check(self):
         self.tick()
@@ -816,6 +933,118 @@ class LeaseTest(SupervisorCase):
         self.tick()
         self.assertEqual(self.timers.created[-1].interval, 60)  # counted from the request at 1040
         self.assertEqual(self.sup.snapshot()["traffic"], [[1040.0, 100, 10]])
+
+
+LOCATION = {"IP": "205.147.16.74", "Country": "NL", "Lat": 52.37, "Long": 4.89, "ISP": "M247 Europe SRL", "Code": 1000}
+URLOPEN = "protonvpn_container.supervisor.urllib.request.urlopen"
+
+
+def location_reply(body):
+    reply = mock.MagicMock()
+    reply.__enter__.return_value = reply
+    reply.read.return_value = body if isinstance(body, bytes) else json.dumps(body).encode()
+    return reply
+
+
+class ProtonExitIpTest(unittest.TestCase):
+    def lookup(self, body):
+        with mock.patch(URLOPEN, return_value=location_reply(body)) as urlopen:
+            ip = proton_exit_ip()
+        urlopen.assert_called_once_with("https://vpn-api.proton.me/vpn/v1/location", timeout=5)
+        return ip
+
+    def test_returns_only_the_ip(self):
+        self.assertEqual(self.lookup(LOCATION), "205.147.16.74")
+        self.assertEqual(self.lookup({**LOCATION, "IP": "2a02:6ea0:c041:6653::23"}), "2a02:6ea0:c041:6653::23")
+
+    def test_an_unexpected_reply_is_a_value_error(self):
+        for name, body in (
+            ("another code", {**LOCATION, "Code": 1001}),
+            ("no code", {"IP": "205.147.16.74"}),
+            ("no ip", {"Code": 1000}),
+            ("ip not text", {**LOCATION, "IP": 3395}),  # ip_address(int) would take it for an address
+            ("ip not an address", {**LOCATION, "IP": "node-nl-307.protonvpn.net"}),
+            ("ip with a mask", {**LOCATION, "IP": "205.147.16.74/24"}),
+            ("not an object", [LOCATION]),
+            ("not json", b"<html>502</html>"),
+            ("empty", b""),
+        ):
+            with self.subTest(name), self.assertRaises(ValueError):
+                self.lookup(body)
+
+
+class ExitIpTest(SupervisorCase):
+    """A connection the CLI reports as connected but whose connect output we never saw: adopted at start, or made by hand."""
+
+    IP = "205.147.16.74"
+
+    def adopt(self, *replies):
+        self.cli.connected = True
+        self.locate.replies = list(replies)
+        self.make()
+
+    def exit_ip(self):
+        return self.sup.snapshot()["exit_ip"]
+
+    def test_an_adopted_connection_resolves_its_exit_ip(self):
+        self.adopt(self.IP)
+        seen = []  # asked after a state check that showed it connected, with no lock held
+        self.locate.during = lambda: seen.append((self.sup.snapshot()["connected"], len(self.cli.argvs("status"))))
+        self.tick()
+        self.assertEqual(self.exit_ip(), self.IP)
+        self.assertEqual(seen, [(True, 1)])
+        self.assertEqual(self.cli.argvs("connect"), [])
+        self.assertIn(f"exit IP {self.IP}", self.out.getvalue())
+
+    def test_a_known_exit_ip_is_not_looked_up_again(self):
+        self.adopt(self.IP)
+        self.tick()
+        self.tick(30)
+        self.tick(30)
+        self.assertEqual((self.locate.calls, self.exit_ip()), (1, self.IP))
+
+    def test_the_connect_output_stays_the_primary_source(self):
+        self.make()
+        self.tick()
+        self.tick(30)
+        self.assertEqual((self.exit_ip(), self.locate.calls), ("205.147.16.78", 0))
+
+    def test_a_failed_lookup_changes_nothing_else_and_is_retried_at_the_next_check(self):
+        self.adopt(OSError("timed out"), ValueError("unexpected reply"), http.client.IncompleteRead(b""), self.IP)
+        self.tick()
+        for calls in (1, 2, 3):
+            snap = self.sup.snapshot()
+            self.assertEqual((self.locate.calls, snap["connected"], snap["last_error"], snap["exit_ip"]), (calls, True, "", ""))
+            self.tick(1)  # the next state check is not due: no new lookup
+            self.assertEqual(self.locate.calls, calls)
+            self.tick(29)
+        self.assertEqual((self.locate.calls, self.exit_ip()), (4, self.IP))
+        self.assertEqual(self.out.getvalue().count("exit IP lookup failed"), 3)
+
+    def test_an_exit_ip_is_forgotten_with_its_connection_and_found_again(self):
+        self.adopt(self.IP, "205.147.16.99")
+        self.tick()
+        self.assertEqual(self.exit_ip(), self.IP)
+        self.cli.connected, self.cli.connect_rc = False, 1  # the tunnel drops and our reconnect fails
+        self.tick(30)
+        snap = self.sup.snapshot()
+        self.assertEqual((snap["connected"], snap["exit_ip"]), (False, ""))
+        self.cli.connected = True  # one made by hand while we back off
+        self.tick(30)
+        self.assertEqual((self.exit_ip(), self.locate.calls), ("205.147.16.99", 2))
+
+    def test_the_real_lookup_keeps_only_the_ip_and_a_bad_reply_changes_nothing_else(self):
+        self.cli.connected = True
+        self.make(locate=proton_exit_ip)
+        replies = [urllib.error.URLError("no route"), location_reply(b"{not json"), location_reply(LOCATION)]
+        with mock.patch(URLOPEN, side_effect=replies):
+            for advance, expected in ((0, ""), (30, ""), (30, "205.147.16.74")):
+                self.tick(advance)
+                snap = self.sup.snapshot()
+                self.assertEqual((snap["connected"], snap["last_error"], snap["exit_ip"]), (True, "", expected))
+        shown = json.dumps(self.sup.snapshot())
+        for geolocation in ("M247", "52.37", "Country", "Lat"):
+            self.assertNotIn(geolocation, shown)
 
 
 class TrafficTest(SupervisorCase):

@@ -35,7 +35,8 @@ Reference implementation of every workaround (throwaway spike, read-only): `/tmp
   `/var/cache/Proton` → `/config/cache` (dir `700`), `/config/forwarded_port` (`644`).
 - WireGuard fwmark `0xea13b2c`; tunnel interface `proton0`; NAT-PMP gateway `10.2.0.1`.
 - Log prefixes: `[protonvpn]`, `[natpmp]`, `[firewall]`, `[webui]`, `[init]`, `[nm]`.
-- Env defaults: `KILL_SWITCH=standard`, `ANONYMOUS_CRASH_REPORTS=off`, `TZ=UTC`, `DEBUG=false`,
+- Native Proton kill switch is fixed internally to Standard, never exposed through settings.
+- Env defaults: `ANONYMOUS_CRASH_REPORTS=off`, `TZ=UTC`, `DEBUG=false`,
   `RECONNECT_INTERVAL=30`, `LAN_NETWORKS=` (empty), `WEBUI_PORT=8788`, `WEBUI_PASSWORD=` (empty),
   `API_KEY=` (empty).
 - Settings precedence: env var (non-empty; locks the WebUI field) → `/config/settings.json`
@@ -178,9 +179,9 @@ git add -A && git commit -m "feat: bootable Proton VPN CLI image"
     connection target `SERVER, COUNTRY, CITY, P2P, SECURE_CORE, TOR` (`cli_key=None`, kind
     `text`/`bool`) and the CLI settings in the spec's table order `NETSHIELD→netshield,
     PORT_FORWARDING→port-forwarding, VPN_ACCELERATOR→vpn-accelerator, MODERATE_NAT→moderate-nat,
-    IPV6→ipv6, CUSTOM_DNS→custom-dns, KILL_SWITCH→kill-switch,
+    IPV6→ipv6, CUSTOM_DNS→custom-dns,
     ANONYMOUS_CRASH_REPORTS→anonymous-crash-reports` (kind `choice`, `text` for `custom-dns`).
-  - `DEFAULTS = {"KILL_SWITCH": "standard", "ANONYMOUS_CRASH_REPORTS": "off"}`.
+  - `DEFAULTS = {"ANONYMOUS_CRASH_REPORTS": "off"}`.
   - `class SettingsStore(path: str = "/config/settings.json", environ: Mapping[str,str] = os.environ)`:
     `effective(env) -> str` (env non-empty → file → `DEFAULTS` → `""`), `locked(env) -> bool`
     (env var non-empty), `source(env) -> "env"|"file"|"default"`, `save(env, value) -> None`
@@ -225,15 +226,14 @@ Tests run inside the built image so the Python matches Debian 13's:
 
 - [ ] **Step 1: Write failing tests**
 - `test_config.py`: `test_env_wins_and_locks` (env `COUNTRY=NL`, file `CH` → `NL`, locked, source
-  `env`); `test_file_then_default` (no env: file value; then key absent → `standard` for
-  `KILL_SWITCH`, `""` for `NETSHIELD`); `test_save_locked_raises`; `test_save_atomic_mode`
+  `env`); `test_file_then_default` (file overrides defaults; absent
+  `ANONYMOUS_CRASH_REPORTS` becomes `off`); `test_save_locked_raises`; `test_save_atomic_mode`
   (file mode `0o600` after save; empty value removes key); `test_corrupt_file_is_empty`;
   `test_banner_flag_roundtrip`; `test_connect_args_server` (`SERVER='NL#914' COUNTRY=NL P2P=true`
   → `['NL#914','--p2p']`, warning logged); `test_connect_args_city_spaces`
   (`COUNTRY=US CITY='New York'` → `['--country','US','--city','New York']`);
   `test_connect_args_empty` → `[]`; `test_connect_args_flags` (`SECURE_CORE=Yes TOR=0` →
-  `['--securecore']`); `test_settings_pairs_order` (only defaults →
-  `[('kill-switch',['standard']),('anonymous-crash-reports',['off'])]`);
+  `['--securecore']`);
   `test_settings_pairs_custom_dns` (`CUSTOM_DNS='on 1.1.1.1'` → `('custom-dns',['on','1.1.1.1'])`).
 - `test_parsing.py`: status connected/disconnected (spike text; `Status: Disconnected` alone),
   exit IP, natpmp ok (`Mapped public port 41404 protocol TCP to local port 0 lifetime 60` → 41404)
@@ -345,8 +345,8 @@ git add -A && git commit -m "feat: fail-closed cgroup-scoped kill switch"
     `threading.Event`); signin hint
     `Not signed in. Sign in from the WebUI or run: docker exec -it <name> protonvpn signin <username>`
     at most every 60 s; apply effective settings on the first signed-in tick of a session (env
-    value rejected → log and `os._exit(1)`; file value rejected → record in `settings_errors`,
-    log, continue); connect with backoff 30, 60, 120, 300, 300… s, reset on success; NAT-PMP
+    syntax rejected with rc 2 → log and exit; runtime failures including rc 1 → visible error and
+    retry without terminating the WebUI); connect with backoff 30, 60, 120, 300, 300… s, reset on success; NAT-PMP
     every 45 s when `is_true(effective PORT_FORWARDING)` (`natpmpc -a 1 0 udp 60 -g 10.2.0.1`,
     then tcp; write `/config/forwarded_port` mode `0o644` only on change, log
     `[natpmp] forwarded port N`; failure → `[natpmp] refresh failed`, truncate file, port None);
@@ -566,7 +566,7 @@ git add -A && git commit -m "ci: lint, tests and multi-arch publish"
   `8788`→`8788` TCP; Path `/config` → `/mnt/user/appdata/protonvpn-cli`; one Variable per env
   var with description; setting variables empty by default (the WebUI configures them);
   dropdowns (`|`-separated `Default`, first entry empty) for `NETSHIELD`, `PORT_FORWARDING`,
-  `VPN_ACCELERATOR`, `MODERATE_NAT`, `IPV6`, `KILL_SWITCH`, `ANONYMOUS_CRASH_REPORTS`, `P2P`,
+  `VPN_ACCELERATOR`, `MODERATE_NAT`, `IPV6`, `ANONYMOUS_CRASH_REPORTS`, `P2P`,
   `SECURE_CORE`, `TOR`, `DEBUG`, with allowed values from `protonvpn config set <key> --help` in
   the built image; `WEBUI_PASSWORD` and `API_KEY` with `Mask="true"` (the `API_KEY` description
   says how to generate one: `openssl rand -hex 32`). `Overview`: open the WebUI to sign in and

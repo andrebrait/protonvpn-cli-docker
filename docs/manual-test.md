@@ -29,11 +29,12 @@ This is a checklist, not a record of successful tests. Leave unexercised items u
 ## Connection, settings and port forwarding
 
 - [ ] Connect by `COUNTRY`, by exact `SERVER`, and with `P2P=true`. Verify status/server/location and confirm `SERVER` takes precedence over `COUNTRY`/`CITY` with a warning.
-- [ ] With no setting environment overrides, confirm the WebUI fields remain editable, including the Python startup defaults `KILL_SWITCH=standard` and `ANONYMOUS_CRASH_REPORTS=off`.
+- [ ] With no setting environment overrides, confirm the WebUI fields remain editable, including the Python startup default `ANONYMOUS_CRASH_REPORTS=off`. Confirm there is no kill-switch field or API override: Proton Standard and the container firewall remain enforced.
 - [ ] Change a CLI setting and connection target in the WebUI while signed in. Confirm the CLI setting applies immediately, target changes reconnect, and accepted values persist in `/config/settings.json`. Reject an invalid value without saving it.
 - [ ] Change a setting while signed out, then sign in. Confirm it is applied; a rejected upstream value is visible rather than silently ignored.
 - [ ] Recreate with a non-empty setting environment variable. Confirm its value applies, the WebUI field is locked, and API writes to it return 409. Remove/empty the override and recreate; confirm the saved value or Python default returns and the field unlocks. `docker restart` alone cannot change container environment.
 - [ ] Confirm `/etc/resolv.conf` uses the VPN-provided DNS after connection (unless deliberately using custom DNS). Check DNS and the public exit IP from an attached application; compare the exit IP with VPN status rather than the host's normal route.
+- [ ] Restart with a connected tunnel and confirm Exit IP recovers without a new sign-in. Its lookup failure must not change the CLI-derived VPN health.
 - [ ] While connected (VPN DNS in `/etc/resolv.conf`), `docker kill` and `docker start` the VPN container. Before signing in or reconnecting, confirm `docker exec protonvpn-cli getent hosts example.com` works and `/etc/resolv.conf` is Docker's resolver again, not the VPN's `10.2.0.1`; then confirm the session reconnects and DNS follows the tunnel.
 - [ ] On an eligible P2P server/plan, enable port forwarding. Confirm a valid matching port in the WebUI, `/config/forwarded_port`, JSON `/api/v1/port`, and text `/api/v1/port?format=text`. Observe multiple renewals at roughly 45-second intervals.
 - [ ] Configure the torrent listener to that port and confirm inbound reachability using a suitable external peer/probe. This project does not automatically update qBittorrent. Do not mistake a Docker host port publication for VPN forwarding.

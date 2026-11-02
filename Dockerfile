@@ -35,6 +35,9 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 COPY rootfs/ /
+# nm-dispatcher silently skips a script writable by group or other (a container has no syslog to say so), and COPY keeps
+# the build context's modes: git archive / a umask-002 checkout ships it 775. Fix the mode here, whatever the context.
+RUN chmod 0755 /etc/NetworkManager/dispatcher.d/50-resolv
 
 ENV HOME=/config \
     PROTON_LOADER_OVERRIDES=keyring=json \

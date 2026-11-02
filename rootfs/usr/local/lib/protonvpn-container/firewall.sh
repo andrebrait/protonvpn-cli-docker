@@ -79,6 +79,36 @@ keep_docker_resolver() {
   rm -f "$2"
 }
 
+# Docker's own routes (every route through eth0) live in this table, private to the container's namespace; see firewall_routes.
+FW_EGRESS_TABLE=7788
+
+# firewall_routes <4|6>: NetworkManager's WireGuard policy ("lookup main suppress_prefixlength 0", then "not fwmark <tunnel> lookup <tunnel table>",
+# priorities ~31000) sends every flow without the tunnel's fwmark into the tunnel, including the WebUI's replies and the LAN_NETWORKS flows
+# the filter lets out of eth0. Those flows must leave through eth0, but the main table cannot be trusted to pick it: Proton's kill-switch
+# interface puts its own default there (IPv6 metric 95, against Docker's 1024 on eth0), so "lookup main" would send them into the kill switch.
+# So eth0's routes are snapshotted into FW_EGRESS_TABLE (taken before NetworkManager runs, and "dev eth0" leaves out any
+# kill-switch or tunnel route an earlier run left in the main table), and two rules ahead of the tunnel policy send exactly those flows
+# there; all other traffic still follows the tunnel. Rebuilt from scratch, so a namespace that outlives a restart gets no duplicates.
+# Reads LAN_NETWORKS and WEBUI_PORT like firewall_rules.
+firewall_routes() {
+  fam=$1
+  for prio in 100 101; do
+    while ip -"$fam" rule del priority "$prio" 2>/dev/null; do :; done
+  done
+  # A table that holds nothing does not exist: showing it prints an error, flushing it fails.
+  [ -z "$(ip -"$fam" route show table "$FW_EGRESS_TABLE" 2>/dev/null)" ] || ip -"$fam" route flush table "$FW_EGRESS_TABLE" || return 1
+  # No eth0 (--network none) means no routes to keep. "show dev" leaves the device out of each line.
+  routes=$(ip -"$fam" route show dev eth0 2>/dev/null)
+  if [ -n "$routes" ]; then
+    printf '%s\n' "$routes" | sed "s/\$/ dev eth0/; s/^/route replace table $FW_EGRESS_TABLE /" | ip -"$fam" -batch - || return 1
+  fi
+  ip -"$fam" rule add priority 100 ipproto tcp sport "${WEBUI_PORT:-8788}" lookup "$FW_EGRESS_TABLE" || return 1
+  for net in $(echo "${LAN_NETWORKS:-}" | tr ',' ' '); do
+    case $net in *:*) [ "$fam" = 6 ] || continue ;; *) [ "$fam" = 4 ] || continue ;; esac
+    ip -"$fam" rule add priority 101 to "$net" lookup "$FW_EGRESS_TABLE" || return 1
+  done
+}
+
 # firewall_init: load both families before anything else touches the network; exit on any failure.
 # iptables-restore without --noflush replaces only the filter table, so Docker's nat rules survive.
 firewall_init() {
@@ -94,6 +124,7 @@ firewall_init() {
     # shellcheck disable=SC2086  # intentional word splitting of the resolver list
     rules=$(firewall_rules "$fam" "$cg" $resolvers)
     out=$(printf '%s\n' "$rules" | "$cmd" 2>&1) || { fw_log "$cmd failed: $out"; exit 1; }
+    firewall_routes "$fam" || { fw_log "ip -$fam rule failed: WebUI and LAN_NETWORKS replies would be lost while the VPN is up"; exit 1; }
   done
   set +f
   fw_log "kill switch loaded (cgroup $cg)"
