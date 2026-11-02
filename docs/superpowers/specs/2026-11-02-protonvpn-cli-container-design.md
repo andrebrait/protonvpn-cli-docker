@@ -211,12 +211,32 @@ Container variables (environment only, not editable in the WebUI):
 | Variable | Purpose | Default |
 |---|---|---|
 | `LAN_NETWORKS` | Comma-separated CIDRs reachable outside the tunnel (e.g. Unraid LAN for WebUIs of sharing containers) | empty |
-| `WEBUI_PORT` | WebUI listen port (not 8080: attached apps share this namespace's ports) | `8788` |
+| `WEBUI_PORT` | Decimal WebUI listen port `1`–`65535`, without leading zeros; invalid values stop startup before firewall loading (attached apps must use different ports) | `8788` |
 | `WEBUI_PASSWORD` | WebUI password; empty leaves the WebUI open (warning logged, dismissible banner) | empty |
+| `WEBUI_ALLOWED_NETWORKS` | Optional comma-separated source IPv4/IPv6 CIDRs or IPs for all HTTP access; empty allows normal non-VPN sources | empty |
 | `API_KEY` | Bearer token for scripts using the API; empty disables token access (see Public API) | empty |
 | `TZ` | Log timestamps | `UTC` |
 | `DEBUG` | `true` adds `--verbose` to CLI calls and NM debug logging | `false` |
 | `RECONNECT_INTERVAL` | Supervisor status-check period, seconds | `30` |
+
+### WebUI network ingress
+
+All TCP traffic to the internal `WEBUI_PORT` reaches a dedicated access chain before generic
+loopback, established-connection, LAN or tunnel accepts. Traffic arriving on `proton0` is always
+dropped first, even if its source matches the allowlist or the user permits `0.0.0.0/0` / `::/0`.
+This means the container's VPN interface, not all changing public Proton exit IPs on other paths.
+
+With `WEBUI_ALLOWED_NETWORKS` nonempty, only matching source CIDRs for that family may reach any
+HTTP surface: UI, API, login, docs and static files. There is no implicit loopback exception:
+include `127.0.0.1/32` explicitly for local HTTP clients. The network policy cannot be bypassed by
+credentials, `LAN_NETWORKS`, existing connections or forwarded headers. Empty/unset preserves
+normal non-VPN access and existing application authentication.
+
+Parse configuration as literal networks with standard-library `ipaddress`, not DNS names.
+Malformed nonempty input fails startup rather than disabling the restriction. The policy uses the
+kernel's source address; Docker/reverse proxies may mask it and must enforce real-client policy
+upstream where necessary. Recreate the container to change the environment. Docker health reads
+its private file and does not need a loopback HTTP exemption.
 
 ### Kill switch (container firewall)
 
@@ -225,10 +245,10 @@ removed. Containers attached with `--network=container:…` share this network n
 rules apply to them too.
 
 - `OUTPUT`/`INPUT` policy `DROP`; `FORWARD` `DROP`.
-- Allow for everyone in the namespace: `lo`; `ESTABLISHED,RELATED`; any traffic on the tunnel
-  interface (`proton0`); packets carrying Proton's WireGuard fwmark `0xea13b2c` (the encrypted
-  packets to the VPN endpoint, sent by the kernel); `LAN_NETWORKS` on `eth0` in both directions;
-  inbound TCP `WEBUI_PORT` on `eth0` (who can reach it is decided by Docker port publishing).
+- Except for the HTTP access policy above, allow everyone in the namespace: `lo`;
+  `ESTABLISHED,RELATED`; tunnel traffic (`proton0`); packets carrying Proton's WireGuard fwmark
+  `0xea13b2c` (the encrypted packets to the VPN endpoint); `LAN_NETWORKS` on `eth0` in both
+  directions. None of these generic exceptions overrides the HTTP access chain.
 - Docker's embedded DNS (`127.0.0.11`, user-defined networks) is reached over `lo` and forwards
   queries outside the tunnel, so traffic to `127.0.0.11` is accepted only from this container's
   own cgroup and dropped for everyone else, ahead of the `lo` rule.

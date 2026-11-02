@@ -38,7 +38,7 @@ docker run -d --name protonvpn-cli \
   ghcr.io/andrebrait/protonvpn-cli-docker:latest
 ```
 
-Open `http://YOUR_DOCKER_HOST:8788/`, unlock the WebUI, and sign in to Proton. Until the VPN is connected and the traffic check passes, the container remains running but unhealthy. Keep the published port on a trusted network; the built-in server uses HTTP, not TLS. Use a trusted HTTPS reverse proxy for remote access, rather than exposing it directly to the internet.
+Open `http://YOUR_DOCKER_HOST:8788/`, unlock the WebUI, and sign in to Proton. Until the VPN is connected and the traffic check passes, the container remains running but unhealthy. Keep the published port on a trusted network, and set `WEBUI_ALLOWED_NETWORKS` to limit which clients may connect; the built-in server uses HTTP, not TLS. Use a trusted HTTPS reverse proxy for remote access, rather than exposing it directly to the internet.
 
 To build locally instead of pulling a published image:
 
@@ -142,13 +142,35 @@ Container-only configuration is not editable in the WebUI:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `LAN_NETWORKS` | empty | Comma-separated IPv4/IPv6 CIDRs allowed outside the tunnel. Use only trusted networks. |
-| `WEBUI_PORT` | `8788` | Internal WebUI/API listen port; update Docker's port mapping if changed. |
+| `LAN_NETWORKS` | empty | Comma-separated IPv4/IPv6 CIDRs allowed outside the tunnel, for traffic such as attached application ports. Use only trusted networks. Does not grant WebUI access. |
+| `WEBUI_PORT` | `8788` | Internal WebUI/API listen port, decimal `1`–`65535` without leading zeros. Invalid values stop startup. Update Docker's port mapping if changed. |
+| `WEBUI_ALLOWED_NETWORKS` | empty | Comma-separated IPv4/IPv6 CIDRs or addresses allowed to reach the WebUI and API port. Empty allows any non-VPN source. Recreate the container to change it. See [WebUI network allowlist](#webui-network-allowlist). |
 | `WEBUI_PASSWORD` | empty | WebUI password, distinct from your Proton password. Empty enables open mode with a log warning and dismissible banner. |
 | `API_KEY` | empty | Separate bearer credential for scripts. Empty disables bearer-token access, not open-mode access. |
 | `TZ` | `UTC` | Timezone for logs. |
 | `DEBUG` | `false` | `true` / `false`; verbose CLI and NetworkManager logging. Review logs before sharing them. |
 | `RECONNECT_INTERVAL` | `30` | Supervisor connection-check interval in seconds (at least 1). |
+
+### WebUI network allowlist
+
+`WEBUI_ALLOWED_NETWORKS` filters the source address of every TCP connection to `WEBUI_PORT` before the container accepts it. It covers the whole HTTP surface: the WebUI, the API, login and logout, the API documentation, the OpenAPI JSON, and static files. It is set when the container is created and is not editable in the WebUI or API.
+
+```bash
+WEBUI_ALLOWED_NETWORKS=127.0.0.1/32,10.0.0.0/8
+```
+
+The example allows loopback and a private `10.0.0.0/8` network. Use your real LAN CIDR instead.
+
+- **Empty or unset:** any non-VPN source may reach the port, and authentication works as before. An empty list does not disable authentication, and `API_KEY` does not restrict access by itself.
+- **Set:** only sources matching a listed CIDR or address connect; all others are dropped. Each address family is checked separately, so an IPv4-only list denies every IPv6 client.
+- **Loopback is not implicit.** Include `127.0.0.1/32` (and `::1/128` for IPv6 loopback) if local clients need access.
+- **The Proton tunnel cannot reach the HTTP port.** TCP connections arriving through the tunnel to `WEBUI_PORT` are blocked even with `0.0.0.0/0,::/0` or a range that contains the tunnel address. Other TCP and UDP application/data ports remain usable through the tunnel.
+- **Invalid values fail startup.** Entries must be IPv4 or IPv6 CIDRs or single addresses; a single address means `/32` or `/128`. Hostnames are not resolved. Wildcards, malformed CIDRs, and delimiter-only values stop startup with a `WEBUI_ALLOWED_NETWORKS` error. The container never falls back to allowing every source. Whitespace around entries is ignored.
+- **The source is the address the container sees.** `X-Forwarded-For` and similar headers are ignored. A reverse proxy, or Docker's userland proxy, can replace the client address with its own, so the list must match that address. In that case, restrict real clients at the proxy.
+- **Headers, API keys, and session cookies cannot bypass the list.** A denied client never completes the TCP handshake.
+- **Not affected:** the Proton CLI and data tunnel, the health check (it reads a local file, not HTTP), and the outbound traffic check. `LAN_NETWORKS` does not admit WebUI clients; a LAN range must appear in this list to reach the WebUI.
+
+**Locked out?** The list cannot be changed from the WebUI. Edit `WEBUI_ALLOWED_NETWORKS` in the Unraid template, or in your Compose file or `docker run` command, then recreate the container and its attached containers. Unraid's Console button and `docker exec` use the CLI rather than HTTP, so they stay available for diagnosis.
 
 ## Attaching containers and hardening
 
@@ -184,7 +206,7 @@ Configure your torrent client's listening port to the reported value, and update
 
 ## API
 
-Open [the API documentation](http://localhost:8788/api) or [OpenAPI 3.1 JSON](http://localhost:8788/api/v1/openapi.json) on your Docker host (replace `localhost` for remote hosts). Both are available without authentication. The WebUI uses this same versioned API.
+Open [the API documentation](http://localhost:8788/api) or [OpenAPI 3.1 JSON](http://localhost:8788/api/v1/openapi.json) on your Docker host (replace `localhost` for remote hosts). Both are available without authentication, but `WEBUI_ALLOWED_NETWORKS` still applies: a client it denies cannot load them. The WebUI uses this same versioned API.
 
 Set a random `API_KEY` in the VPN container's environment for bearer authentication. Generate it with either command:
 

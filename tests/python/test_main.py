@@ -153,11 +153,10 @@ class WebuiPortTest(unittest.TestCase):
         self.assertEqual(self.port({"WEBUI_PORT": "9000"}), (9000, ""))
         self.assertEqual(self.port({"WEBUI_PORT": "65535"}), (65535, ""))
 
-    def test_invalid_values_fall_back_with_a_message(self):
-        for raw in ("abc", "0", "65536", "-1", "80.5", " "):
-            port, out = self.port({"WEBUI_PORT": raw})
-            self.assertEqual(port, 8788, raw)
-            self.assertIn("[webui] WEBUI_PORT", out, raw)
+    def test_noncanonical_ports_cannot_select_an_unguarded_listener(self):
+        for raw in ("0x2328", "02324", "0", "65536", "+8788", "８７８８", "8788 "):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                webui_port({"WEBUI_PORT": raw})
 
 
 class StubSupervisor:

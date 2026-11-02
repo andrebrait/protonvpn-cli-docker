@@ -26,6 +26,7 @@
     <pre><code>docker run --rm python:3-alpine python -c "import secrets; print(secrets.token_urlsafe(32))"</code></pre>
     <p>For the examples below, export <code>API_KEY</code> in your terminal to the generated key. Replace credential and code placeholders before running sign-in examples.</p>
     <p>An empty <code>API_KEY</code> disables bearer authentication. It does not close an open WebUI: when <code>WEBUI_PASSWORD</code> is empty, anyone who can reach this port can control the VPN. With a password set, use a valid session cookie or bearer key.</p>
+  <p>This page and the OpenAPI document need no login, but they are still subject to <code>WEBUI_ALLOWED_NETWORKS</code>: when that list is set, clients outside it cannot load them.</p>
     <p>Every POST needs a JSON object. Cookie and open-mode writes also need <code>X-Requested-With: protonvpn-webui</code>; only a valid bearer key skips that header. Errors use <code>{"error": "message"}</code> with a non-success HTTP status. No key or password is shown here.</p>
   </section>
   <section id="cookie-flow" class="card" aria-labelledby="h-cookie">

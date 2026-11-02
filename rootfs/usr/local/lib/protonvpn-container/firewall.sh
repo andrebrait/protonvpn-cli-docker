@@ -11,15 +11,49 @@ own_cgroup() {
   return 1
 }
 
-# firewall_rules <4|6> <own_cgroup> [resolvers...]: print an iptables-restore *filter document.
-# Reads LAN_NETWORKS (comma-separated CIDRs) and WEBUI_PORT (default 8788) from the environment.
+# webui_networks: print WEBUI_ALLOWED_NETWORKS normalized, one IP or CIDR per line; nothing when it is unset or empty (no source
+# restriction). Never resolves a name: every entry (an empty one too) must be an IP or a CIDR, or the status is 1 and a typo cannot
+# leave the WebUI open to all.
+webui_networks() {
+  [ -n "${WEBUI_ALLOWED_NETWORKS:-}" ] || return 0
+  python3 -c '
+import ipaddress, re, sys
+try:
+    for entry in sys.argv[1].split(","):
+        entry = entry.strip()
+        # Narrower than ipaddress: its netmask form ("/0.0.0.0" is "/0") and IPv6 zone ids are not CIDRs.
+        if not re.fullmatch(r"[0-9A-Fa-f:.]+(/[0-9]+)?", entry):
+            raise ValueError(f"{entry!r} is not an IP address or CIDR")
+        print(ipaddress.ip_network(entry, strict=False))
+except ValueError as err:
+    sys.exit(f"[firewall] WEBUI_ALLOWED_NETWORKS: {err}")
+' "$WEBUI_ALLOWED_NETWORKS"
+}
+
+# firewall_rules <4|6> <own_cgroup> [resolvers...]: print an iptables-restore *filter document; status 1 (nothing printed)
+# when WEBUI_ALLOWED_NETWORKS is invalid.
+# Reads LAN_NETWORKS (comma-separated CIDRs), WEBUI_ALLOWED_NETWORKS and WEBUI_PORT (default 8788) from the environment.
 firewall_rules() {
   fam=$1 cg=$2; shift 2
+  allow=$(webui_networks) || return 1
   set -f  # CIDR and resolver lists are expanded unquoted: no globbing
   echo '*filter'
   echo ':INPUT DROP [0:0]'
   echo ':OUTPUT DROP [0:0]'
   echo ':FORWARD DROP [0:0]'
+  echo ':WEBUI_HTTP - [0:0]'
+  # Every packet to the WebUI port is judged here first, so no accept below (lo, ESTABLISHED, LAN, tunnel) can wave it through.
+  # The tunnel never reaches the WebUI, allowed or not; with a list, what it does not name is dropped, loopback included.
+  # A listed source falls through to those accepts: the list only narrows who may connect, never adds an interface.
+  echo "-A INPUT -p tcp --dport ${WEBUI_PORT:-8788} -j WEBUI_HTTP"
+  echo '-A WEBUI_HTTP -i proton0 -j DROP'
+  if [ -n "$allow" ]; then
+    for net in $allow; do
+      case $net in *:*) [ "$fam" = 6 ] || continue ;; *) [ "$fam" = 4 ] || continue ;; esac
+      echo "-A WEBUI_HTTP -s $net -j RETURN"
+    done
+    echo '-A WEBUI_HTTP -j DROP'
+  fi
   if [ "$fam" = 4 ]; then
     # Docker's embedded DNS answers on lo but forwards outside the tunnel: own cgroup only.
     echo "-A OUTPUT -o lo -d 127.0.0.11 -m cgroup --path $cg -j ACCEPT"
@@ -116,6 +150,15 @@ firewall_routes() {
 # firewall_init: load both families before anything else touches the network; exit on any failure.
 # iptables-restore without --noflush replaces only the filter table, so Docker's nat rules survive.
 firewall_init() {
+  # Share the listener's parser: xtables/iproute accept hex and octal ports that Python would interpret differently.
+  WEBUI_PORT=$(python3 -c '
+from protonvpn_container.__main__ import webui_port
+try:
+    print(webui_port())
+except ValueError as err:
+    raise SystemExit(f"[firewall] {err}")
+') || exit 1
+  export WEBUI_PORT
   [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = cgroup2fs ] || { fw_log "cgroup v2 required: /sys/fs/cgroup is not cgroup2fs"; exit 1; }
   cg=$(own_cgroup) || { fw_log "cgroup v2 required: no 0:: line in /proc/self/cgroup"; exit 1; }
   mkdir -p /run/protonvpn-container
@@ -126,7 +169,7 @@ firewall_init() {
     cmd=iptables-restore
     [ "$fam" = 6 ] && cmd=ip6tables-restore
     # shellcheck disable=SC2086  # intentional word splitting of the resolver list
-    rules=$(firewall_rules "$fam" "$cg" $resolvers)
+    rules=$(firewall_rules "$fam" "$cg" $resolvers) || exit 1  # an empty document would load nothing; the reason is already printed
     out=$(printf '%s\n' "$rules" | "$cmd" 2>&1) || { fw_log "$cmd failed: $out"; exit 1; }
     firewall_routes "$fam" || { fw_log "ip -$fam rule failed: WebUI and LAN_NETWORKS replies would be lost while the VPN is up"; exit 1; }
   done

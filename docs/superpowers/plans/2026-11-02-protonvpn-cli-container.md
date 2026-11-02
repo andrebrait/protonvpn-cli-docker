@@ -632,3 +632,30 @@ must be a separate fact. The user chose observation only, not probe-triggered re
   reconnect/signin. Preserve the port-renewal timer and normal CLI state.
 - [ ] **Step 5:** Scoped adversarial review, resolve findings, commit, update the PR and release
   `latest` / `0.0.1` only after CI and acceptance pass.
+
+---
+
+### Task 9: HTTP source allowlist with mandatory VPN-interface denial
+
+**Files:** `firewall.sh`, shell unit/smoke tests; README, Unraid template, manual checklist and
+API reference access-policy description. No new application auth scheme or configurable bypass.
+
+**Interface:** `WEBUI_ALLOWED_NETWORKS`, immutable container environment, comma-separated literal
+IPv4/IPv6 CIDRs or individual IPs. Empty/unset preserves normal non-VPN access. Invalid nonempty
+input fails startup. The entire HTTP port, including API/docs/static/login, uses this policy.
+
+- [ ] **Step 1:** Network worker validates/normalizes networks with stdlib `ipaddress`; generate
+  a dedicated HTTP input chain ahead of all generic INPUT accepts. Drop `proton0` first,
+  regardless of source or broad allowlists. If configured, permit matching source ranges then
+  drop all unmatched traffic, including loopback unless explicitly included.
+- [ ] **Step 2:** Exercise real allowed and denied clients, authentication/header non-bypass,
+  loopback opt-in, address-family separation and malformed configuration. Prove incoming
+  `proton0` traffic is denied even with an allow-all list using actual packet ingress rather
+  than assuming a local request to the tunnel address traverses that interface.
+- [ ] **Step 3:** Docs worker adds the advanced unmasked template variable and explains source
+  IPs as seen by the container, proxy masking, no X-Forwarded-For trust, and the distinction from
+  LAN_NETWORKS. Include explicit local-client example `127.0.0.1/32,10.0.0.0/8`.
+- [ ] **Step 4:** Controller runs integrated network/Python/schema/lint checks and real target
+  allow/deny checks. Health must remain usable via its private file even when HTTP is denied.
+- [ ] **Step 5:** Scoped security/contract review, then update the PR and proceed to the already
+  requested public `latest` / `0.0.1` publication and anonymous-pull verification.

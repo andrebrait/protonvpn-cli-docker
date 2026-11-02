@@ -10,11 +10,13 @@
 - Versioned JSON API, optional separate bearer key and an OpenAPI 3.1 reference page with key-generation instructions.
 - Independent WireGuard-bound traffic health in the WebUI, API and Docker healthcheck, separate from Proton's connection state and without probe-triggered reconnects.
 - Always-on container firewall, fixed Proton Standard kill switch and renewable TCP/UDP port forwarding.
+- Optional HTTP source-IP allowlist, with unconditional VPN-interface blocking on the control port while forwarded application TCP/UDP traffic remains allowed.
 - Unraid template, official Proton VPN icon and amd64/arm64 image builds.
 
 ### Fixed
 
 - Recovery of DNS and WebUI access when the VPN connects or the container restarts.
+- Rejection of ambiguous HTTP port values before firewall setup, preventing hexadecimal/octal interpretation from protecting a different port than the listener.
 - Duplicate sign-in completion reapplying settings and interrupting an established connection.
 - Stale forwarded ports after disconnects, failed checks or lease expiration.
 

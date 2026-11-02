@@ -4,7 +4,7 @@
   "info": {
     "title": "Proton VPN API",
     "version": "1.0.0",
-    "description": "One versioned API for the WebUI and scripts. Configure API_KEY separately from WEBUI_PASSWORD. Access is allowed with a valid bearer key, valid session cookie, or while WEBUI_PASSWORD is empty. An empty API_KEY disables bearer authentication, not open-mode access. Only valid bearer-authenticated writes bypass X-Requested-With. All POSTs require a JSON object (maximum 8192 bytes). Use HTTPS via a trusted reverse proxy outside a trusted local network. Errors use {\"error\": \"message\"}; no legacy error fields."
+    "description": "One versioned API for the WebUI and scripts. Configure API_KEY separately from WEBUI_PASSWORD. WEBUI_ALLOWED_NETWORKS, when set, is checked first on every route, including this document; clients outside it cannot connect. Access is then allowed with a valid bearer key, valid session cookie, or while WEBUI_PASSWORD is empty. An empty API_KEY disables bearer authentication, not open-mode access. Only valid bearer-authenticated writes bypass X-Requested-With. All POSTs require a JSON object (maximum 8192 bytes). Use HTTPS via a trusted reverse proxy outside a trusted local network. Errors use {\"error\": \"message\"}; no legacy error fields."
   },
   "servers": [
     {

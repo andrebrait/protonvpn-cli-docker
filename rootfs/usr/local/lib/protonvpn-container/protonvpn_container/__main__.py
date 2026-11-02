@@ -62,9 +62,8 @@ def webui_port(environ=os.environ) -> int:
         port = int(raw)
     except ValueError:
         port = 0
-    if not 1 <= port <= 65535:
-        print(f"[webui] WEBUI_PORT must be a port from 1 to 65535 (got {raw!r}); using {DEFAULT_WEBUI_PORT}", flush=True)
-        return DEFAULT_WEBUI_PORT
+    if not 1 <= port <= 65535 or str(port) != raw:
+        raise ValueError(f"WEBUI_PORT must be a decimal port from 1 to 65535 without leading zeros (got {raw!r})")
     return port
 
 

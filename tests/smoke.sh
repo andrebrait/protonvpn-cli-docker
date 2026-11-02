@@ -151,16 +151,17 @@ resolv_survives_nm() {
   [ "$(docker exec "$C" grep '^nameserver' /etc/resolv.conf)" = "$want" ]
 }
 bridge_field() { docker network inspect bridge -f "{{(index .IPAM.Config 0).$1}}"; }
-bad_lan_fails_closed() {
-  start_container "t5b-$$-bad" -e LAN_NETWORKS=not-a-cidr || return 1
+# fails_closed <name> <env assignment> <log text>: the container stops with a non-zero status and logs <log text>.
+fails_closed() {
+  start_container "$1" -e "$2" || return 1
   i=0
   while [ "$i" -lt 10 ]; do
-    [ "$(docker inspect -f '{{.State.Running}}' "t5b-$$-bad")" = false ] && break
+    [ "$(docker inspect -f '{{.State.Running}}' "$1")" = false ] && break
     i=$((i + 1)); sleep 1
   done
-  [ "$(docker inspect -f '{{.State.Running}}' "t5b-$$-bad")" = false ] || return 1
-  [ "$(docker inspect -f '{{.State.ExitCode}}' "t5b-$$-bad")" -ne 0 ] || return 1
-  docker logs "t5b-$$-bad" 2>&1 | grep -qF '[firewall]'
+  [ "$(docker inspect -f '{{.State.Running}}' "$1")" = false ] || return 1
+  [ "$(docker inspect -f '{{.State.ExitCode}}' "$1")" -ne 0 ] || return 1
+  docker logs "$1" 2>&1 | grep -qF "$3"
 }
 
 # Connected tunnel helpers. NM's WireGuard policy sends every flow without the tunnel's fwmark into the tunnel,
@@ -326,6 +327,106 @@ print("bearer status 200; absent/wrong 401; public OpenAPI 200; bearer write 200
 ' "$2"
 }
 
+# WebUI source policy helpers.
+# ip_of / ip6_of <container> [network]: its IPv4 / global IPv6 address on the network (default bridge).
+ip_of() { docker inspect -f "{{(index .NetworkSettings.Networks \"${2:-bridge}\").IPAddress}}" "$1"; }
+ip6_of() { docker inspect -f "{{(index .NetworkSettings.Networks \"${2:-bridge}\").GlobalIPv6Address}}" "$1"; }
+# http_from <client> <url> [header...]: GET from <client>; prints the status, "timeout" when nothing answers within 5 seconds (a dropped
+# SYN), "error" for anything else (a refusal included).
+http_from() {
+  hc=$1; shift
+  docker exec "$hc" python3 -c '
+import sys, urllib.error, urllib.request
+req = urllib.request.Request(sys.argv[1], headers=dict(h.split(": ", 1) for h in sys.argv[2:]))
+try:
+    print(urllib.request.urlopen(req, timeout=5).status)
+except urllib.error.HTTPError as err:
+    print(err.code)
+except (TimeoutError, urllib.error.URLError) as err:
+    print("timeout" if isinstance(getattr(err, "reason", err), TimeoutError) else "error")
+' "$@"
+}
+# http_is <status|timeout> <client> <url> [header...]
+http_is() { want=$1; shift; [ "$(http_from "$@")" = "$want" ]; }
+# v6_listener <container>: the stand-in for an IPv6 WebUI (the real one binds IPv4 only): a listener on the WebUI port, IPv6 only.
+v6_listener() {
+  docker exec -d "$1" python3 -c 'import socket, time
+s = socket.socket(socket.AF_INET6); s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+s.bind(("::", 8788)); s.listen(); time.sleep(600)'
+}
+listening6() { docker exec "$1" ss -ltn 'sport = :8788' | grep -q '\[::\]'; }
+# proton0_data <product> <client>: the same tunnel client that cannot reach the control port exchanges TCP and UDP application data.
+proton0_data() {
+  docker exec -d "$1" python3 -c '
+import selectors, socket
+sel = selectors.DefaultSelector()
+for family, addr in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):
+    for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+        s = socket.socket(family, kind)
+        if family == socket.AF_INET6:
+            s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        s.bind((addr, 51413))
+        if kind == socket.SOCK_STREAM:
+            s.listen()
+        sel.register(s, selectors.EVENT_READ, kind)
+while True:
+    for key, _ in sel.select():
+        if key.data == socket.SOCK_DGRAM:
+            data, addr = key.fileobj.recvfrom(1024)
+            key.fileobj.sendto(data, addr)
+        else:
+            conn, _ = key.fileobj.accept()
+            with conn:
+                conn.settimeout(5)
+                conn.sendall(conn.recv(16, socket.MSG_WAITALL))
+' || return 1
+  eventually 10 docker exec "$2" python3 -c '
+import socket
+for family, addr in ((socket.AF_INET, "10.77.0.1"), (socket.AF_INET6, "fd77::1")):
+    for kind in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
+        with socket.socket(family, kind) as s:
+            s.settimeout(5)
+            s.connect((addr, 51413))
+            s.sendall(b"application-data")
+            assert s.recv(16, socket.MSG_WAITALL if kind == socket.SOCK_STREAM else 0) == b"application-data", (addr, kind)
+'
+}
+wg_handshaken() { [ "$(docker exec "$1" wg show wgq latest-handshakes | cut -f2)" -gt 0 ]; }
+# proton0_pair <product container> <client container>: proton0 (the interface name the filter treats as the tunnel) in the product is a
+# WireGuard link to wgq in the client. The product opens it, with the tunnel fwmark, so its UDP leaves the kill switch and the answers
+# are ESTABLISHED. The client reaches the product at 10.77.0.1 / fd77::1 through it, and the egress table that rule 100 selects for the
+# WebUI's replies routes them back into it (without that route the handshake could not complete, drop or no drop).
+proton0_pair() {
+  pk=$(docker exec "$1" wg genkey) && qk=$(docker exec "$2" wg genkey) || return 1
+  ppub=$(echo "$pk" | docker exec -i "$1" wg pubkey) && qpub=$(echo "$qk" | docker exec -i "$2" wg pubkey) || return 1
+  docker exec -i "$2" sh -es "$qk" "$ppub" <<'EOF' || return 1
+ip link add wgq type wireguard
+echo "$1" | wg set wgq private-key /dev/stdin listen-port 51820 peer "$2" allowed-ips 10.77.0.1/32,fd77::1/128
+ip addr add 10.77.0.2/32 dev wgq; ip -6 addr add fd77::2/128 dev wgq; ip link set wgq up
+ip route add 10.77.0.1/32 dev wgq; ip -6 route add fd77::1/128 dev wgq
+EOF
+  docker exec -i "$1" sh -es "$pk" "$qpub" "$(ip_of "$2")" <<'EOF' || return 1
+egress_table() { ip -"$1" rule show | sed -n "s/.*sport 8788 lookup \([0-9][0-9]*\).*/\1/p"; }
+ip link add proton0 type wireguard
+echo "$1" | wg set proton0 private-key /dev/stdin listen-port 51821 fwmark 0xea13b2c peer "$2" endpoint "$3:51820" allowed-ips 10.77.0.2/32,fd77::2/128 persistent-keepalive 1
+ip addr add 10.77.0.1/32 dev proton0; ip -6 addr add fd77::1/128 dev proton0; ip link set proton0 up
+ip route add 10.77.0.2/32 dev proton0; ip -6 route add fd77::2/128 dev proton0
+ip route add 10.77.0.2/32 dev proton0 table "$(egress_table 4)"; ip -6 route add fd77::2/128 dev proton0 table "$(egress_table 6)"
+EOF
+  eventually 15 wg_handshaken "$2"
+}
+# proton0_drop_only <product container> <client container>: with the WebUI up (IPv4) and a stand-in listening (IPv6), the client cannot
+# connect through proton0; with the drop rules taken out the same connections complete, and put back they are dropped again.
+proton0_drop_only() {
+  eventually 20 webui_says "$1" /api/v1/state '^200$' || return 1
+  v6_listener "$1" && eventually 5 listening6 "$1" || return 1
+  blocked_from "$2" 10.77.0.1 8788 && blocked_from "$2" fd77::1 8788 || return 1
+  docker exec "$1" iptables -D WEBUI_HTTP -i proton0 -j DROP && docker exec "$1" ip6tables -D WEBUI_HTTP -i proton0 -j DROP || return 1
+  tcp_from "$2" 10.77.0.1 8788 && tcp_from "$2" fd77::1 8788; open=$?
+  docker exec "$1" iptables -I WEBUI_HTTP 1 -i proton0 -j DROP && docker exec "$1" ip6tables -I WEBUI_HTTP 1 -i proton0 -j DROP || return 1
+  [ "$open" -eq 0 ] && blocked_from "$2" 10.77.0.1 8788 && blocked_from "$2" fd77::1 8788
+}
+
 C=t5b-$$-smoke
 mkdir -p "$TMP/Proton"
 echo '{}' > "$TMP/Proton/stale.json"
@@ -396,7 +497,78 @@ assert "ipv6 lan allowed" reachable_from "t5b-$$-v6-att" "$V6PEER" 9
 run_container "t5b-$$-v6n" --network "t5b-$$-v6" || { echo "FAIL v6n boot"; exit 1; }
 attach "t5b-$$-v6n-att" "t5b-$$-v6n" || { echo "FAIL attach"; exit 1; }
 assert "ipv6 lan blocked without LAN_NETWORKS" blocked_from "t5b-$$-v6n-att" "$V6PEER" 9
-assert "bad LAN fails closed" bad_lan_fails_closed
+assert "bad LAN fails closed" fails_closed "t5b-$$-bad" LAN_NETWORKS=192.0.2.0/33 '[firewall]'
+for port in 0 0x2328 02324; do
+  assert "ambiguous WEBUI_PORT '$port' fails closed" fails_closed "t5b-$$-badport$port" "WEBUI_PORT=$port" WEBUI_PORT
+done
+
+# WEBUI_ALLOWED_NETWORKS, judged on real TCP between containers: a client's address is the one the WebUI container sees.
+# The list is the container's environment, so each case is its own container.
+n=0
+for bad in example.com '10.0.0.*' 10.0.0.0/33 ',,' '10.0.0.0/8,fd00::/129'; do
+  n=$((n + 1))
+  assert "invalid WEBUI_ALLOWED_NETWORKS '$bad' fails closed" fails_closed "t5b-$$-badnet$n" "WEBUI_ALLOWED_NETWORKS=$bad" WEBUI_ALLOWED_NETWORKS
+done
+
+CONTAINERS="$CONTAINERS t5b-$$-peer2"
+docker run -d --name "t5b-$$-peer2" --entrypoint sleep "$IMAGE" infinity >/dev/null
+PEER1=$(ip_of "t5b-$$-peer") ACL_KEY=$(openssl rand -hex 32)
+# LAN_NETWORKS covers both peers: it admits them to other ports, but must not admit the unlisted one to the WebUI.
+ACL=t5b-$$-acl
+run_container "$ACL" -e WEBUI_ALLOWED_NETWORKS="$PEER1" -e LAN_NETWORKS="$(bridge_field Subnet)" -e WEBUI_PASSWORD=x -e API_KEY="$ACL_KEY" \
+  || { echo "FAIL allowlist boot"; exit 1; }
+ACLIP=$(ip_of "$ACL")
+assert "allowlist: a listed client is served the API with its key" eventually 20 http_is 200 "t5b-$$-peer" "http://$ACLIP:8788/api/v1/status" "Authorization: Bearer $ACL_KEY"
+assert "allowlist: a listed client is served the page" http_is 200 "t5b-$$-peer" "http://$ACLIP:8788/"
+assert "allowlist: an unlisted LAN client never completes the handshake" blocked_from "t5b-$$-peer2" "$ACLIP" 8788
+assert "allowlist: forged forwarding headers and a valid key do not help" http_is timeout "t5b-$$-peer2" "http://$ACLIP:8788/api/v1/status" \
+  "Authorization: Bearer $ACL_KEY" "X-Forwarded-For: $PEER1" "X-Real-IP: $PEER1" "Forwarded: for=$PEER1"
+assert "allowlist: the public API docs are behind the same policy" http_is timeout "t5b-$$-peer2" "http://$ACLIP:8788/api/v1/openapi.json"
+assert "allowlist: other ports still follow LAN_NETWORKS" reachable_from "t5b-$$-peer2" "$ACLIP" 9
+assert "allowlist: loopback is not implicitly allowed" blocked_from "$ACL" 127.0.0.1 8788
+assert "allowlist: the container's own address is not implicitly allowed" blocked_from "$ACL" "$ACLIP" 8788
+assert "allowlist: healthcheck does not need HTTP" unhealthy_when_signed_out "$ACL"
+ACLO=t5b-$$-aclo
+run_container "$ACLO" -e WEBUI_ALLOWED_NETWORKS=127.0.0.1 -e LAN_NETWORKS="$(bridge_field Subnet)" || { echo "FAIL loopback allowlist boot"; exit 1; }
+assert "allowlist: loopback listed, the WebUI answers in the container" eventually 20 webui_says "$ACLO" /api/v1/state '^200$'
+assert "allowlist: loopback listed, a client in LAN_NETWORKS is still dropped" blocked_from "t5b-$$-peer" "$(ip_of "$ACLO")" 8788
+
+# IPv6 has its own list: the WebUI listens on IPv4 only, so a stand-in listener on the same port takes its place for IPv6.
+CONTAINERS="$CONTAINERS t5b-$$-v6peer2"
+docker run -d --name "t5b-$$-v6peer2" --network "t5b-$$-v6" --entrypoint sleep "$IMAGE" infinity >/dev/null
+ACL6=t5b-$$-acl6
+run_container "$ACL6" --network "t5b-$$-v6" -e WEBUI_ALLOWED_NETWORKS="$V6PEER" || { echo "FAIL ipv6 allowlist boot"; exit 1; }
+ACL6IP=$(ip6_of "$ACL6" "t5b-$$-v6")
+v6_listener "$ACL6" || { echo "FAIL ipv6 stand-in listener"; exit 1; }
+assert "ipv6 allowlist: stand-in is listening" eventually 10 listening6 "$ACL6"
+assert "ipv6 allowlist: a listed client connects" tcp_from "t5b-$$-v6peer" "$ACL6IP" 8788
+assert "ipv6 allowlist: an unlisted client never completes the handshake" blocked_from "t5b-$$-v6peer2" "$ACL6IP" 8788
+assert "ipv6 allowlist: no IPv4 entry, so no IPv4 client" blocked_from "t5b-$$-v6peer" "$(ip_of "$ACL6" "t5b-$$-v6")" 8788
+
+# Packets that really arrive on proton0: a WireGuard pair in which the container opens the tunnel, so that the kill switch lets the
+# UDP out and takes the answers as ESTABLISHED. With no list and with allow-all, the tunnel's clients never reach the WebUI, and the drop
+# is the only thing that stops them: without it the same connections complete.
+for mode in open all local; do
+  CONTAINERS="$CONTAINERS t5b-$$-q0$mode"
+  docker run -d --name "t5b-$$-q0$mode" --cap-add NET_ADMIN --entrypoint sleep "$IMAGE" infinity >/dev/null
+done
+run_container "t5b-$$-p0open" || { echo "FAIL proton0 boot"; exit 1; }
+run_container "t5b-$$-p0all" -e WEBUI_ALLOWED_NETWORKS=0.0.0.0/0,::/0 || { echo "FAIL proton0 boot"; exit 1; }
+run_container "t5b-$$-p0local" -e WEBUI_ALLOWED_NETWORKS=127.0.0.1 || { echo "FAIL proton0 boot"; exit 1; }
+for mode in open all local; do
+  assert "proton0 ($mode): the tunnel is up" proton0_pair "t5b-$$-p0$mode" "t5b-$$-q0$mode"
+  if [ "$mode" = local ]; then
+    assert "proton0 ($mode): an unlisted eth0 client is dropped" blocked_from "t5b-$$-peer" "$(ip_of "t5b-$$-p0$mode")" 8788
+  else
+    assert "proton0 ($mode): an eth0 client is served" eventually 20 tcp_from "t5b-$$-peer" "$(ip_of "t5b-$$-p0$mode")" 8788
+  fi
+  assert "proton0 ($mode): the same peer exchanges TCP and UDP application data" proton0_data "t5b-$$-p0$mode" "t5b-$$-q0$mode"
+  if [ "$mode" = local ]; then
+    assert "proton0 ($mode): the same unlisted peer cannot reach the control port" blocked_from "t5b-$$-q0$mode" 10.77.0.1 8788
+  else
+    assert "proton0 ($mode): tunnel clients never reach the WebUI, and only the drop stops them" proton0_drop_only "t5b-$$-p0$mode" "t5b-$$-q0$mode"
+  fi
+done
 
 # Connected tunnel (needs the IPv6 network above): the WebUI answers and LAN_NETWORKS stay reachable, all else goes into the tunnel,
 # with the kill-switch interface's default routes in the main table. $HOLD owns the namespace, so it outlives $POL's restarts.
