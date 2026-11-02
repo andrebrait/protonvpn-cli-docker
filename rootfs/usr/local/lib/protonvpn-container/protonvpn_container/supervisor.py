@@ -10,7 +10,10 @@ Its result is kept only while the connection it was made on is still the current
 """
 
 import collections
+import contextlib
+import json
 import os
+import tempfile
 import sys
 import threading
 import time
@@ -49,6 +52,10 @@ KILL_SWITCH_PAIR = (KILL_SWITCH_KEY, ["standard"])
 CLI_USAGE_ERROR = 2  # click UsageError: the value is invalid. Any other rc (1: network, local agent; 124; 127) is transient
 # Checks a connect waits for settings that keep failing transiently; the tunnel has priority.
 SETTINGS_RETRIES = 3
+# The only supported tunnel: the firewall, the tunnel check and the traffic sampler all assume WireGuard's proton0.
+PROTOCOL = "wireguard"
+# The CLI has no protocol command; Proton reads this JSON file (persisted under /config) on every invocation.
+NATIVE_SETTINGS = "/etc/Proton/VPN/settings.json"
 
 
 def log(message: str) -> None:
@@ -58,6 +65,30 @@ def log(message: str) -> None:
 def say(out: str) -> None:
     for line in out.splitlines():
         log(f"[protonvpn] {line}")
+
+
+def pin_protocol(path: str) -> None:
+    """Pin Proton's protocol without losing other settings; unreadable state blocks connecting."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = {}
+    if not isinstance(data, dict):
+        raise ValueError("native settings must be a JSON object")
+    if data.get("protocol") == PROTOCOL:
+        return
+    data["protocol"] = PROTOCOL
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".settings-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+        raise
 
 
 def decide(signed_in: bool, connected: bool, user_disconnected: bool) -> str:
@@ -80,10 +111,11 @@ class Supervisor:
         exit_fn=os._exit,
         timer=threading.Timer,
         health_file: str = HEALTH_FILE,
+        native_settings: str = NATIVE_SETTINGS,
     ):
         self._store, self._run, self._tool, self._clock = store, run, tool, clock
         self._interval, self._port_file, self._exit, self._timer = interval, port_file, exit_fn, timer
-        self._health_file = health_file
+        self._health_file, self._native_settings = health_file, native_settings
         self._thread = self._health_thread = None
         self._stop = threading.Event()
         self._cli_lock = threading.Lock()  # one CLI mutation at a time: tick vs apply_setting
@@ -245,6 +277,7 @@ class Supervisor:
             self._failures = 0
             self._next_check = 0.0
             return True, "saved; connecting"
+        self._withdraw_forwarding()  # cleanup needs the old tunnel's source identity
         self._drop_connection()  # reconnecting: the old connection and its port are gone from here on
         say(self._run("disconnect").out)
         if self._connect():
@@ -290,6 +323,10 @@ class Supervisor:
             self._next_natpmp = 0.0  # the port is requested again at the first good check
             return
         account, st = parse_account(info.out), parse_status(status.out)
+        if self._reject_protocol(st):
+            with self._lock:
+                self._signed_in, self._account = bool(account), account
+            return
         with self._lock:
             if self._stop.is_set():
                 return
@@ -306,6 +343,8 @@ class Supervisor:
                 self._disconnect_pending = False
         if not st.connected:
             self._drop_connection()
+        if account and not st.connected and not self._pin_protocol():
+            return  # native config setters can rewrite malformed state too: validate before they run
         pending: list[str] = []
         if not account:
             self._new_session()
@@ -347,25 +386,55 @@ class Supervisor:
                 self._exit_ip = ""  # the next connection, ours or adopted, has its own
         self._was_connected = connected
 
+    def _reject_protocol(self, st: Status) -> bool:
+        if not st.connected or st.protocol.lower() == PROTOCOL:
+            return False
+        message = f"connected over {st.protocol or 'an unknown protocol'}, not {PROTOCOL}; disconnecting"
+        self._drop_connection()  # revoke publication before a slow or unsuccessful native disconnect
+        self._withdraw_forwarding()
+        self._was_connected = False
+        with self._lock:
+            self._last_error = message
+        log(f"[protonvpn] {message}")
+        say(self._run("disconnect", timeout=STOP_DISCONNECT_TIMEOUT).out)
+        return True
+
     def _read_status(self) -> Status:
         st = parse_status(self._run("status").out)
+        if self._reject_protocol(st):
+            return Status()
         with self._lock:
             if self._stop.is_set():
                 st = Status()
             self._st = st
         return st
 
+    def _pin_protocol(self) -> bool:
+        try:
+            pin_protocol(self._native_settings)
+        except (OSError, ValueError) as exc:
+            message = f"cannot set the {PROTOCOL} protocol in {self._native_settings}: {exc}"
+            log(f"[protonvpn] {message}")
+            with self._lock:
+                self._last_error = message
+            return False
+        return True
+
     def _connect(self) -> bool:
         """False means a connection failure; a canceled attempt is handled without backoff or target rollback."""
         with self._lock:
             if self._stop.is_set() or self._user_disconnected:
                 return True
+        if not self._pin_protocol():  # target changes also enter here directly
+            return False
         self._mappings.clear()  # a fresh connect may have a different Proton source identity
         res = self._run("connect", *connect_args(self._store))
         say(res.out)
         with self._lock:
             canceled = self._stop.is_set() or self._user_disconnected
         st = Status() if canceled or res.rc != 0 else parse_status(self._run("status").out)
+        if self._reject_protocol(st):
+            return False
         with self._lock:
             canceled = canceled or self._stop.is_set() or self._user_disconnected
             if not canceled:
@@ -535,7 +604,10 @@ class Supervisor:
             return
         with self._lock:
             connected, leaving = self._st.connected, self._disconnect_pending
-        if not connected or leaving or self._stop.is_set():
+        if not connected or self._stop.is_set():
+            return
+        if leaving:  # a failed Disconnect can leave the tunnel up: delete its mappings while it still can
+            self._withdraw_forwarding()
             return
         if self._clock() >= self._next_natpmp:
             self._refresh_port()

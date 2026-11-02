@@ -303,10 +303,13 @@ A thread in the Python service, every `RECONNECT_INTERVAL` seconds:
 
 1. Not signed in → log the signin hint every 60 s, keep checking.
 2. Signed in, settings not yet applied this session → apply effective settings.
-3. `protonvpn status` first line is not `Status: Connected` → run
+3. `protonvpn status` first line is not `Status: Connected` → set `"protocol": "wireguard"` in Proton's
+   saved `settings.json` (the CLI has no protocol command; failure counts as a failed connect), then run
    `protonvpn connect <target args>`; on failure log the CLI output and retry with backoff
    (30 s, 60 s, 120 s, capped at 300 s). A user-initiated disconnect from the WebUI suspends
-   reconnecting until the user connects again or the container restarts.
+   reconnecting until the user connects again or the container restarts. A connected tunnel whose
+   protocol is not WireGuard is disconnected and never reported as connected; a failed Disconnect
+   still deletes the forwarding mappings while the tunnel is up.
 4. Connected and effective port forwarding on → every 45 s run
    `natpmpc -a 1 0 udp 60 -g 10.2.0.1` and `natpmpc -a 1 0 tcp 60 -g 10.2.0.1`, parse
    `Mapped public port N ... lifetime L` (exit code 0, 1..65535 port and positive lifetime required),

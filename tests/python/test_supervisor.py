@@ -56,6 +56,8 @@ class FakeCli:
         self.connect_duration = 0
         self.slow = {}  # argv -> seconds the call takes; a call given a shorter timeout is cut off at it, as the real one is
         self.during = {}  # argv -> fn(), run while that call is blocked: time passes, timers fire
+        self.protocol = "wireguard"
+        self.native_settings = None  # when set, a connect uses the protocol saved there, as Proton's does
 
     def __call__(self, *args, timeout=120):
         self.calls.append((self.clock.now, args))
@@ -75,11 +77,17 @@ class FakeCli:
         if args == ("info",):
             return Result(0, f"Account: '{'me@proton.me' if self.signed_in else 'None'}'\n")
         if args == ("status",):
-            return Result(0, STATUS_UP if self.connected else "Status: Disconnected\n")
+            return Result(0, STATUS_UP.replace("wireguard", self.protocol) if self.connected else "Status: Disconnected\n")
         if args[:3] == ("config", "set", "kill-switch") and self.connected:
             return Result(2, "Error: Disconnect before changing Kill Switch. Run 'protonvpn disconnect' first.\n")
         if args[0] == "connect":
             self.clock.now += self.connect_duration
+            if self.native_settings:
+                try:
+                    with open(self.native_settings) as f:
+                        self.protocol = json.load(f).get("protocol", "protun-smart")
+                except FileNotFoundError:
+                    self.protocol = "protun-smart"  # Proton's free-tier default when nothing is saved
             if self.connect_rc:
                 return Result(self.connect_rc, "Error: Connection failed.\n")
             self.connected = True
@@ -178,6 +186,8 @@ class SupervisorCase(unittest.TestCase):
         self.tool.responses[PROBE] = PROBE_OK
 
     def make(self, environ=None, file=None):
+        self.native_settings = os.path.join(self.dir, "Proton", "VPN", "settings.json")
+        self.cli.native_settings = self.native_settings
         path = os.path.join(self.dir, "settings.json")
         if file is not None:
             with open(path, "w") as f:
@@ -193,6 +203,7 @@ class SupervisorCase(unittest.TestCase):
             exit_fn=self.exits.append,
             timer=self.timers,
             health_file=self.health_file,
+            native_settings=self.native_settings,
         )
         return self.sup
 
@@ -1144,6 +1155,73 @@ class NatpmpTest(SupervisorCase):
         self.sup._run = run
         return disabled
 
+    def test_unsupported_tunnel_rejection_withdraws_live_leases_even_if_disconnect_fails(self):
+        for requested in (False, True):
+            with self.subTest(user_disconnect=requested):
+                self.cli.connected, self.cli.protocol = False, "wireguard"
+                self.cli.responses.pop(("disconnect",), None)
+                self.make(file={"PORT_FORWARDING": "on"})
+                state = self.native_natpmp()
+                self.tick()
+                self.sup.health_tick()
+                self.cli.protocol = "openvpn-tcp"
+                self.cli.responses[("disconnect",)] = Result(1, "disconnect failed")
+                if requested:
+                    self.sup.request_disconnect()
+                self.tick(30)
+                self.tick(1)
+                self.assertTrue(self.cli.connected)
+                snap = self.sup.snapshot()
+                self.assertEqual((snap["connected"], snap["tunnel_healthy"], snap["forwarded_port"]), (False, False, None))
+                with open(state) as f:
+                    remote = json.load(f)
+                self.assertEqual((remote["own"], remote["deletes"]), ({}, ["udp", "tcp"]))
+                self.assertEqual(remote["other"], {"udp": 50000, "tcp": 50000})
+                self.assertEqual(self.read_port_file(), "")
+
+    def test_failed_disconnect_deletes_the_mappings_of_the_tunnel_left_up(self):
+        self.make(file={"PORT_FORWARDING": "on"})
+        state = self.native_natpmp()
+        self.tick()
+        self.cli.responses[("disconnect",)] = Result(1, "Error: disconnect failed\n")
+        self.sup.request_disconnect()
+        self.tick(1)
+        self.tick(1)
+        self.assertTrue(self.cli.connected)
+        with open(state) as f:
+            remote = json.load(f)
+        self.assertEqual((remote["own"], remote["deletes"]), ({}, ["udp", "tcp"]))
+        self.assertEqual((self.sup.snapshot()["forwarded_port"], self.read_port_file()), (None, ""))
+        self.tick(1)
+        with open(state) as f:
+            self.assertEqual(json.load(f), remote)  # one deletion, and no new mapping while leaving
+
+    def test_target_change_deletes_old_mappings_before_disconnect(self):
+        self.make(file={"PORT_FORWARDING": "on"})
+        state = self.native_natpmp()
+        self.tick()
+        self.assertEqual(self.sup.snapshot()["forwarded_port"], 41404)
+        disabled = os.path.join(self.dir, "natpmpc.disabled")
+
+        def disconnect():
+            with open(state) as f:
+                remote = json.load(f)
+            self.assertEqual(remote["own"], {})
+            self.assertEqual(remote["other"], {"udp": 50000, "tcp": 50000})
+            self.assertEqual((self.sup.snapshot()["forwarded_port"], self.read_port_file()), (None, ""))
+            with open(disabled, "w"):
+                pass
+
+        self.cli.during[("disconnect",)] = disconnect
+        self.cli.during[("connect", "--country", "CH")] = lambda: os.unlink(disabled)
+        self.assertEqual(self.apply("COUNTRY", "CH"), (True, "reconnected"))
+        self.tick(1)
+        with open(state) as f:
+            remote = json.load(f)
+        self.assertEqual(remote["deletes"], ["udp", "tcp"])
+        self.assertEqual(remote["own"], {"udp": 41404, "tcp": 41404})
+        self.assertEqual((self.sup.snapshot()["forwarded_port"], self.read_port_file()), (41404, "41404\n"))
+
     def test_off_deletes_only_this_source_protocols_once_and_on_reacquires(self):
         self.make(file={"PORT_FORWARDING": "on"})
         state = self.native_natpmp()
@@ -1806,6 +1884,100 @@ class HealthStopTest(HealthCase):
             self.sup._health_thread.join(5)
         self.assertFalse(self.sup._health_thread.is_alive())
         self.assertEqual((self.health(), self.docker_says_healthy(), self.health_lines()), ((False, "", None), False, []))
+
+
+class ProtocolTest(SupervisorCase):
+    """Only WireGuard: Proton's saved protocol picks the backend of every connect, and the CLI has no command for it."""
+
+    def save_native(self, data):
+        os.makedirs(os.path.dirname(self.native_settings), exist_ok=True)
+        with open(self.native_settings, "w") as f:
+            json.dump(data, f)
+
+    def test_connect_saves_wireguard_and_keeps_the_other_native_settings(self):
+        self.make()
+        self.save_native({"protocol": "openvpn-tcp", "killswitch": 1})
+        self.tick()
+        self.assertEqual(self.cli.protocol, "wireguard")
+        with open(self.native_settings) as f:
+            self.assertEqual(json.load(f), {"protocol": "wireguard", "killswitch": 1})
+        self.assertEqual(stat.S_IMODE(os.stat(self.native_settings).st_mode), 0o600)
+        self.assertEqual(self.sup.snapshot()["protocol"], "wireguard")
+
+    def test_nothing_saved_connects_over_wireguard_not_the_tier_default(self):
+        self.make()
+        self.tick()
+        self.assertEqual((self.cli.protocol, self.sup.snapshot()["connected"]), ("wireguard", True))
+
+    def test_an_adopted_openvpn_tunnel_is_replaced_by_wireguard(self):
+        self.cli.connected, self.cli.protocol = True, "openvpn-udp"
+        self.make()
+        self.tick()
+        self.assertEqual(len(self.cli.argvs("disconnect")), 1)
+        self.assertFalse(self.sup.snapshot()["connected"])
+        self.tick(30)
+        self.assertEqual(self.cli.protocol, "wireguard")
+        snap = self.sup.snapshot()
+        self.assertEqual((snap["connected"], snap["protocol"], snap["last_error"]), (True, "wireguard", ""))
+
+    def test_an_unsupported_tunnel_that_will_not_disconnect_is_never_vouched_for(self):
+        self.cli.connected, self.cli.protocol = True, "openvpn-tcp"
+        self.cli.responses[("disconnect",)] = Result(1, "Error: disconnect failed\n")
+        self.make(file={"PORT_FORWARDING": "on"})
+        self.tick()
+        self.tick(1)
+        snap = self.sup.snapshot()
+        self.assertEqual((snap["connected"], snap["forwarded_port"]), (False, None))
+        self.assertIn("openvpn-tcp", snap["last_error"])
+        self.assertEqual((self.cli.argvs("connect"), [a for a in self.tool.calls if a[0] == "natpmpc"]), ([], []))
+        self.tick(30)
+        self.assertEqual(len(self.cli.argvs("disconnect")), 2)  # tried again at the next check
+
+    def test_a_protocol_that_cannot_be_saved_stops_the_connect(self):
+        self.make()
+        os.makedirs(self.native_settings)  # unreadable as a file
+        self.tick()
+        self.assertEqual(self.cli.argvs("connect"), [])
+        self.assertIn("cannot set the wireguard protocol", self.sup.snapshot()["last_error"])
+
+    def test_unsupported_adoption_is_not_published_during_disconnect(self):
+        self.make()
+        self.cli.connected, self.cli.protocol = True, "openvpn-tcp"
+        seen = []
+        self.cli.during[("disconnect",)] = lambda: seen.append(self.sup.snapshot())
+        self.tick()
+        self.assertTrue(seen)
+        self.assertFalse(seen[0]["connected"])
+        self.assertIsNone(seen[0]["forwarded_port"])
+
+    def test_connect_rejects_a_non_wireguard_result_even_after_pinning(self):
+        self.make(file={"PORT_FORWARDING": "on"})
+        # Simulate native code ignoring the saved preference, or a console writer racing it.
+        self.cli.responses[("status",)] = [
+            Result(0, "Status: Disconnected\n"),
+            Result(0, STATUS_UP.replace("wireguard", "openvpn-tcp")),
+        ]
+        self.tick()
+        self.assertFalse(self.sup.snapshot()["connected"])
+        self.assertIsNone(self.sup.snapshot()["forwarded_port"])
+        self.assertEqual(len(self.cli.argvs("disconnect")), 1)
+        self.assertIn("openvpn-tcp", self.sup.snapshot()["last_error"])
+
+    def test_invalid_native_settings_are_preserved_and_block_connect(self):
+        for raw in ('{"protocol": "openvpn-tcp",', '["openvpn-tcp"]', '\ud800'):
+            with self.subTest(raw=raw):
+                self.make()
+                os.makedirs(os.path.dirname(self.native_settings), exist_ok=True)
+                original = raw.encode("utf-8", errors="surrogatepass")
+                with open(self.native_settings, "wb") as f:
+                    f.write(original)
+                # Native config set ignores malformed JSON and can persist defaults; it must not run first.
+                self.cli.during[("config", "set", "anonymous-crash-reports", "off")] = lambda: self.save_native({})
+                self.tick()
+                self.assertEqual(self.cli.argvs("connect"), [])
+                with open(self.native_settings, "rb") as f:
+                    self.assertEqual(f.read(), original)
+
 
 
 if __name__ == "__main__":
