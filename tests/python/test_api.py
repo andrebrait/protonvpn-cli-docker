@@ -135,6 +135,7 @@ class ApiTest(WebuiCase):
                     self.store, run=cli, tool=FakeTool(), clock=clock,
                     port_file=self.settings_path + ".port",
                     health_file=self.settings_path + ".health",
+                    native_settings=self.settings_path + ".native",
                 )
                 supervisor.tick()
                 self.server.ui.supervisor = supervisor
@@ -201,6 +202,7 @@ class ApiTest(WebuiCase):
         supervisor = Supervisor(
             self.store, run=self.cli, tool=tool, clock=self.clock, port_file=self.port_file, timer=FakeTimers(),
             health_file=self.settings_path + ".health",
+            native_settings=self.settings_path + ".native",
         )
         self.server.ui.supervisor = supervisor
         supervisor.tick()
