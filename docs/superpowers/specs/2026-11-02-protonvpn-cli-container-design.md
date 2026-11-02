@@ -244,9 +244,22 @@ rules apply to them too.
 - No hostname allow-list and no re-resolution: the exception is scoped by origin, not
   destination.
 - The CLI's own `standard` kill switch stays enabled as defence in depth.
+- OUTPUT `ESTABLISHED,RELATED` on `eth0` is accepted only for this container's own cgroup, plus
+  replies from `WEBUI_PORT` (a lingering flow from an attached container must not keep leaving
+  `eth0` after the tunnel drops). IPv6 neighbour discovery is accepted on `eth0` so IPv6
+  `LAN_NETWORKS` work.
 
-Acceptance, each case checked from this container **and** from an attached container: with the CLI
-killed (`pkill -f /usr/bin/protonvpn`), after `protonvpn disconnect`, and while signed out:
+Threat model (decided 2026-11-02): the kill switch prevents **accidental** leaks from ordinary
+applications in attached containers. It does not contain deliberately hostile code: any process
+holding `CAP_NET_RAW` (granted by Docker by default) can set Proton's fwmark with `SO_MARK` or
+send raw frames with `AF_PACKET`, and a process with `CAP_NET_ADMIN` can rewrite the rules; no
+firewall inside a shared namespace can stop that. The README and the Unraid template recommend
+`--cap-drop=NET_RAW` (and never `NET_ADMIN`) for attached containers, and starting them after this
+container reports healthy (the rules load about half a second after start).
+
+Acceptance, each case checked from this container **and** from an attached container without
+`NET_RAW`/`NET_ADMIN` misuse: with the CLI killed (`pkill -f /usr/bin/protonvpn`), after
+`protonvpn disconnect`, and while signed out:
 
 - the attached container cannot reach any non-LAN address on any port, DNS included;
 - this container can reach only TCP 443 and port 53 outside the tunnel.
