@@ -16,16 +16,20 @@ the source of truth.
 
 Success criteria:
 
-1. A user signs in once from the container console; the session survives container recreation.
-2. The connection target and every CLI setting are configurable through environment variables.
+1. A user signs in once, from the WebUI or the container console; the session survives container
+   recreation.
+2. The connection target and every CLI setting are configurable through the WebUI or environment
+   variables; an environment variable, when set, wins and locks the WebUI field.
 3. No traffic leaves outside the tunnel, except to configured LAN networks, while disconnected,
    reconnecting, or after a CLI crash.
-4. The forwarded port (P2P servers) is kept alive and published to a file.
+4. The forwarded port (P2P servers) is kept alive and published to a file and the WebUI.
 5. Docker health reflects `protonvpn status`.
-6. An Unraid template exposes the settings above as fields.
+6. A WebUI shows status, server and location, forwarded port and live traffic.
+7. An Unraid template exposes the settings above as fields and links the WebUI.
 
-Non-goals: GUI or WebUI, OpenVPN, Proton Stealth protocol, split tunneling, unattended login from
-environment variables, port-change webhooks into other applications.
+Non-goals: Proton's GTK GUI, OpenVPN, Proton Stealth protocol, split tunneling, unattended login
+from environment variables, port-change webhooks into other applications, persistent traffic
+history, security-key (FIDO2) signin from the WebUI.
 
 ## Project
 
@@ -70,19 +74,24 @@ Gaps found in the CLI:
 
 ```
 tini (PID 1)
-└── entrypoint.sh
+└── entrypoint.sh (POSIX sh)
     ├── firewall setup (default drop)               — first, before any network activity
     ├── dbus-daemon --system
     ├── fake sd-login records
     ├── NetworkManager (eth0 unmanaged; logs to stdout)
     ├── dbus-daemon --session (address in /run/session-bus.env)
-    ├── apply settings (protonvpn config set …)     — only when signed in
-    └── supervisor loop (foreground)
-        ├── signin wait / reconnect
-        └── NAT-PMP refresh
+    └── exec python3 -m protonvpn_container         (foreground, one process)
+        ├── supervisor thread: signin wait, apply settings, connect/reconnect, NAT-PMP refresh,
+        │   traffic sampling
+        └── WebUI: http.server.ThreadingHTTPServer on WEBUI_PORT
 ```
 
-All scripts are POSIX `sh`, checked with `shellcheck`.
+Boot and firewall stay POSIX `sh` (checked with `shellcheck`). The supervisor and WebUI are one
+Python package (`protonvpn_container`) using only the standard library of the image's Debian
+Python 3; it owns all runtime state (connection state, forwarded port, traffic samples, effective
+settings, signin flow), so there is no inter-process protocol. It drives the CLI through
+`subprocess` (`protonvpn status`, `info`, `connect`, `config set`, …) and trusts its output.
+Tests use `unittest`.
 
 ### Image contents
 
@@ -122,26 +131,39 @@ Single volume `/config`:
 | `/config/Proton/` (← `/etc/Proton`) | CLI settings, JSON keyring (session tokens) | dir `700`, files `600` |
 | `/config/cache/` (← `/var/cache/Proton`) | Server list, CLI logs | dir `700` |
 | `/config/forwarded_port` | Current forwarded port, empty when none | `644` |
+| `/config/settings.json` | Settings saved from the WebUI, plus `webui_banner_dismissed` | `600` |
 
 The entrypoint enforces the modes on every start (the JSON keyring writes files with the default
 umask, so it runs with `umask 077` and fixes existing files).
 
 ### Login
 
-- Signin is interactive only: Unraid's container **Console** button or
-  `docker exec -it protonvpn protonvpn signin <user>`. 2FA (TOTP) prompts work there.
+- From the WebUI: username and password, then a 2FA code when the account has one. The service
+  runs `protonvpn signin <user> --totp` in a pseudo-terminal (`pty`), writes the password at the
+  `Password:` prompt and the code at the `2FA Token` prompt, and reports the CLI's own success or
+  error message. One signin at a time; an abandoned flow is killed after 5 minutes. The password
+  and code are never logged or stored.
+- From the console: `docker exec -it <name> protonvpn signin <user>` (Unraid **Console** button).
+  Required for security-key (FIDO2) accounts.
 - While not signed in, the container stays running with the firewall closed, logs
-  `Not signed in. Run: docker exec -it <name> protonvpn signin <username>` every 60 s, and reports
-  unhealthy.
+  `Not signed in. Sign in from the WebUI or run: docker exec -it <name> protonvpn signin <username>`
+  every 60 s, and reports unhealthy.
 - Once signin is detected (`protonvpn info` succeeds), the supervisor applies settings and
-  connects without a restart.
-- Proton resets settings on signout; settings are reapplied from the environment on every start
-  and after every detected signin, so this does not matter.
+  connects without a restart. Sign out is a WebUI button (`protonvpn signout`).
+- Proton resets settings on signout; effective settings are reapplied on every start and after
+  every detected signin, so this does not matter.
 
 ### Configuration
 
-Environment variables are the only source of truth for settings. Empty or unset means "do not
-pass / leave the CLI default".
+Every setting below has an effective value resolved in this order:
+
+1. Environment variable, when set and non-empty. The WebUI shows the field read-only with
+   "set by container config".
+2. `/config/settings.json`, written by the WebUI.
+3. Image default (table below); unset means "do not pass / leave the CLI default".
+
+The Unraid template ships the setting variables empty, so the WebUI is the normal place to
+configure; environment variables serve declarative setups.
 
 Connection target (passed to `protonvpn connect`):
 
@@ -167,16 +189,26 @@ Settings (each runs `protonvpn config set <key> <value>` on start/signin):
 | `KILL_SWITCH` | `kill-switch` | `standard` |
 | `ANONYMOUS_CRASH_REPORTS` | `anonymous-crash-reports` | `off` |
 
-Values pass through unmodified; the CLI validates them. A rejected value logs the CLI's error and
-the container exits non-zero, so a misconfiguration is visible instead of silently ignored. The
-exact value syntax for multi-value settings (`custom-dns`) is taken from `protonvpn config set
-<key> --help` during implementation and documented in the README and template.
+Values pass through unmodified; the CLI validates them:
 
-Container variables:
+- Environment value rejected by the CLI at start or signin → log the CLI's error and exit non-zero
+  (a misconfiguration is visible instead of silently ignored).
+- WebUI change while signed in → applied immediately (`config set`, or a reconnect when the
+  connection target changes); saved to `settings.json` only when the CLI accepts it; the CLI's
+  error is shown in the WebUI otherwise.
+- WebUI change while signed out → saved, applied at signin; a rejection then is logged and shown
+  in the WebUI, and the container keeps running.
+
+The exact value syntax for multi-value settings (`custom-dns`) and the allowed values for the
+WebUI dropdowns are taken from `protonvpn config set <key> --help` during implementation.
+
+Container variables (environment only, not editable in the WebUI):
 
 | Variable | Purpose | Default |
 |---|---|---|
 | `LAN_NETWORKS` | Comma-separated CIDRs reachable outside the tunnel (e.g. Unraid LAN for WebUIs of sharing containers) | empty |
+| `WEBUI_PORT` | WebUI listen port (not 8080: attached apps share this namespace's ports) | `8788` |
+| `WEBUI_PASSWORD` | WebUI password; empty leaves the WebUI open (warning logged, dismissible banner) | empty |
 | `TZ` | Log timestamps | `UTC` |
 | `DEBUG` | `true` adds `--verbose` to CLI calls and NM debug logging | `false` |
 | `RECONNECT_INTERVAL` | Supervisor status-check period, seconds | `30` |
@@ -190,7 +222,11 @@ rules apply to them too.
 - `OUTPUT`/`INPUT` policy `DROP`; `FORWARD` `DROP`.
 - Allow for everyone in the namespace: `lo`; `ESTABLISHED,RELATED`; any traffic on the tunnel
   interface (`proton0`); packets carrying Proton's WireGuard fwmark `0xea13b2c` (the encrypted
-  packets to the VPN endpoint, sent by the kernel); `LAN_NETWORKS` on `eth0` in both directions.
+  packets to the VPN endpoint, sent by the kernel); `LAN_NETWORKS` on `eth0` in both directions;
+  inbound TCP `WEBUI_PORT` on `eth0` (who can reach it is decided by Docker port publishing).
+- Docker's embedded DNS (`127.0.0.11`, user-defined networks) is reached over `lo` and forwards
+  queries outside the tunnel, so traffic to `127.0.0.11` is accepted only from this container's
+  own cgroup and dropped for everyone else, ahead of the `lo` rule.
 - Allow **only for this container's own processes**: TCP 443 and UDP/TCP 53 out of `eth0`, to any
   address. The CLI needs the Proton API (and possibly proton-core's DoH-based alternative routing)
   while disconnected to sign in, refresh the server list and connect.
@@ -217,22 +253,48 @@ killed (`pkill -f /usr/bin/protonvpn`), after `protonvpn disconnect`, and while 
 
 ### Supervisor
 
-Foreground loop in `entrypoint.sh`:
+A thread in the Python service, every `RECONNECT_INTERVAL` seconds:
 
 1. Not signed in → log the signin hint every 60 s, keep checking.
-2. Signed in, settings not yet applied this session → apply settings.
+2. Signed in, settings not yet applied this session → apply effective settings.
 3. `protonvpn status` first line is not `Status: Connected` → run
    `protonvpn connect <target args>`; on failure log the CLI output and retry with backoff
-   (30 s, 60 s, 120 s, capped at 300 s).
-4. Connected and `PORT_FORWARDING=on` → every 45 s run
+   (30 s, 60 s, 120 s, capped at 300 s). A user-initiated disconnect from the WebUI suspends
+   reconnecting until the user connects again or the container restarts.
+4. Connected and effective port forwarding on → every 45 s run
    `natpmpc -a 1 0 udp 60 -g 10.2.0.1` and `natpmpc -a 1 0 tcp 60 -g 10.2.0.1`, parse
    `Mapped public port N`, write N to `/config/forwarded_port`, log when N changes. On failure log
    a warning and empty the file.
-5. On `SIGTERM`: `protonvpn disconnect`, stop NM and D-Bus, exit 0. The firewall stays closed
-   until the namespace is gone.
+5. Every 5 s while connected: read `wg show proton0 transfer`, keep the last 15 minutes of
+   samples in memory (180 points), reset on a new connection.
+6. On `SIGTERM`: `protonvpn disconnect`, stop the WebUI, NM and D-Bus, exit 0. The firewall stays
+   closed until the namespace is gone.
 
-All output goes to stdout with `[protonvpn]`, `[natpmp]`, `[firewall]` prefixes, so `docker logs`
-shows the CLI's own messages unaltered.
+All output goes to stdout with `[protonvpn]`, `[natpmp]`, `[firewall]`, `[webui]` prefixes, so
+`docker logs` shows the CLI's own messages unaltered.
+
+### WebUI
+
+- One page, plain HTML/CSS/JS shipped as static files in the package; no build step, no external
+  CDN (it must work while the tunnel is down). JSON API under `/api/`; the page polls
+  `/api/state` every 5 s.
+- Shows: connection state; server, city and country, load, protocol (from `protonvpn status`);
+  exit IP (from the connect output, kept until the next connect); forwarded port with a copy
+  button; traffic totals since connect and a live up/down rate graph (inline SVG) over the last
+  15 minutes; account name (`protonvpn info`); last error from the CLI.
+- Actions: sign in (username, password, 2FA code step), sign out, connect, disconnect, save
+  settings. Settings fields locked by environment variables are rendered disabled with
+  "set by container config".
+- Auth: when `WEBUI_PASSWORD` is set, a login form issues a random session cookie (`HttpOnly`,
+  `SameSite=Strict`), sessions held in memory (lost on restart), password compared in constant
+  time, 5 failed logins per minute per client address before a 60 s lockout. When unset, the WebUI
+  is open, `[webui] WARNING: WEBUI_PASSWORD is not set; the WebUI is open to anyone who can reach
+  it` is logged at start, and the page shows a banner whose dismissal is stored in
+  `settings.json` (`webui_banner_dismissed`), so it stays dismissed across browsers and restarts.
+- State-changing requests are `POST` with a JSON body and require the `X-Requested-With` header
+  (blocks cross-site form posts).
+- Account takeover is out of reach by design: the WebUI never displays tokens, the password, or
+  keyring contents.
 
 ### Health
 
@@ -246,25 +308,30 @@ health does not depend on the port (a failing NAT-PMP refresh is logged, not fat
 
 - Repository `ghcr.io/andrebrait/protonvpn-cli:latest`, network `bridge`.
 - `ExtraParams`: `--cap-add=NET_ADMIN --device=/dev/net/tun --sysctl net.ipv4.conf.all.src_valid_mark=1`.
+- `WebUI`: `http://[IP]:[PORT:8788]/`; Port `8788` → `8788` (TCP).
 - Path: `/config` → `/mnt/user/appdata/protonvpn-cli`.
-- Variables: every variable in Configuration, with descriptions and defaults; settings with fixed
-  value sets as dropdowns.
-- Overview text: sign in once from the Console button, how to attach other containers
-  (`--network=container:protonvpn-cli`), where the forwarded port is written.
+- Variables: every variable in Configuration, with descriptions; setting variables empty by
+  default (so the WebUI configures them); `WEBUI_PASSWORD` masked.
+- Overview text: open the WebUI to sign in and configure (or use the Console button), how to
+  attach other containers (`--network=container:protonvpn-cli`) and publish their ports on this
+  container, where the forwarded port is written.
 - Publishing to Community Applications is out of scope for this spec.
 
 ## Testing
 
-- `shellcheck` on all scripts (CI).
+- `shellcheck` on all shell scripts; `python3 -m unittest` for the Python package, with the CLI,
+  `natpmpc` and `wg` replaced by fake executables on `PATH` (CI).
 - CI builds both architectures.
-- Credential-free smoke test (CI, `scripts/smoke-test`): container starts, NetworkManager runs,
+- Credential-free smoke test (CI, `tests/smoke.sh`): container starts, NetworkManager runs,
   `protonvpn status` prints `Status: Disconnected`, health is unhealthy with the signin hint in the
-  logs, and an outbound request to a public non-Proton address fails (firewall closed).
-- Manual credentialed checklist (`docs/manual-test.md`), run before each release: signin with 2FA;
-  connect by country, by server, with `P2P`; DNS points at Proton; forwarded port file populated
-  and refreshed; session survives recreate; kill-switch acceptance cases above; reconnect after
-  blocking the endpoint for 5 minutes; settings changes via env take effect on restart; a sharing
-  container uses the tunnel.
+  logs, an outbound request to a public non-Proton address fails (firewall closed), the WebUI
+  answers on `WEBUI_PORT` (open without a password, `401` on `/api/state` with one).
+- Manual credentialed checklist (`docs/manual-test.md`), run before each release: signin with 2FA
+  from the WebUI and from the console; connect by country, by server, with `P2P`; DNS points at
+  Proton; forwarded port file and WebUI populated and refreshed; traffic graph moves; session
+  survives recreate; kill-switch acceptance cases above; reconnect after blocking the endpoint for
+  5 minutes; WebUI setting changes apply live and env-locked fields are disabled; settings changes
+  via env take effect on restart; a sharing container uses the tunnel.
 
 ## Risks
 
@@ -280,5 +347,8 @@ health does not depend on the port (a failing NAT-PMP refresh is logged, not fat
   Unraid 7.3.4 (kernel 6.18.58, Docker 29.8.2, cgroup v2, host iptables 1.8.13 legacy, `wireguard`
   module present): owning container allowed, attached container blocked. The test container used
   the `nf_tables` iptables backend, so the host's legacy backend does not matter.
+- The WebUI signin drives the CLI's interactive prompts through a pty; a change to the CLI's
+  prompt text (`Password:`, `2FA Token`) breaks it. Match the prompts loosely and surface any
+  unexpected CLI output in the WebUI; the manual checklist covers it each release.
 - Not yet verified: arm64, CLI behaviour after long outages (supervisor covers it), security-key
   (FIDO2) signin through `docker exec`.
