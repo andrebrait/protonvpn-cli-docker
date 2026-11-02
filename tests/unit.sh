@@ -45,6 +45,10 @@ check "v4 own dns tcp" has '-A OUTPUT -o eth0 -m cgroup --path / -p tcp --dport 
 accept=$(ln_of '-A OUTPUT -o lo -d 127.0.0.11 -m cgroup --path / -j ACCEPT')
 drop=$(ln_of '-A OUTPUT -o lo -d 127.0.0.11 -j DROP')
 lo=$(ln_of '-A OUTPUT -o lo -j ACCEPT')
+check "v4 no icmpv6" lacks ipv6-icmp
+check "v4 OUTPUT established is own-cgroup eth0 only" has '-A OUTPUT -o eth0 -m conntrack --ctstate ESTABLISHED,RELATED -m cgroup --path / -j ACCEPT'
+check "v4 every OUTPUT established rule has cgroup or webui sport" eq "$(printf '%s\n' "$RULES" | grep 'OUTPUT.*ESTABLISHED' | grep -vc -e '-m cgroup --path' -e '-p tcp --sport 8788 ')" 0
+check "v4 webui replies by sport" has '-A OUTPUT -o eth0 -p tcp --sport 8788 -m conntrack --ctstate ESTABLISHED -j ACCEPT'
 check "v4 embedded dns: accept < drop < lo" test "${accept:-9}" -lt "${drop:-8}" -a "${drop:-9}" -lt "${lo:-0}"
 
 RULES=$(firewall_rules 6 /system.slice/docker-abc.scope 192.168.65.7 fd00::53)
@@ -53,6 +57,17 @@ check "v6 omits v4 LAN" lacks '10.0.0.0/8'
 check "v6 no embedded dns" lacks '127.0.0.11'
 check "v6 resolver" has '-A OUTPUT -o eth0 -m cgroup --path /system.slice/docker-abc.scope -p udp --dport 53 -d fd00::53 -j ACCEPT'
 check "v6 omits v4 resolver" lacks '192.168.65.7'
+for t in neighbour-solicitation neighbour-advertisement; do
+  check "v6 ND $t out" has "-A OUTPUT -o eth0 -p ipv6-icmp --icmpv6-type $t -j ACCEPT"
+  check "v6 ND $t in" has "-A INPUT -i eth0 -p ipv6-icmp --icmpv6-type $t -j ACCEPT"
+done
+check "v6 every OUTPUT established rule has cgroup or webui sport" eq "$(printf '%s\n' "$RULES" | grep 'OUTPUT.*ESTABLISHED' | grep -vc -e '-m cgroup --path' -e '-p tcp --sport 8788 ')" 0
+
+RULES=$(firewall_rules 6 / 'fe80::1%eth0' bad/addr '*' 10.0.0.1)
+check "v6 resolver zone id stripped" has '-A OUTPUT -o eth0 -m cgroup --path / -p udp --dport 53 -d fe80::1 -j ACCEPT'
+check "invalid resolver skipped" lacks 'bad/addr'
+check "glob resolver skipped" lacks ' -d * '
+check "v4 resolver skipped for v6" lacks '10.0.0.1'
 
 unset WEBUI_PORT
 RULES=$(firewall_rules 4 /)

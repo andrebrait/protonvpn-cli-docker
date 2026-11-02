@@ -75,12 +75,43 @@ no_runtime_installs() {
   [ -z "$(docker exec "$C" sh -c 'ls /var/lib/apt/lists | grep -v -e lock -e partial')" ]
 }
 
-not() { ! "$@"; }
+is_running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
 # tcp_from <container> <host> <port>: connect succeeds.
 tcp_from() { docker exec "$1" timeout 5 bash -c "</dev/tcp/$2/$3"; }
-# reachable_from <container> <host> <port>: connect succeeds or is refused; only a timeout (exit 124) fails.
-reachable_from() { docker exec "$1" timeout 5 bash -c "</dev/tcp/$2/$3" 2>/dev/null; [ $? -ne 124 ]; }
+# blocked_from <container> <host> <port>: container is up and the connect times out (exit 124).
+# Anything else (refused, exec failure, missing bash) is not proof of a drop.
+blocked_from() {
+  is_running "$1" || return 1
+  docker exec "$1" timeout 5 bash -c "</dev/tcp/$2/$3" >/dev/null 2>&1
+  [ $? -eq 124 ]
+}
+# reachable_from <container> <host> <port>: connect succeeds or the peer refuses it; a timeout or
+# an exec failure fails.
+reachable_from() {
+  is_running "$1" || return 1
+  out=$(docker exec "$1" timeout 5 bash -c "</dev/tcp/$2/$3" 2>&1); rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  [ "$rc" -eq 1 ] && case $out in *refused*) return 0 ;; esac
+  return 1
+}
 dns_from() { docker exec "$1" timeout 5 getent hosts example.com; }
+# dns_blocked_from <container>: lookup fails with "not found" (2) or times out (124), not an exec error.
+dns_blocked_from() {
+  is_running "$1" || return 1
+  docker exec "$1" timeout 5 getent hosts example.com >/dev/null 2>&1
+  rc=$?; [ "$rc" -eq 2 ] || [ "$rc" -eq 124 ]
+}
+# Docker's original resolv.conf survives NM bringing a connection up and down.
+resolv_survives_nm() {
+  want=$(docker exec "$C" grep '^nameserver' /run/protonvpn-container/resolv.conf.docker) || return 1
+  [ -n "$want" ] || return 1
+  docker exec "$C" nmcli con add type dummy ifname smoke1 con-name smoke1 ipv4.method manual \
+    ipv4.addresses 10.250.1.1/32 ipv6.method disabled >/dev/null || return 1
+  sleep 2
+  docker exec "$C" nmcli con delete smoke1 >/dev/null || return 1
+  sleep 2
+  [ "$(docker exec "$C" grep '^nameserver' /etc/resolv.conf)" = "$want" ]
+}
 bridge_field() { docker network inspect bridge -f "{{(index .IPAM.Config 0).$1}}"; }
 bad_lan_fails_closed() {
   start_container t3-bad -e LAN_NETWORKS=not-a-cidr || return 1
@@ -114,30 +145,48 @@ assert "restart boots: cli disconnected" cli_disconnected
 assert "no runtime installs" no_runtime_installs
 
 # Task 3: kill switch. $C sits on the default bridge, attached containers share its namespace.
+assert "resolv.conf survives nm up/down" resolv_survives_nm
 attach t3-att "$C" || { echo "FAIL attach"; exit 1; }
 assert "own 443 allowed" tcp_from "$C" 1.1.1.1 443
-assert "own 80 blocked" not tcp_from "$C" 1.1.1.1 80
+assert "own 80 blocked" blocked_from "$C" 1.1.1.1 80
 assert "own dns allowed" dns_from "$C"
-assert "attached 443 blocked" not tcp_from t3-att 1.1.1.1 443
-assert "attached dns blocked" not dns_from t3-att
+assert "attached 443 blocked" blocked_from t3-att 1.1.1.1 443
+assert "attached dns blocked" dns_blocked_from t3-att
 
 NETWORKS="$NETWORKS t3-net"
 docker network create t3-net >/dev/null
 run_container t3-emb --network t3-net || { echo "FAIL embedded boot"; exit 1; }
 attach t3-emb-att t3-emb || { echo "FAIL attach"; exit 1; }
 assert "own embedded dns allowed" dns_from t3-emb
-assert "attached embedded dns blocked" not dns_from t3-emb-att
+assert "attached embedded dns blocked" dns_blocked_from t3-emb-att
 
 GW=$(bridge_field Gateway)
 run_container t3-lan -e LAN_NETWORKS="$(bridge_field Subnet)" || { echo "FAIL lan boot"; exit 1; }
 attach t3-lan-att t3-lan || { echo "FAIL attach"; exit 1; }
 assert "lan allowed" reachable_from t3-lan-att "$GW" 9
-assert "lan blocked without LAN_NETWORKS" not reachable_from t3-att "$GW" 9
+assert "lan blocked without LAN_NETWORKS" blocked_from t3-att "$GW" 9
 
+# WebUI port: a listener in $C (own cgroup) must complete the handshake with an outside peer.
 CIP=$(docker inspect -f '{{.NetworkSettings.Networks.bridge.IPAddress}}' "$C")
 CONTAINERS="$CONTAINERS t3-peer"
 docker run -d --name t3-peer --entrypoint sleep "$IMAGE" infinity >/dev/null
-assert "webui port open inbound" reachable_from t3-peer "$CIP" 8788
+docker exec -d "$C" python3 -m http.server 8788 --bind 0.0.0.0
+sleep 2
+assert "webui port open inbound" tcp_from t3-peer "$CIP" 8788
+assert "other inbound port blocked" blocked_from t3-peer "$CIP" 8789
+
+# IPv6 LAN: neighbour discovery must work for LAN_NETWORKS on an IPv6 network.
+NETWORKS="$NETWORKS t3-v6"
+docker network create --ipv6 --subnet fd00:3:3:3::/64 t3-v6 >/dev/null
+CONTAINERS="$CONTAINERS t3-v6peer"
+docker run -d --name t3-v6peer --network t3-v6 --entrypoint sleep "$IMAGE" infinity >/dev/null
+V6PEER=$(docker inspect -f '{{(index .NetworkSettings.Networks "t3-v6").GlobalIPv6Address}}' t3-v6peer)
+run_container t3-v6 --network t3-v6 -e LAN_NETWORKS=fd00:3:3:3::/64 || { echo "FAIL v6 boot"; exit 1; }
+attach t3-v6-att t3-v6 || { echo "FAIL attach"; exit 1; }
+assert "ipv6 lan allowed" reachable_from t3-v6-att "$V6PEER" 9
+run_container t3-v6n --network t3-v6 || { echo "FAIL v6n boot"; exit 1; }
+attach t3-v6n-att t3-v6n || { echo "FAIL attach"; exit 1; }
+assert "ipv6 lan blocked without LAN_NETWORKS" blocked_from t3-v6n-att "$V6PEER" 9
 assert "bad LAN fails closed" bad_lan_fails_closed
 
 [ "$FAILED" -eq 0 ] && echo "all ok"
