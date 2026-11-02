@@ -340,6 +340,49 @@ class ApplySettingsTest(SupervisorCase):
         self.tick()
         self.assertEqual(self.exits, [])
 
+    def test_hung_setting_does_not_block_connect_forever(self):
+        self.make(environ={"NETSHIELD": "malware"})
+        key = ("config", "set", "netshield", "malware")
+        self.cli.responses[key] = Result(124, "protonvpn timed out after 120s\n")
+
+        def calls(argv):
+            return [a for a in self.cli.argvs("config") if a == argv]
+
+        self.tick()  # check 1
+        self.tick(30)  # check 2
+        self.assertEqual(self.cli.argvs("connect"), [])
+        self.assertIn("holding the connect, check 2 of 3", self.out.getvalue())
+        self.tick(30)  # check 3
+        self.assertEqual(len(self.cli.argvs("connect")), 1)
+        self.assertTrue(self.sup.snapshot()["connected"])
+        self.assertIn("[protonvpn] connecting without netshield (will keep retrying)", self.out.getvalue())
+        # The other settings were applied once, although netshield (earlier in the list) kept failing.
+        self.assertEqual(len(calls(("config", "set", "kill-switch", "standard"))), 1)
+        self.assertEqual(len(calls(("config", "set", "anonymous-crash-reports", "off"))), 1)
+        # Still retried at every later check, now while connected, until it works.
+        self.tick(30)
+        self.assertEqual(len(calls(key)), 4)
+        self.cli.responses[key] = Result(0, "NetShield has been set to malware\n")
+        self.tick(30)
+        self.assertEqual(len(calls(key)), 5)
+        self.tick(30)
+        self.assertEqual(len(calls(key)), 5)
+        self.assertEqual(self.exits, [])
+
+    def test_hung_kill_switch_waits_for_a_disconnected_moment(self):
+        self.make()
+        ks = ("config", "set", "kill-switch", "standard")
+        self.cli.responses[ks] = Result(124, "protonvpn timed out after 120s\n")
+        for _ in range(3):
+            self.tick(30)
+        self.assertEqual(len(self.cli.argvs("connect")), 1)
+        self.tick(30)  # connected: the CLI would refuse kill-switch, so it is not tried
+        self.assertEqual(self.cli.argvs("config").count(ks), 3)
+        self.cli.connected = False  # the tunnel drops
+        self.tick(30)
+        self.assertEqual(self.cli.argvs("config").count(ks), 4)
+        self.assertEqual(len(self.cli.argvs("connect")), 2)  # no second hold
+
     def test_env_setting_rejected_exits(self):
         self.make(environ={"NETSHIELD": "bogus"})
         self.cli.responses[("config", "set", "netshield", "bogus")] = Result(2, "Error: invalid choice\n")

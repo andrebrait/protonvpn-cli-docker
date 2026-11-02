@@ -36,6 +36,8 @@ TRAFFIC_KEEP = 180  # 15 minutes
 STOP_DISCONNECT_TIMEOUT = 5
 KILL_SWITCH_KEY = "kill-switch"  # the CLI refuses it while a connection is up
 CLI_REJECTED = (1, 2)  # click ClickException / UsageError; anything else (124, 127, ...) is transient
+# Checks a connect waits for settings that keep failing transiently; the tunnel has priority.
+SETTINGS_RETRIES = 3
 
 
 def log(message: str) -> None:
@@ -82,7 +84,7 @@ class Supervisor:
         # Loop state, only touched under _cli_lock (or by single float stores from requests).
         self._was_connected = self._reapply = False
         self._applied: set[str] = set()  # CLI setting keys applied in this signed-in session
-        self._failures = 0
+        self._failures = self._unapplied_checks = 0
         self._next_check = self._next_hint = self._next_traffic = self._next_natpmp = 0.0
 
     # --- lifecycle ---
@@ -228,18 +230,28 @@ class Supervisor:
             say(self._run("disconnect").out)
             st = self._read_status()
         action = decide(bool(account), st.connected, user_disconnected)
-        settings_ok = True
+        pending: list[str] = []
         if action == "wait_signin":
             self._new_session()
             if now >= self._next_hint:
                 self._next_hint = now + HINT_EVERY
                 log(f"[protonvpn] {HINT}")
         else:
-            settings_ok = self._apply_settings(st.connected)
-        if action == "connect":
-            if not settings_ok:
-                log("[protonvpn] settings not fully applied yet; connecting at the next check")
-            elif not self._connect():
+            pending = self._apply_settings(st.connected)
+            if pending:
+                self._unapplied_checks += 1
+            elif all(key in self._applied for key, _ in settings_pairs(self._store)):
+                self._unapplied_checks = 0  # not while a kill-switch is only deferred: that is not a success
+        hold = bool(pending) and self._unapplied_checks < SETTINGS_RETRIES
+        if action == "connect" and hold:
+            log(
+                f"[protonvpn] settings not applied yet ({', '.join(pending)}); holding the connect, "
+                f"check {self._unapplied_checks} of {SETTINGS_RETRIES}"
+            )
+        elif action == "connect":
+            if pending:
+                log(f"[protonvpn] connecting without {', '.join(pending)} (will keep retrying)")
+            if not self._connect():
                 delay = BACKOFF[min(self._failures, len(BACKOFF) - 1)]
                 self._failures += 1
                 # Counted from the end of the attempt, which can take minutes.
@@ -280,16 +292,18 @@ class Supervisor:
 
     def _new_session(self) -> None:
         self._applied = set()
+        self._unapplied_checks = 0
         with self._lock:
             self._settings_errors = {}
 
-    def _apply_settings(self, connected: bool) -> bool:
+    def _apply_settings(self, connected: bool) -> list[str]:
         """Apply the effective settings not yet applied in this session.
 
-        False when a transient CLI failure left some pending (retried at the next check).
+        Returns the CLI keys a transient CLI failure left pending; they are retried at every check.
         `kill-switch` waits for a disconnected moment, before the next connect.
         """
         env_of = {s.cli_key: s.env for s in SETTINGS if s.cli_key}
+        pending = []
         for key, words in settings_pairs(self._store):
             if key in self._applied or (connected and key == KILL_SWITCH_KEY):
                 continue
@@ -309,9 +323,10 @@ class Supervisor:
                     self._settings_errors[env] = message
             else:
                 log(f"[protonvpn] setting {env} not applied (rc {res.rc}); will retry: {message}")
-                return False
+                pending.append(key)
+                continue  # one hung key must not starve the rest
             self._applied.add(key)
-        return True
+        return pending
 
     def _sample(self, now: float) -> None:
         self._next_traffic = now + TRAFFIC_EVERY
