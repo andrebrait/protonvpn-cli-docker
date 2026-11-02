@@ -172,7 +172,7 @@ Only the VPN container's own cgroup, including `docker exec` sessions, can use d
 
 Proton's additional kill switch is fixed to **Standard**, not exposed as an environment variable, WebUI field, or API setting. Standard blocks traffic after an accidental VPN drop but restores it after an intentional disconnect. The container firewall remains enforced in both cases: intentionally disconnecting does **not** give attached applications an unprotected internet route. Neither protection layer can be disabled through the WebUI or API.
 
-The WebUI uses readable labels such as **Default**, **On**, and **Off**. CLI/API values remain lowercase. When a running tunnel is adopted after a restart, its missing exit address is recovered from Proton's own location API; this lookup does not determine VPN health.
+The WebUI uses readable labels such as **Default**, **On**, and **Off**. CLI/API values remain lowercase. When adopting a running tunnel after a restart, a missing exit IPv4 address is recovered from the HTTPS IP-echo service `api.ipify.org`; lookup failure does not determine VPN health. Proton's location API cannot be used here because it refuses requests from VPN exits.
 
 ## Port forwarding
 

@@ -12,7 +12,7 @@ from unittest import mock
 
 from protonvpn_container.cli import Result
 from protonvpn_container.config import SettingsStore
-from protonvpn_container.supervisor import HINT, Supervisor, decide, proton_exit_ip
+from protonvpn_container.supervisor import HINT, Supervisor, decide, lookup_exit_ip
 
 STATUS_UP = "Status: Connected\nServer: NL#914 in Amsterdam, Netherlands\nLoad: 31%\nProtocol: wireguard\n"
 CONNECT_OUT = "Connected to NL#914 in Amsterdam, Netherlands. \nYour new IP address is 205.147.16.78.\n"
@@ -143,7 +143,7 @@ class FakeTimers:
 
 
 class FakeLocate:
-    """`proton_exit_ip`: `replies` are IPs or exceptions to raise, consumed in order (the last repeats)."""
+    """IP echo: `replies` are IPs or exceptions to raise, consumed in order (the last repeats)."""
 
     def __init__(self):
         self.replies = [OSError("not scripted")]
@@ -935,41 +935,29 @@ class LeaseTest(SupervisorCase):
         self.assertEqual(self.sup.snapshot()["traffic"], [[1040.0, 100, 10]])
 
 
-LOCATION = {"IP": "205.147.16.74", "Country": "NL", "Lat": 52.37, "Long": 4.89, "ISP": "M247 Europe SRL", "Code": 1000}
+ECHO_IP = b"205.147.16.74\n"
 URLOPEN = "protonvpn_container.supervisor.urllib.request.urlopen"
 
 
-def location_reply(body):
+def echo_reply(body):
     reply = mock.MagicMock()
     reply.__enter__.return_value = reply
-    reply.read.return_value = body if isinstance(body, bytes) else json.dumps(body).encode()
+    reply.read.return_value = body
     return reply
 
 
-class ProtonExitIpTest(unittest.TestCase):
+class ExitIpLookupTest(unittest.TestCase):
     def lookup(self, body):
-        with mock.patch(URLOPEN, return_value=location_reply(body)) as urlopen:
-            ip = proton_exit_ip()
-        urlopen.assert_called_once_with("https://vpn-api.proton.me/vpn/v1/location", timeout=5)
-        return ip
+        with mock.patch(URLOPEN, return_value=echo_reply(body)):
+            return lookup_exit_ip()
 
-    def test_returns_only_the_ip(self):
-        self.assertEqual(self.lookup(LOCATION), "205.147.16.74")
-        self.assertEqual(self.lookup({**LOCATION, "IP": "2a02:6ea0:c041:6653::23"}), "2a02:6ea0:c041:6653::23")
+    def test_accepts_only_a_single_ip_literal(self):
+        self.assertEqual(self.lookup(ECHO_IP), "205.147.16.74")
+        self.assertEqual(self.lookup(b"2a02:6ea0:c041:6653::23\n"), "2a02:6ea0:c041:6653::23")
 
-    def test_an_unexpected_reply_is_a_value_error(self):
-        for name, body in (
-            ("another code", {**LOCATION, "Code": 1001}),
-            ("no code", {"IP": "205.147.16.74"}),
-            ("no ip", {"Code": 1000}),
-            ("ip not text", {**LOCATION, "IP": 3395}),  # ip_address(int) would take it for an address
-            ("ip not an address", {**LOCATION, "IP": "node-nl-307.protonvpn.net"}),
-            ("ip with a mask", {**LOCATION, "IP": "205.147.16.74/24"}),
-            ("not an object", [LOCATION]),
-            ("not json", b"<html>502</html>"),
-            ("empty", b""),
-        ):
-            with self.subTest(name), self.assertRaises(ValueError):
+    def test_malformed_echo_is_rejected(self):
+        for body in (b"", b"<html>502</html>", b"node-nl-307.protonvpn.net", b"205.147.16.74/24", b'{"IP":"205.147.16.74"}', b"\xff"):
+            with self.subTest(body=body), self.assertRaises(ValueError):
                 self.lookup(body)
 
 
@@ -1033,18 +1021,15 @@ class ExitIpTest(SupervisorCase):
         self.tick(30)
         self.assertEqual((self.exit_ip(), self.locate.calls), ("205.147.16.99", 2))
 
-    def test_the_real_lookup_keeps_only_the_ip_and_a_bad_reply_changes_nothing_else(self):
+    def test_failed_echo_changes_no_connection_state_and_later_lookup_recovers(self):
         self.cli.connected = True
-        self.make(locate=proton_exit_ip)
-        replies = [urllib.error.URLError("no route"), location_reply(b"{not json"), location_reply(LOCATION)]
+        self.make(locate=lookup_exit_ip)
+        replies = [urllib.error.URLError("no route"), echo_reply(b"<html>error</html>"), echo_reply(ECHO_IP)]
         with mock.patch(URLOPEN, side_effect=replies):
             for advance, expected in ((0, ""), (30, ""), (30, "205.147.16.74")):
                 self.tick(advance)
                 snap = self.sup.snapshot()
                 self.assertEqual((snap["connected"], snap["last_error"], snap["exit_ip"]), (True, "", expected))
-        shown = json.dumps(self.sup.snapshot())
-        for geolocation in ("M247", "52.37", "Country", "Lat"):
-            self.assertNotIn(geolocation, shown)
 
 
 class TrafficTest(SupervisorCase):

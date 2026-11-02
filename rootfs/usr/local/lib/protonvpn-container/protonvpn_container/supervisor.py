@@ -8,7 +8,6 @@ check due; the loop thread does the work.
 import collections
 import http.client
 import ipaddress
-import json
 import os
 import sys
 import threading
@@ -35,10 +34,10 @@ HINT_EVERY = 60
 BACKOFF = (30, 60, 120, 300)
 NATPMP_EVERY = 45
 NATPMP_LEASE = 60  # seconds a mapping lives without a renewal
-# Proton's own location service, the same API the CLI uses: it answers, unauthenticated, with the IP it sees the request from.
-LOCATION_URL = "https://vpn-api.proton.me/vpn/v1/location"
-LOCATION_TIMEOUT = 5
-LOCATION_MAX = 4096  # bytes of the reply read; a real one is ~150
+# A display-only IPv4 echo: Proton's location API refuses requests from VPN exits.
+EXIT_IP_URL = "https://api.ipify.org"
+EXIT_IP_TIMEOUT = 5
+EXIT_IP_MAX = 128
 TRAFFIC_EVERY = 5
 TRAFFIC_KEEP = 180  # 15 minutes
 # Cap for `protonvpn disconnect` during shutdown; the caller's total budget may be shorter.
@@ -61,18 +60,13 @@ def say(out: str) -> None:
         log(f"[protonvpn] {line}")
 
 
-def proton_exit_ip() -> str:
-    """The public IP Proton sees this container at: the tunnel's exit while it is up. Only the IP is kept of its reply.
+def lookup_exit_ip() -> str:
+    """Read a single IP literal; lookup failure never determines tunnel health.
 
-    Raises OSError (network), http.client.HTTPException or ValueError (an unexpected reply).
-    shortcut: urllib's timeout does not cover DNS resolution, so a broken resolver can hold the loop longer; bound it then.
+    shortcut: urllib's timeout does not cover DNS resolution; use a separate bounded worker if resolver stalls become material.
     """
-    with urllib.request.urlopen(LOCATION_URL, timeout=LOCATION_TIMEOUT) as reply:
-        body = json.loads(reply.read(LOCATION_MAX))
-    ip = body.get("IP") if isinstance(body, dict) and body.get("Code") == 1000 else None
-    if not isinstance(ip, str):
-        raise ValueError("unexpected reply from Proton's location service")
-    return str(ipaddress.ip_address(ip))
+    with urllib.request.urlopen(EXIT_IP_URL, timeout=EXIT_IP_TIMEOUT) as reply:
+        return str(ipaddress.ip_address(reply.read(EXIT_IP_MAX).decode("ascii").strip()))
 
 
 def decide(signed_in: bool, connected: bool, user_disconnected: bool) -> str:
@@ -94,7 +88,7 @@ class Supervisor:
         port_file: str = PORT_FILE,
         exit_fn=os._exit,
         timer=threading.Timer,
-        locate=proton_exit_ip,
+        locate=lookup_exit_ip,
     ):
         self._store, self._run, self._tool, self._clock = store, run, tool, clock
         self._interval, self._port_file, self._exit, self._timer = interval, port_file, exit_fn, timer

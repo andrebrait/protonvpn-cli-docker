@@ -303,8 +303,8 @@ All output goes to stdout with `[protonvpn]`, `[natpmp]`, `[firewall]`, `[webui]
   CDN (it must work while the tunnel is down). JSON API under `/api/v1/`; the page polls
   `/api/v1/state` every 5 s.
 - Shows: connection state; server, city and country, load, protocol (from `protonvpn status`);
-  exit IP (from connect output, or a bounded Proton `/vpn/v1/location` lookup when adopting an
-  already-connected tunnel; lookup failure does not affect CLI-derived health); forwarded port with a copy
+  exit IPv4 address (from connect output, or the bounded HTTPS `https://api.ipify.org` IP echo
+  when adopting an existing tunnel; lookup failure does not affect CLI-derived health); forwarded port with a copy
   button; traffic totals since connect and a live up/down rate graph (inline SVG) over the last
   15 minutes; account name (`protonvpn info`); last error from the CLI.
 - Actions: sign in (username, password, 2FA code step), sign out, connect, disconnect, save
