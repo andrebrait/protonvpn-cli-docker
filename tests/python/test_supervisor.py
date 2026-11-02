@@ -33,25 +33,34 @@ class Clock:
 
 
 class FakeCli:
-    """Stateful `protonvpn`; `responses[argv]` overrides the default reply."""
+    """Stateful `protonvpn`; `responses[argv]` (a Result, or a list consumed in order) overrides the reply."""
 
     def __init__(self, clock):
         self.clock = clock
         self.calls = []
+        self.timeouts = []
         self.responses = {}
         self.signed_in = True
         self.connected = False
         self.connect_rc = 0
+        self.connect_duration = 0
 
     def __call__(self, *args, timeout=120):
         self.calls.append((self.clock.now, args))
-        if args in self.responses:
-            return self.responses[args]
+        self.timeouts.append((args, timeout))
+        reply = self.responses.get(args)
+        if isinstance(reply, list):
+            reply = reply.pop(0) if len(reply) > 1 else reply[0]
+        if reply is not None:
+            return reply
         if args == ("info",):
             return Result(0, f"Account: '{'me@proton.me' if self.signed_in else 'None'}'\n")
         if args == ("status",):
             return Result(0, STATUS_UP if self.connected else "Status: Disconnected\n")
+        if args[:3] == ("config", "set", "kill-switch") and self.connected:
+            return Result(2, "Error: Disconnect before changing Kill Switch. Run 'protonvpn disconnect' first.\n")
         if args[0] == "connect":
+            self.clock.now += self.connect_duration
             if self.connect_rc:
                 return Result(self.connect_rc, "Error: Connection failed.\n")
             self.connected = True
@@ -204,6 +213,33 @@ class ConnectTest(SupervisorCase):
         failed = self.next_connect()
         self.assertEqual(self.next_connect() - failed, 30)
 
+    def test_backoff_counts_from_end_of_attempt(self):
+        self.make()
+        self.cli.connect_rc = 1
+        self.cli.connect_duration = 40
+        starts = [self.next_connect() for _ in range(4)]
+        self.assertEqual([b - a for a, b in zip(starts, starts[1:])], [70, 100, 160])  # 40 s + 30, 60, 120
+
+    def test_target_change_while_backing_off_connects_at_once(self):
+        self.make()
+        self.cli.connect_rc = 1
+        self.next_connect()
+        self.next_connect()  # now waiting out 60 s
+        self.assertEqual(self.apply("COUNTRY", "NL"), (True, "saved; connecting"))
+        self.cli.connect_rc = 0
+        self.tick(1)
+        self.assertEqual(self.cli.argvs("connect")[-1], ("connect", "--country", "NL"))
+        self.assertTrue(self.sup.snapshot()["connected"])
+        self.assertEqual(len(self.cli.argvs("disconnect")), 0)
+
+    def test_bool_target_change_in_spelling_only_is_unchanged(self):
+        self.make()
+        self.tick()
+        self.assertEqual(self.apply("P2P", "false"), (True, "unchanged"))
+        self.assertEqual(self.apply("P2P", "true"), (True, "reconnected"))
+        self.assertEqual(self.apply("P2P", "on"), (True, "unchanged"))
+        self.assertEqual(len(self.cli.argvs("connect")), 2)
+
     def test_connect_rc0_but_not_connected_counts_as_failure(self):
         self.make()
         self.cli.responses[("connect",)] = Result(0, "free plan limitation\n")
@@ -253,17 +289,56 @@ class ApplySettingsTest(SupervisorCase):
         self.assertEqual(self.cli.argvs("config"), applied)
         self.sup.notify_signed_in()
         self.tick(1)
-        self.assertEqual(len(self.cli.argvs("config")), 2 * len(applied))
+        again = self.cli.argvs("config")[len(applied) :]
+        # Connected now, so the kill switch (refused by the CLI while a connection is up) waits.
+        self.assertEqual(again, [a for a in applied if a[2] != "kill-switch"])
 
     def test_reapplied_after_signout_and_signin(self):
         self.make()
         self.tick()
         count = len(self.cli.argvs("config"))
-        self.cli.signed_in = False
+        self.cli.signed_in, self.cli.connected = False, False  # signout ends the connection too
         self.tick(30)
         self.cli.signed_in = True
         self.tick(30)
         self.assertEqual(len(self.cli.argvs("config")), 2 * count)
+
+    def test_env_kill_switch_while_connected_does_not_exit(self):
+        self.make(environ={"KILL_SWITCH": "off"})
+        self.cli.connected = True  # a connection lingers into the first signed-in tick
+        self.tick()
+        self.assertEqual(self.exits, [])
+        calls = [a for _, a in self.cli.calls]
+        self.assertNotIn(("config", "set", "kill-switch", "off"), calls)
+        self.assertIn(("config", "set", "anonymous-crash-reports", "off"), calls)
+        self.assertEqual(self.sup.snapshot()["settings_errors"], {})
+        # Applied once the connection is gone, before the next connect.
+        self.cli.connected = False
+        self.tick(30)
+        calls = [a for _, a in self.cli.calls]
+        self.assertEqual(self.exits, [])
+        self.assertLess(calls.index(("config", "set", "kill-switch", "off")), calls.index(("connect",)))
+
+    def test_transient_cli_failure_is_retried(self):
+        self.make(environ={"NETSHIELD": "malware"})
+        key = ("config", "set", "netshield", "malware")
+        self.cli.responses[key] = [Result(124, "protonvpn timed out after 120s\n"), Result(0, "ok\n")]
+        self.tick()
+        self.assertEqual(self.exits, [])  # not a rejection, although the value comes from the environment
+        self.assertEqual(self.sup.snapshot()["settings_errors"], {})
+        self.assertEqual(self.cli.argvs("connect"), [])  # nothing connects with settings half applied
+        self.tick(30)
+        self.assertEqual([a for a in self.cli.argvs("config") if a == key], [key, key])
+        self.assertEqual(self.exits, [])
+        self.assertTrue(self.sup.snapshot()["connected"])
+        self.tick(30)
+        self.assertEqual([a for a in self.cli.argvs("config") if a == key], [key, key])  # applied: not again
+
+    def test_missing_cli_binary_is_transient_too(self):
+        self.make(environ={"NETSHIELD": "malware"})
+        self.cli.responses[("config", "set", "netshield", "malware")] = Result(127, "cannot run protonvpn\n")
+        self.tick()
+        self.assertEqual(self.exits, [])
 
     def test_env_setting_rejected_exits(self):
         self.make(environ={"NETSHIELD": "bogus"})
@@ -365,6 +440,25 @@ class NatpmpTest(SupervisorCase):
         self.assertEqual(self.read_port_file(), "")
         self.assertIsNone(self.sup.snapshot()["forwarded_port"])
         self.assertIn("[natpmp] refresh failed", self.out.getvalue())
+        self.assertEqual(self.tool.calls.count(TCP), 3)  # the failing udp call ended the refresh
+
+    def test_udp_failure_skips_tcp(self):
+        self.tool.responses[UDP] = NATPMP_FAILED
+        self.make(environ={"PORT_FORWARDING": "on"})
+        self.tick()
+        self.assertEqual(self.tool.calls.count(UDP), 1)
+        self.assertNotIn(TCP, self.tool.calls)
+        self.assertEqual(self.read_port_file(), "")
+
+    def test_port_forwarding_switched_off_clears_file_at_once(self):
+        self.make(file={"PORT_FORWARDING": "on"})
+        self.tick()
+        self.assertEqual(self.read_port_file(), "41404\n")
+        self.assertEqual(self.apply("PORT_FORWARDING", "off")[0], True)
+        self.tick(1)  # the refresh is not due for another 44 s
+        self.assertEqual(self.read_port_file(), "")
+        self.assertIsNone(self.sup.snapshot()["forwarded_port"])
+        self.assertEqual(self.tool.calls.count(UDP), 1)
 
     def test_natpmp_idle_when_port_forwarding_off(self):
         self.make()
@@ -423,6 +517,13 @@ class StopTest(SupervisorCase):
             self.sup.stop()
         self.assertIn(("disconnect",), self.cli.argvs("disconnect"))
         self.assertFalse(self.sup._thread.is_alive())
+
+    def test_stop_respects_the_time_it_is_given(self):
+        self.make()
+        self.sup.stop(timeout=2)
+        self.assertEqual(self.cli.timeouts[-1], (("disconnect",), 2))
+        self.sup.stop()
+        self.assertEqual(self.cli.timeouts[-1], (("disconnect",), 5))
 
 
 if __name__ == "__main__":

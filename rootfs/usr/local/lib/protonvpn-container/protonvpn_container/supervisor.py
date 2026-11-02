@@ -32,9 +32,10 @@ BACKOFF = (30, 60, 120, 300)
 NATPMP_EVERY = 45
 TRAFFIC_EVERY = 5
 TRAFFIC_KEEP = 180  # 15 minutes
-# `docker stop` gives 10 s by default; the daemons still have to be stopped after this.
+# Cap for `protonvpn disconnect` during shutdown; the caller's total budget may be shorter.
 STOP_DISCONNECT_TIMEOUT = 5
-STOP_JOIN_TIMEOUT = 2
+KILL_SWITCH_KEY = "kill-switch"  # the CLI refuses it while a connection is up
+CLI_REJECTED = (1, 2)  # click ClickException / UsageError; anything else (124, 127, ...) is transient
 
 
 def log(message: str) -> None:
@@ -79,7 +80,8 @@ class Supervisor:
         self._settings_errors: dict[str, str] = {}
         self._user_disconnected = self._disconnect_pending = False
         # Loop state, only touched under _cli_lock (or by single float stores from requests).
-        self._applied = self._was_connected = False
+        self._was_connected = self._reapply = False
+        self._applied: set[str] = set()  # CLI setting keys applied in this signed-in session
         self._failures = 0
         self._next_check = self._next_hint = self._next_traffic = self._next_natpmp = 0.0
 
@@ -89,11 +91,13 @@ class Supervisor:
         self._thread = threading.Thread(target=self._loop, name="supervisor", daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 6.0) -> None:
+        """Disconnect and stop the loop, within `timeout` seconds in total."""
+        end = time.monotonic() + timeout
         self._stop.set()
-        say(self._run("disconnect", timeout=STOP_DISCONNECT_TIMEOUT).out)
+        say(self._run("disconnect", timeout=min(STOP_DISCONNECT_TIMEOUT, timeout)).out)
         if self._thread is not None:
-            self._thread.join(timeout=STOP_JOIN_TIMEOUT)
+            self._thread.join(timeout=max(0.0, end - time.monotonic()))
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -135,7 +139,7 @@ class Supervisor:
         self._next_check = 0.0
 
     def notify_signed_in(self) -> None:
-        self._applied = False
+        self._reapply = True
         self._next_check = 0.0
 
     def apply_setting(self, env: str, value: str) -> tuple[bool, str]:
@@ -151,7 +155,7 @@ class Supervisor:
             return True, "saved; applied at sign in"
         with self._cli_lock:
             if setting.cli_key is None:
-                return self._apply_target(env, value)
+                return self._apply_target(setting, value)
             words = (value or DEFAULTS.get(env, "")).split()
             message = "saved; the CLI keeps its current value"
             if words:
@@ -160,19 +164,27 @@ class Supervisor:
                     return False, res.out.strip()
                 message = res.out.strip()
             self._store.save(env, value)
+            self._applied.add(setting.cli_key)
             with self._lock:
                 self._settings_errors.pop(env, None)
             return True, message
 
-    def _apply_target(self, env: str, value: str) -> tuple[bool, str]:
-        if value == self._store.effective(env):
+    def _apply_target(self, setting, value: str) -> tuple[bool, str]:
+        env = setting.env
+        current = self._store.effective(env)
+        if (is_true(value) == is_true(current)) if setting.kind == "bool" else (value == current):
             return True, "unchanged"
-        previous = self._store.effective(env) if self._store.source(env) == "file" else ""
+        previous = current if self._store.source(env) == "file" else ""
         self._store.save(env, value)
         with self._lock:
-            connected = self._st.connected
+            connected, user_disconnected = self._st.connected, self._user_disconnected
         if not connected:
-            return True, "saved; applies at next connect"
+            if user_disconnected:
+                return True, "saved; applies at next connect"
+            # Waiting out a backoff with the old target: try the new one now.
+            self._failures = 0
+            self._next_check = 0.0
+            return True, "saved; connecting"
         say(self._run("disconnect").out)
         if self._connect():
             return True, "reconnected"
@@ -191,11 +203,11 @@ class Supervisor:
                 connected = self._st.connected
             if connected and now >= self._next_traffic:
                 self._sample(now)
-            if connected and now >= self._next_natpmp:
-                if is_true(self._store.effective("PORT_FORWARDING")):
-                    self._refresh_port(now)
-                else:
+            if connected:
+                if not is_true(self._store.effective("PORT_FORWARDING")):
                     self._set_port(None)
+                elif now >= self._next_natpmp:
+                    self._refresh_port(now)
 
     def _check(self, now: float) -> None:
         self._next_check = now + self._interval
@@ -205,6 +217,9 @@ class Supervisor:
             log(f"[protonvpn] state check failed (rc {failed.rc}): {failed.out.strip()}")
             return
         account, st = parse_account(info.out), parse_status(status.out)
+        if self._reapply:
+            self._reapply = False
+            self._new_session()
         with self._lock:
             self._signed_in, self._account, self._st = bool(account), account, st
             disconnect, self._disconnect_pending = self._disconnect_pending, False
@@ -213,19 +228,23 @@ class Supervisor:
             say(self._run("disconnect").out)
             st = self._read_status()
         action = decide(bool(account), st.connected, user_disconnected)
+        settings_ok = True
         if action == "wait_signin":
-            self._applied = False
+            self._new_session()
             if now >= self._next_hint:
                 self._next_hint = now + HINT_EVERY
                 log(f"[protonvpn] {HINT}")
-        elif not self._applied:
-            self._apply_settings()
-            self._applied = True
-        if action == "connect" and not self._connect():
-            delay = BACKOFF[min(self._failures, len(BACKOFF) - 1)]
-            self._failures += 1
-            self._next_check = now + delay
-            log(f"[protonvpn] connect failed; retrying in {delay}s")
+        else:
+            settings_ok = self._apply_settings(st.connected)
+        if action == "connect":
+            if not settings_ok:
+                log("[protonvpn] settings not fully applied yet; connecting at the next check")
+            elif not self._connect():
+                delay = BACKOFF[min(self._failures, len(BACKOFF) - 1)]
+                self._failures += 1
+                # Counted from the end of the attempt, which can take minutes.
+                self._next_check = self._clock() + delay
+                log(f"[protonvpn] connect failed; retrying in {delay}s")
         with self._lock:
             connected = self._st.connected
         if connected:
@@ -259,23 +278,40 @@ class Supervisor:
             self._traffic.clear()
         self._next_traffic = self._next_natpmp = 0.0
 
-    def _apply_settings(self) -> None:
+    def _new_session(self) -> None:
+        self._applied = set()
+        with self._lock:
+            self._settings_errors = {}
+
+    def _apply_settings(self, connected: bool) -> bool:
+        """Apply the effective settings not yet applied in this session.
+
+        False when a transient CLI failure left some pending (retried at the next check).
+        `kill-switch` waits for a disconnected moment, before the next connect.
+        """
         env_of = {s.cli_key: s.env for s in SETTINGS if s.cli_key}
-        errors = {}
         for key, words in settings_pairs(self._store):
+            if key in self._applied or (connected and key == KILL_SWITCH_KEY):
+                continue
             env = env_of[key]
             res = self._run("config", "set", key, *words)
+            message = res.out.strip()
             if res.rc == 0:
                 say(res.out)
-                continue
-            message = res.out.strip()
-            log(f"[protonvpn] setting {env} rejected: {message}")
-            if self._store.source(env) == "env":
-                log(f"[protonvpn] {env} comes from the container environment; exiting")
-                self._exit(1)
-            errors[env] = message
-        with self._lock:
-            self._settings_errors = errors
+                with self._lock:
+                    self._settings_errors.pop(env, None)
+            elif res.rc in CLI_REJECTED:
+                log(f"[protonvpn] setting {env} rejected: {message}")
+                if self._store.source(env) == "env":
+                    log(f"[protonvpn] {env} comes from the container environment; exiting")
+                    self._exit(1)
+                with self._lock:
+                    self._settings_errors[env] = message
+            else:
+                log(f"[protonvpn] setting {env} not applied (rc {res.rc}); will retry: {message}")
+                return False
+            self._applied.add(key)
+        return True
 
     def _sample(self, now: float) -> None:
         self._next_traffic = now + TRAFFIC_EVERY
@@ -286,16 +322,16 @@ class Supervisor:
 
     def _refresh_port(self, now: float) -> None:
         self._next_natpmp = now + NATPMP_EVERY
-        results = [
-            self._tool("natpmpc", "-a", "1", "0", proto, "60", "-g", GATEWAY) for proto in ("udp", "tcp")
-        ]
-        ports = [parse_natpmp_port(r.out) for r in results]
-        if None in ports:
-            failed = next(r.out for r, p in zip(results, ports) if p is None)
-            log(f"[natpmp] refresh failed: {(failed.strip().splitlines() or [''])[-1]}")
-            self._set_port(None)
-        else:
-            self._set_port(ports[0])
+        ports = []
+        for proto in ("udp", "tcp"):
+            res = self._tool("natpmpc", "-a", "1", "0", proto, "60", "-g", GATEWAY)
+            port = parse_natpmp_port(res.out)
+            if port is None:  # a silent gateway makes natpmpc wait minutes: do not try tcp as well
+                log(f"[natpmp] refresh failed: {(res.out.strip().splitlines() or [''])[-1]}")
+                self._set_port(None)
+                return
+            ports.append(port)
+        self._set_port(ports[0])
 
     def _set_port(self, port: int | None) -> None:
         if port == self._port and self._port_synced:
@@ -305,8 +341,9 @@ class Supervisor:
         try:
             self._write_port_file("" if port is None else f"{port}\n")
         except OSError as exc:
-            self._port_synced = False
-            log(f"[natpmp] cannot write {self._port_file}: {exc}")
+            if self._port_synced is not None:  # log once per failure streak; the tick may retry every second
+                log(f"[natpmp] cannot write {self._port_file}: {exc}")
+            self._port_synced = None
             return
         self._port_synced = True
         if port is not None:
