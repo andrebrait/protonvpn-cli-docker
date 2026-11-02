@@ -4,6 +4,11 @@ umask 077
 
 log() { echo "[init] $*"; }
 
+# Load the kill switch first, before anything can touch the network; it is never removed.
+# shellcheck source=/dev/null
+. /usr/local/lib/protonvpn-container/firewall.sh
+firewall_init
+
 rm -f /run/session-bus.env
 
 # Proton hard-codes /etc/Proton and /var/cache/Proton when running as root; persist both under /config.
