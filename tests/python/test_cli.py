@@ -62,5 +62,21 @@ class RunTest(unittest.TestCase):
         self.assertIn("protonvpn", result.out)
 
 
+class RunToolTest(unittest.TestCase):
+    def test_runs_any_program(self):
+        result = cli.run_tool("echo", "hi")
+        self.assertEqual((result.rc, result.out), (0, "hi\n"))
+
+    def test_missing_binary_returns_127(self):
+        result = cli.run_tool("/nonexistent/tool")
+        self.assertEqual(result.rc, 127)
+        self.assertIn("/nonexistent/tool", result.out)
+
+    def test_timeout_returns_124(self):
+        result = cli.run_tool("sleep", "5", timeout=0.3)
+        self.assertEqual(result.rc, 124)
+        self.assertIn("sleep timed out", result.out)
+
+
 if __name__ == "__main__":
     unittest.main()

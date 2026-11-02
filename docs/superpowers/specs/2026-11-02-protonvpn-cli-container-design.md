@@ -148,8 +148,9 @@ umask, so it runs with `umask 077` and fixes existing files).
 - While not signed in, the container stays running with the firewall closed, logs
   `Not signed in. Sign in from the WebUI or run: docker exec -it <name> protonvpn signin <username>`
   every 60 s, and reports unhealthy.
-- Once signin is detected (`protonvpn info` succeeds), the supervisor applies settings and
-  connects without a restart. Sign out is a WebUI button (`protonvpn signout`).
+- Once signin is detected (`protonvpn info` prints an account name; signed out it exits 0 and prints
+  `Account: 'None'`), the supervisor applies settings and connects without a restart. Sign out is a
+  WebUI button (`protonvpn signout`).
 - Proton resets settings on signout; effective settings are reapplied on every start and after
   every detected signin, so this does not matter.
 

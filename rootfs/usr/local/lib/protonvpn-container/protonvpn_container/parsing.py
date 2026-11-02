@@ -3,6 +3,7 @@
 import re
 from dataclasses import dataclass
 
+_ACCOUNT = re.compile(r"^Account: '(.*)'\s*$", re.M)
 _EXIT_IP = re.compile(r"Your new IP address is (\S+?)\.?\s*$", re.M)
 _NATPMP_PORT = re.compile(r"Mapped public port (\d+)")
 
@@ -51,3 +52,9 @@ def parse_wg_transfer(out: str) -> tuple[int, int] | None:
             tx += int(fields[2])
             peers += 1
     return (rx, tx) if peers else None
+
+
+def parse_account(info_out: str) -> str:
+    """Account name from `protonvpn info`; "" when signed out (the CLI prints 'None' and exits 0)."""
+    match = _ACCOUNT.search(info_out)
+    return "" if match is None or match.group(1) == "None" else match.group(1)

@@ -125,6 +125,38 @@ bad_lan_fails_closed() {
   docker logs t3-bad 2>&1 | grep -qF '[firewall]'
 }
 
+# Task 4 helpers: supervisor, health, shutdown.
+# eventually <seconds> <command...>: retry once a second until it succeeds.
+eventually() {
+  n=$1; shift
+  i=0
+  while [ "$i" -lt "$n" ]; do
+    "$@" && return 0
+    i=$((i + 1)); sleep 1
+  done
+  return 1
+}
+SIGNIN_HINT='Not signed in. Sign in from the WebUI or run: docker exec -it <name> protonvpn signin <username>'
+hint_logged() { docker logs "$1" 2>&1 | grep -qF "$SIGNIN_HINT"; }
+# Exit 1 is the health command's own "not connected"; an exec failure (126/127) must not pass.
+unhealthy_when_signed_out() {
+  is_running "$1" || return 1
+  docker exec "$1" /usr/local/bin/healthcheck.sh >/dev/null 2>&1
+  [ $? -eq 1 ]
+}
+port_file_empty_644() {
+  [ "$(docker exec "$1" stat -c '%a %s' /config/forwarded_port)" = "644 0" ]
+}
+# The PIDs recorded for shutdown name the real daemons (NM, not the log prefixer).
+pid_file_is() { [ "$(docker exec "$1" sh -c "cat /proc/\$(cat /run/protonvpn-container/$2)/comm")" = "$3" ]; }
+graceful_stop() {
+  start=$(date +%s)
+  docker stop -t 15 "$1" >/dev/null || return 1
+  [ $(($(date +%s) - start)) -lt 10 ] || return 1
+  [ "$(docker inspect -f '{{.State.ExitCode}}' "$1")" = 0 ] || return 1
+  docker logs "$1" 2>&1 | grep -qF '[init] stopped'
+}
+
 C=t1-smoke
 mkdir -p "$TMP/Proton"
 echo '{}' > "$TMP/Proton/stale.json"
@@ -139,6 +171,8 @@ assert "config modes: /config/cache 700" mode_is /config/cache 700
 assert "config modes: stale.json 600" mode_is /config/Proton/stale.json 600
 assert "symlinks: /etc/Proton" link_is /etc/Proton /config/Proton
 assert "symlinks: /var/cache/Proton" link_is /var/cache/Proton /config/cache
+# The previous boot's session-bus.env would satisfy wait_ready before the new boot removes it.
+docker exec "$C" rm -f /run/session-bus.env
 docker restart "$C" >/dev/null && wait_ready "$C"
 assert "restart boots: nm running" nm_running
 assert "restart boots: cli disconnected" cli_disconnected
@@ -188,6 +222,16 @@ run_container t3-v6n --network t3-v6 || { echo "FAIL v6n boot"; exit 1; }
 attach t3-v6n-att t3-v6n || { echo "FAIL attach"; exit 1; }
 assert "ipv6 lan blocked without LAN_NETWORKS" blocked_from t3-v6n-att "$V6PEER" 9
 assert "bad LAN fails closed" bad_lan_fails_closed
+
+# Task 4: supervisor while signed out.
+run_container t4-main || { echo "FAIL supervisor boot"; exit 1; }
+assert "signin hint logged" eventually 20 hint_logged t4-main
+assert "unhealthy when signed out" unhealthy_when_signed_out t4-main
+assert "forwarded_port is empty, mode 644" eventually 5 port_file_empty_644 t4-main
+assert "pid file: NetworkManager" pid_file_is t4-main nm.pid NetworkManager
+assert "pid file: system bus" pid_file_is t4-main dbus-system.pid dbus-daemon
+assert "pid file: session bus" pid_file_is t4-main dbus-session.pid dbus-daemon
+assert "graceful stop" graceful_stop t4-main
 
 [ "$FAILED" -eq 0 ] && echo "all ok"
 exit "$FAILED"

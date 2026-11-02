@@ -1,4 +1,4 @@
-"""Runs the protonvpn CLI; never raises for CLI failures."""
+"""Runs the protonvpn CLI and helper tools; never raises for command failures."""
 
 import os
 import subprocess
@@ -16,9 +16,17 @@ class Result:
 def run(*args: str, timeout: float = 120) -> Result:
     if is_true(os.environ.get("DEBUG", "")):
         args = ("--verbose", *args)
+    return _exec(["protonvpn", *args], timeout)
+
+
+def run_tool(*argv: str, timeout: float = 10) -> Result:
+    return _exec(list(argv), timeout)
+
+
+def _exec(argv: list[str], timeout: float) -> Result:
     try:
         proc = subprocess.run(
-            ["protonvpn", *args],
+            argv,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -30,7 +38,7 @@ def run(*args: str, timeout: float = 120) -> Result:
         partial = exc.output.decode(errors="replace") if isinstance(exc.output, bytes) else (exc.output or "")
         if partial and not partial.endswith("\n"):
             partial += "\n"
-        return Result(124, f"{partial}protonvpn timed out after {timeout}s\n")
+        return Result(124, f"{partial}{argv[0]} timed out after {timeout}s\n")
     except OSError as exc:
-        return Result(127, f"cannot run protonvpn: {exc}\n")
+        return Result(127, f"cannot run {argv[0]}: {exc}\n")
     return Result(proc.returncode, proc.stdout)

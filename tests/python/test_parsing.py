@@ -2,6 +2,7 @@ import unittest
 
 from protonvpn_container.parsing import (
     Status,
+    parse_account,
     parse_exit_ip,
     parse_natpmp_port,
     parse_status,
@@ -56,6 +57,17 @@ class ParseWgTransferTest(unittest.TestCase):
 
     def test_empty(self):
         self.assertIsNone(parse_wg_transfer(""))
+
+
+class ParseAccountTest(unittest.TestCase):
+    def test_signed_in(self):
+        self.assertEqual(parse_account("Account: 'me@proton.me'\n"), "me@proton.me")
+
+    def test_signed_out_prints_none(self):
+        self.assertEqual(parse_account("Account: 'None'\n"), "")
+
+    def test_unexpected_output(self):
+        self.assertEqual(parse_account("Traceback ...\n"), "")
 
 
 if __name__ == "__main__":

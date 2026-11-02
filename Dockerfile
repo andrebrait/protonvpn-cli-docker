@@ -35,4 +35,5 @@ ENV HOME=/config \
 ENV PYTHONPATH=/usr/local/lib/protonvpn-container
 
 VOLUME /config
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 CMD ["/usr/local/bin/healthcheck.sh"]
 ENTRYPOINT ["tini", "--", "/usr/local/bin/entrypoint.sh"]
