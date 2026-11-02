@@ -100,7 +100,11 @@ firewall_routes() {
   # No eth0 (--network none) means no routes to keep. "show dev" leaves the device out of each line.
   routes=$(ip -"$fam" route show dev eth0 2>/dev/null)
   if [ -n "$routes" ]; then
-    printf '%s\n' "$routes" | sed "s/\$/ dev eth0/; s/^/route replace table $FW_EGRESS_TABLE /" | ip -"$fam" -batch - || return 1
+    printf '%s\n' "$routes" | sed "s/ expires [0-9]*sec//; s/\$/ dev eth0/; s/^/route replace table $FW_EGRESS_TABLE /" | ip -"$fam" -batch - || return 1
+  fi
+  # Even a broad LAN allowance must leave Proton's DNS/NAT-PMP gateway inside the tunnel.
+  if [ "$fam" = 4 ]; then
+    ip -4 route replace throw 10.2.0.1/32 table "$FW_EGRESS_TABLE" || return 1
   fi
   ip -"$fam" rule add priority 100 ipproto tcp sport "${WEBUI_PORT:-8788}" lookup "$FW_EGRESS_TABLE" || return 1
   for net in $(echo "${LAN_NETWORKS:-}" | tr ',' ' '); do

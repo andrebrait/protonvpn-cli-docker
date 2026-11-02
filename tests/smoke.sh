@@ -240,7 +240,7 @@ egress_table_eth0_only() {
     t=$(docker exec "$1" ip -"$f" rule show | sed -n 's/.*sport 8788 lookup \([0-9][0-9]*\).*/\1/p') && [ -n "$t" ] || return 1
     routes=$(docker exec "$1" ip -"$f" route show table "$t") || return 1
     echo "$routes" | grep -q '^default' || return 1
-    ! echo "$routes" | grep -qv ' dev eth0\( \|$\)' || return 1
+    ! echo "$routes" | grep -Ev '^throw 10\.2\.0\.1(/32)?( |$)' | grep -qv ' dev eth0\( \|$\)' || return 1
   done
 }
 
@@ -441,6 +441,17 @@ assert "restart: policy rules once" policy_rules_once "$POL"
 assert "restart: egress table holds eth0 routes only" egress_table_eth0_only "$POL"
 assert "restart: WebUI replies select eth0" route_dev "$POL" eth0 -6 route get fd56::9 ipproto tcp sport 8788 dport 54321
 assert "restart: IPv6 LAN_NETWORKS select eth0" route_dev "$POL" eth0 -6 route get fd55::9
+
+# A broad LAN CIDR must not steal the tunnel's DNS/NAT-PMP destination.
+assert "broad LAN policy reloads" docker exec -e LAN_NETWORKS=10.0.0.0/8,fd55::/64 "$POL" sh -c '. /usr/local/lib/protonvpn-container/firewall.sh; firewall_routes 4'
+assert "broad LAN keeps Proton gateway in tunnel" route_dev "$POL" wgsim0 route get 10.2.0.1
+assert "broad LAN still reaches other LAN addresses" route_dev "$POL" eth0 route get 10.55.0.9
+
+# Kernel route dumps spell RA lifetimes as 'expires Nsec', which route replace cannot parse.
+assert "RA-style routes installed" docker exec "$POL" sh -c "ip -6 route replace default via $gw6 dev eth0 proto ra metric 1024 expires 1800 && ip -6 route add fd88:2:2:2::/64 dev eth0 proto ra expires 1800"
+assert "RA-style routes survive startup copy" reboot "$POL" restart
+assert "RA-style routes keep IPv6 WebUI reachable" route_dev "$POL" eth0 -6 route get fd56::9 ipproto tcp sport 8788 dport 54321
+assert "RA-style routes keep IPv6 LAN reachable" route_dev "$POL" eth0 -6 route get fd55::9
 
 # Task 4: supervisor while signed out.
 run_container "t5b-$$-main" || { echo "FAIL supervisor boot"; exit 1; }

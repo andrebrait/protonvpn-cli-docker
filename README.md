@@ -154,6 +154,8 @@ Container-only configuration is not editable in the WebUI:
 
 Use `--network=container:protonvpn-cli` with Docker run, or `network_mode: service:protonvpn-cli` with Compose. Publish attached applications' ports **on the VPN container**, not on the attached container. Allow the trusted LAN CIDR in `LAN_NETWORKS` for direct access to those application ports. All services in the namespace must use different listen ports.
 
+Direct WebUI/LAN routes are captured from Docker's `eth0` routes at startup. Restart after changing those routes or attaching a different Docker network. Proton's `10.2.0.1` DNS/forwarding gateway stays inside the tunnel even when a broad LAN range such as `10.0.0.0/8` is allowed.
+
 Drop `NET_RAW` from attached containers (`--cap-drop=NET_RAW`), **never grant them `NET_ADMIN`**, and start them only after the VPN container reports healthy. Do not start attached applications alongside an uninitialized VPN namespace: firewall setup happens early in startup, but not atomically with namespace creation.
 
 Docker joins an existing network namespace, not a permanently tracked container name. **If the VPN container is recreated, recreate the attached containers too**, so they join the new namespace. A health dependency alone does not do this for already-running containers. In the Compose example, recreate both services after changing VPN configuration:
