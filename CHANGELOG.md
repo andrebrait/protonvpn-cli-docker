@@ -8,6 +8,7 @@
 - Responsive light/dark WebUI showing connection, server, location, exit IP, forwarded port and live traffic.
 - Environment-controlled or saved preferences, with environment overrides visibly locked in the WebUI.
 - Versioned JSON API, optional separate bearer key and an OpenAPI 3.1 reference page with key-generation instructions.
+- Independent WireGuard-bound traffic health in the WebUI, API and Docker healthcheck, separate from Proton's connection state and without probe-triggered reconnects.
 - Always-on container firewall, fixed Proton Standard kill switch and renewable TCP/UDP port forwarding.
 - Unraid template, official Proton VPN icon and amd64/arm64 image builds.
 
@@ -21,3 +22,4 @@
 
 - Proton does not officially support headless use. Hardware-security-key sign-in requires the console.
 - The firewall protects against accidental leaks, not hostile applications with raw-packet or network-administration capabilities.
+- Operational health checks IPv4 HTTPS through an external echo service; an echo-service outage can fail the check without disconnecting the VPN.

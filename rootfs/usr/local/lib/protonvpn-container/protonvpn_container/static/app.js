@@ -151,7 +151,7 @@
   }
 
   function connectionState(s) {
-    if (s.connected) return ["pill-on", "Connected"];
+    if (s.connected) return [s.tunnel_healthy === true ? "pill-on" : "pill-wait", "Connected"];
     if (!s.signed_in || s.user_disconnected) return ["pill-off", "Disconnected"];
     if (s.last_error) return ["pill-err", "Error"];
     return ["pill-wait", "Connecting…"];
@@ -181,6 +181,8 @@
     setText("protocol", s.connected && s.protocol);
     message("last-error", s.connected ? "" : s.last_error, "error");
 
+    renderTrafficCheck(s);
+
     $("connect").disabled = !s.signed_in || s.connected;
     $("connect").textContent = s.last_error && !s.user_disconnected && !s.connected ? "Retry now" : "Connect";
     $("disconnect").disabled = !s.signed_in || (!s.connected && s.user_disconnected);
@@ -201,6 +203,32 @@
     $("signin-form").hidden = s.signed_in || codeStep;
     $("code-form").hidden = s.signed_in || !codeStep;
     $("acct-name").textContent = s.account;
+  }
+
+  function trafficState(healthy) {
+    if (healthy === true) return ["pill-on", "Passed"];
+    if (healthy === false) return ["pill-err", "Failed"];
+    return ["pill-wait", "Checking"];
+  }
+
+  function checkedText(ago) {
+    if (typeof ago !== "number") return "not checked yet";
+    return ago < 60 ? `last checked ${Math.round(ago)} s ago` : `last checked ${Math.floor(ago / 60)} min ago`;
+  }
+
+  // The traffic check is separate from the CLI's connection: a failed check never changes Connected.
+  function renderTrafficCheck(s) {
+    $("traffic").hidden = !s.connected;
+    if (!s.connected) return;
+    const [cls, label] = trafficState(s.tunnel_healthy);
+    const pill = $("traffic-pill");
+    pill.className = `pill pill-sm ${cls}`;
+    if (pill.textContent !== label) pill.textContent = label; // a live region: announce changes only
+    const scope = `IPv4 HTTPS through the tunnel, ${checkedText(s.health_checked_ago)}`;
+    $("traffic-note").textContent =
+      s.tunnel_healthy === false
+        ? `${(s.health_error || "No successful check in the last 60 seconds").replace(/\.$/, "")}. ${scope}. The VPN stays connected; a failed check never reconnects it.`
+        : scope;
   }
 
   function renderTraffic(s) {

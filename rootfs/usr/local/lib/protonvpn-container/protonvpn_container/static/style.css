@@ -97,6 +97,10 @@ h2 { margin: 0 0 0.875rem; font-size: 0.8125rem; font-weight: 650; text-transfor
 .pill-off { background: var(--off-bg); color: var(--off-fg); }
 .pill-err { background: var(--err-bg); color: var(--err-fg); }
 .pill-off::before { background: transparent; border: 2px solid currentColor; }
+.pill-sm { font-size: 0.9375rem; padding: 0.1rem 0.75rem 0.1rem 0.6rem; }
+.pill-sm::before { width: 0.5rem; height: 0.5rem; }
+.traffic { margin: 0 0 1rem; }
+.traffic-head { display: flex; flex-wrap: wrap; align-items: center; gap: 0.25rem 0.75rem; }
 .where { margin: 0.5rem 0 1rem; color: var(--muted); overflow-wrap: anywhere; }
 .where strong { color: var(--text); font-variant-numeric: tabular-nums; }
 

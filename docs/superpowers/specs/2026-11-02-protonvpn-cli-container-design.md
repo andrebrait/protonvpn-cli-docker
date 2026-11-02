@@ -23,7 +23,7 @@ Success criteria:
 3. No traffic leaves outside the tunnel, except to configured LAN networks, while disconnected,
    reconnecting, or after a CLI crash.
 4. The forwarded port (P2P servers) is kept alive and published to a file and the WebUI.
-5. Docker health reflects `protonvpn status`.
+5. Docker health requires both a CLI-connected tunnel and a fresh, successful tunnel-bound traffic check.
 6. A WebUI shows status, server and location, forwarded port and live traffic.
 7. An Unraid template exposes the settings above as fields and links the WebUI.
 
@@ -84,6 +84,7 @@ tini (PID 1)
     └── exec python3 -m protonvpn_container         (foreground, one process)
         ├── supervisor thread: signin wait, apply settings, connect/reconnect, NAT-PMP refresh,
         │   traffic sampling
+        ├── traffic-check worker: bounded IPv4 HTTPS check bound to proton0, independent of CLI I/O
         └── WebUI: http.server.ThreadingHTTPServer on WEBUI_PORT
 ```
 
@@ -91,7 +92,8 @@ Boot and firewall stay POSIX `sh` (checked with `shellcheck`). The supervisor an
 Python package (`protonvpn_container`) using only the standard library of the image's Debian
 Python 3; it owns all runtime state (connection state, forwarded port, traffic samples, effective
 settings, signin flow), so there is no inter-process protocol. It drives the CLI through
-`subprocess` (`protonvpn status`, `info`, `connect`, `config set`, …) and trusts its output.
+`subprocess` (`protonvpn status`, `info`, `connect`, `config set`, …) and keeps that connection
+state separate from observed tunnel traffic health.
 Tests use `unittest`.
 
 ### Image contents
@@ -104,7 +106,7 @@ Tests use `unittest`.
   and the sha256 Proton publishes for it are build arguments.
 - Packages, `--no-install-recommends`: `proton-vpn-cli` and `python3-proton-vpn-api-core` at the exact
   versions of two build arguments, `network-manager`, `dbus`, `wireguard-tools`, `iproute2`,
-  `iptables`, `natpmpc`, `tini`, `ca-certificates`.
+  `iptables`, `natpmpc`, `curl`, `tini`, `ca-certificates`.
 - Placeholder `proton-vpn-daemon` package built with `dpkg-deb` in the Dockerfile.
 - Files: NM config (`conf.d/container.conf`), dispatcher hook (`dispatcher.d/50-resolv`),
   `protonvpn` wrapper, `entrypoint.sh`, `healthcheck.sh`.
@@ -303,8 +305,8 @@ All output goes to stdout with `[protonvpn]`, `[natpmp]`, `[firewall]`, `[webui]
   CDN (it must work while the tunnel is down). JSON API under `/api/v1/`; the page polls
   `/api/v1/state` every 5 s.
 - Shows: connection state; server, city and country, load, protocol (from `protonvpn status`);
-  exit IPv4 address (from connect output, or the bounded HTTPS `https://api.ipify.org` IP echo
-  when adopting an existing tunnel; lookup failure does not affect CLI-derived health); forwarded port with a copy
+  exit IPv4 address (from connect output, or the independent traffic check when missing;
+  probe failure does not change CLI connection state); forwarded port with a copy
   button; traffic totals since connect and a live up/down rate graph (inline SVG) over the last
   15 minutes; account name (`protonvpn info`); last error from the CLI.
 - Actions: sign in (username, password, 2FA code step), sign out, connect, disconnect, save
@@ -365,9 +367,31 @@ containers are others. There is one API, not a WebUI API plus a public one.
 
 ### Health
 
-`HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3` runs `healthcheck.sh`:
-healthy when `protonvpn status` reports `Status: Connected`. When port forwarding is enabled,
-health does not depend on the port (a failing NAT-PMP refresh is logged, not fatal).
+`HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3` runs `healthcheck.sh`.
+Healthy requires CLI-connected state and a successful IPv4 HTTPS traffic check no more than
+60 seconds old; a forwarded port is not required.
+
+The same Python process runs a separate worker every 30 seconds while connected, with a first
+check promptly after connection. It uses image-baked curl with `--interface if!proton0 --ipv4
+--max-time 5 --noproxy '*' --fail --silent --show-error https://api.ipify.org` and an outer
+six-second subprocess bound. A missing interface must fail, never fall back to the host route.
+Only a valid public IPv4 literal counts as success. Probe I/O holds no CLI lock, cannot delay
+port renewal, and cannot trigger reconnects or change CLI-derived `connected` or `last_error`.
+It also fills a missing exit address, replacing the old synchronous lookup.
+
+Snapshots and `/api/v1/status` expose `tunnel_healthy` (boolean or null before the first connected
+check), `health_error` (string) and `health_checked_ago` (seconds or null). Disconnection,
+staleness or probe failure makes health false; stale results from an earlier connection are
+discarded. The WebUI distinguishes Proton's connection status from Passed/Failed/Checking traffic
+health and does not show an all-healthy green state when traffic checks fail.
+
+Atomic ephemeral `/run/protonvpn-container/health.json` contains `healthy` and a monotonic
+`checked_at` for Docker's local check; missing, malformed or stale data is unhealthy. Startup,
+disconnect and stop revoke prior success. Log only health transitions or changed errors.
+
+This checks IPv4 HTTPS reachability, not every protocol. An echo-service outage can fail the check
+even if Proton still reports connected. Such failure is observable but does not cause automatic
+reconnection. Docker restart policies still do not restart a merely unhealthy container.
 
 ### Unraid template
 

@@ -316,7 +316,7 @@ def request(path, key=None, data=None):
     return resp.status, json.load(resp)
 key = sys.argv[1]
 status, state = request("/api/v1/status", key)
-assert status == 200 and state["signed_in"] is False
+assert status == 200 and state["signed_in"] is False and state["tunnel_healthy"] is False
 assert request("/api/v1/status")[0] == 401
 assert request("/api/v1/status", "wrong")[0] == 401
 assert request("/api/v1/openapi.json")[1]["openapi"] == "3.1.0"
@@ -457,6 +457,7 @@ assert "RA-style routes keep IPv6 LAN reachable" route_dev "$POL" eth0 -6 route 
 run_container "t5b-$$-main" || { echo "FAIL supervisor boot"; exit 1; }
 assert "signin hint logged" eventually 20 hint_logged "t5b-$$-main"
 assert "unhealthy when signed out" unhealthy_when_signed_out "t5b-$$-main"
+assert "signed out: traffic check not passed" eventually 20 webui_says "t5b-$$-main" /api/v1/status '"tunnel_healthy": false'
 assert "forwarded_port is empty, mode 644" eventually 5 port_file_empty_644 "t5b-$$-main"
 assert "pid file: NetworkManager" pid_file_is "t5b-$$-main" nm.pid NetworkManager
 assert "pid file: system bus" pid_file_is "t5b-$$-main" dbus-system.pid dbus-daemon

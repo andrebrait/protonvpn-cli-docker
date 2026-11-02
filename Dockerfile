@@ -26,11 +26,12 @@ RUN apt-get update \
  && apt-get purge -y --auto-remove wget \
  && rm -rf /var/lib/apt/lists/*
 
-# The versions that ship are printed here, in the build output.
+# The versions that ship are printed here, in the build output. curl is the tunnel health probe's transport: it binds to
+# proton0 and bounds the whole request, which Python's urllib cannot do; it belongs in the image, never installed at runtime.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       "proton-vpn-cli=${PROTON_CLI_VERSION}" "python3-proton-vpn-api-core=${PROTON_API_CORE_VERSION}" \
-      network-manager dbus wireguard-tools iproute2 iptables natpmpc tini ca-certificates procps tzdata \
+      network-manager dbus wireguard-tools iproute2 iptables natpmpc curl tini ca-certificates procps tzdata \
  && dpkg-query -W proton-vpn-cli python3-proton-vpn-api-core \
  && rm -rf /var/lib/apt/lists/*
 

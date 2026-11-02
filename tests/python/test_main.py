@@ -162,7 +162,7 @@ class WebuiPortTest(unittest.TestCase):
 
 class StubSupervisor:
     def snapshot(self):
-        return {"signed_in": False}
+        return {"signed_in": False, "tunnel_healthy": False, "health_error": "", "health_checked_ago": None}
 
 
 class StartWebuiTest(unittest.TestCase):

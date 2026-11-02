@@ -1,24 +1,30 @@
-import http.client
 import io
 import json
 import os
 import stat
 import tempfile
 import threading
+import time
 import unittest
-import urllib.error
 from contextlib import redirect_stdout
 from unittest import mock
 
 from protonvpn_container.cli import Result
 from protonvpn_container.config import SettingsStore
-from protonvpn_container.supervisor import HINT, Supervisor, decide, lookup_exit_ip
+from protonvpn_container.health import is_healthy, write_health
+from protonvpn_container.supervisor import HINT, Supervisor, decide
 
 STATUS_UP = "Status: Connected\nServer: NL#914 in Amsterdam, Netherlands\nLoad: 31%\nProtocol: wireguard\n"
 CONNECT_OUT = "Connected to NL#914 in Amsterdam, Netherlands. \nYour new IP address is 205.147.16.78.\n"
 UDP = ("natpmpc", "-a", "1", "0", "udp", "60", "-g", "10.2.0.1")
 TCP = ("natpmpc", "-a", "1", "0", "tcp", "60", "-g", "10.2.0.1")
 WG = ("wg", "show", "proton0", "transfer")
+SUPERVISOR = "protonvpn_container.supervisor"
+PROBE = ("curl",)
+ECHO_IP = "205.147.16.74"
+PROBE_OK = Result(0, f"{ECHO_IP}\n")
+BIND_FAILED = Result(45, "curl: (45) Couldn't bind to interface 'proton0' with errno 19: No such device\n")
+TIMED_OUT = Result(28, "curl: (28) Connection timed out after 5001 milliseconds\n")
 
 
 def mapped(port):
@@ -101,6 +107,7 @@ class FakeTool:
         self.calls = []
 
     def __call__(self, *argv, timeout=10):
+        argv = PROBE if argv and argv[0] == "curl" else argv
         n = sum(1 for a in self.calls if a == argv)
         self.calls.append(argv)
         reply = self.responses.get(argv, Result(1, "not scripted\n"))
@@ -142,22 +149,17 @@ class FakeTimers:
                 timer.fire()
 
 
-class FakeLocate:
-    """IP echo: `replies` are IPs or exceptions to raise, consumed in order (the last repeats)."""
+class Gate:
+    """A probe reply that waits until the test lets it through; `timed_out` shows it was kept waiting for nothing."""
 
-    def __init__(self):
-        self.replies = [OSError("not scripted")]
-        self.calls = 0
-        self.during = None  # fn(), run inside the call
+    def __init__(self, result):
+        self.result = result
+        self.started, self.release, self.timed_out = threading.Event(), threading.Event(), False
 
-    def __call__(self):
-        self.calls += 1
-        if self.during is not None:
-            self.during()
-        reply = self.replies[min(self.calls, len(self.replies)) - 1]
-        if isinstance(reply, Exception):
-            raise reply
-        return reply
+    def __call__(self, n):
+        self.started.set()
+        self.timed_out = not self.release.wait(10)
+        return self.result
 
 
 class SupervisorCase(unittest.TestCase):
@@ -172,9 +174,10 @@ class SupervisorCase(unittest.TestCase):
         self.exits = []
         self.out = io.StringIO()
         self.timers = FakeTimers()
-        self.locate = FakeLocate()
+        self.health_file = os.path.join(self.dir, "health.json")
+        self.tool.responses[PROBE] = PROBE_OK
 
-    def make(self, environ=None, file=None, locate=None):
+    def make(self, environ=None, file=None):
         path = os.path.join(self.dir, "settings.json")
         if file is not None:
             with open(path, "w") as f:
@@ -189,7 +192,7 @@ class SupervisorCase(unittest.TestCase):
             port_file=self.port_file,
             exit_fn=self.exits.append,
             timer=self.timers,
-            locate=locate or self.locate,
+            health_file=self.health_file,
         )
         return self.sup
 
@@ -935,83 +938,258 @@ class LeaseTest(SupervisorCase):
         self.assertEqual(self.sup.snapshot()["traffic"], [[1040.0, 100, 10]])
 
 
-ECHO_IP = b"205.147.16.74\n"
-URLOPEN = "protonvpn_container.supervisor.urllib.request.urlopen"
+class HealthCase(SupervisorCase):
+    """Operational health runs on its own worker: these tests step `health_tick()` as the others step `tick()`."""
+
+    def probe_now(self, advance=0):
+        self.clock.now += advance
+        with redirect_stdout(self.out):
+            self.sup.health_tick()
+
+    def health(self):
+        snap = self.sup.snapshot()
+        return snap["tunnel_healthy"], snap["health_error"], snap["health_checked_ago"]
+
+    def docker_says_healthy(self):
+        return is_healthy(self.health_file, clock=self.clock)
+
+    def health_lines(self):
+        return [line for line in self.out.getvalue().splitlines() if line.startswith("[health]")]
+
+    def worker(self, gate):
+        """A health worker held inside its probe by `gate`."""
+        self.tool.responses[PROBE] = gate
+        thread = threading.Thread(target=self.sup.health_tick)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(gate.release.set)  # runs first: a failed test must not leave the thread waiting
+        self.assertTrue(gate.started.wait(5))
+        return thread
+
+    def finish(self, gate, worker):
+        with redirect_stdout(self.out):
+            gate.release.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
 
 
-def echo_reply(body):
-    reply = mock.MagicMock()
-    reply.__enter__.return_value = reply
-    reply.read.return_value = body
-    return reply
+class HealthTest(HealthCase):
+    def test_a_connection_is_unchecked_until_the_first_probe_which_follows_at_once(self):
+        self.make()
+        self.assertEqual(self.health(), (False, "", None))  # nothing connected
+        self.tick()
+        self.assertEqual((self.sup.snapshot()["connected"], self.health()), (True, (None, "", None)))
+        self.assertFalse(self.docker_says_healthy())
+        self.assertNotIn(PROBE, self.tool.calls)  # the loop's state check never waits for the network
+        self.probe_now()
+        self.assertEqual((self.health(), self.docker_says_healthy()), ((True, "", 0.0), True))
+        self.assertEqual(self.health_lines(), ["[health] tunnel check passed"])
+
+    def test_probes_repeat_every_30_seconds_counted_from_the_end_of_the_last(self):
+        self.make()
+        self.tick()
+        for advance, calls in ((0, 1), (29, 1), (1, 2), (29, 2), (1, 3)):
+            self.probe_now(advance)
+            self.assertEqual(self.tool.calls.count(PROBE), calls)
+
+    def test_nothing_is_probed_while_not_connected(self):
+        self.cli.signed_in = False
+        self.make()
+        self.tick()
+        self.probe_now()
+        self.assertEqual((PROBE in self.tool.calls, self.health()), (False, (False, "", None)))
+
+    def test_a_probe_failure_leaves_the_connection_port_and_native_error_alone_and_recovers(self):
+        self.tool.responses[UDP] = self.tool.responses[TCP] = mapped(41404)
+        self.make(environ={"PORT_FORWARDING": "on"})
+        self.tick()
+        self.tool.responses[PROBE] = BIND_FAILED
+        self.probe_now()
+        snap = self.sup.snapshot()
+        reason = BIND_FAILED.out.strip()
+        self.assertEqual((snap["connected"], snap["tunnel_healthy"], snap["health_error"]), (True, False, reason))
+        self.assertEqual((snap["last_error"], snap["forwarded_port"], self.read_port_file()), ("", 41404, "41404\n"))
+        self.assertFalse(self.docker_says_healthy())
+        self.tick(30)  # the state check still reads Connected and keeps the verdict: no reconnect is asked for
+        self.assertEqual((self.sup.snapshot()["connected"], self.health()), (True, (False, reason, 30.0)))
+        self.tool.responses[PROBE] = PROBE_OK
+        self.probe_now(30)
+        self.assertEqual((self.health(), self.docker_says_healthy()), ((True, "", 0.0), True))
+        self.assertEqual((len(self.cli.argvs("connect")), self.cli.argvs("disconnect")), (1, []))
+        self.assertEqual(self.health_lines(), [f"[health] tunnel check failed: {reason}", "[health] tunnel check recovered"])
+
+    def test_the_same_failure_is_logged_once_and_a_different_one_when_it_changes(self):
+        self.make()
+        self.tick()
+        self.tool.responses[PROBE] = [BIND_FAILED, BIND_FAILED, TIMED_OUT, TIMED_OUT, PROBE_OK, PROBE_OK]
+        for _ in range(6):
+            self.probe_now(30)
+        self.assertEqual(
+            self.health_lines(),
+            [
+                f"[health] tunnel check failed: {BIND_FAILED.out.strip()}",
+                f"[health] tunnel check failed: {TIMED_OUT.out.strip()}",
+                "[health] tunnel check recovered",
+            ],
+        )
+
+    def test_a_pass_vouches_for_60_seconds_only(self):
+        self.make()
+        self.tick()
+        self.probe_now()
+        self.clock.now += 60
+        self.assertEqual((self.health(), self.docker_says_healthy()), ((True, "", 60.0), True))
+        self.clock.now += 1
+        healthy, error, ago = self.health()
+        self.assertEqual((healthy, ago, self.sup.snapshot()["connected"], self.docker_says_healthy()), (False, 61.0, True, False))
+        self.assertIn("no successful check", error)
+
+    def test_a_disconnect_request_revokes_a_fresh_pass_before_the_loop_does_anything(self):
+        self.make()
+        self.tick()
+        self.probe_now()
+        self.assertTrue(self.docker_says_healthy())
+        self.sup.request_disconnect()
+        self.assertEqual((self.health(), self.docker_says_healthy()), ((False, "", None), False))
+
+    def test_an_unreadable_or_ended_connection_supersedes_a_fresh_pass_and_is_checked_anew(self):
+        self.make()
+        self.tick()
+        self.probe_now()
+        self.cli.responses[("info",)] = Result(124, "protonvpn timed out after 120s\n")  # the CLI cannot vouch for it
+        self.tick(30)
+        self.assertEqual((self.health(), self.docker_says_healthy()), ((False, "", None), False))
+        del self.cli.responses[("info",)]
+        self.tick(30)
+        self.assertEqual(self.health(), (None, "", None))  # connected again, not yet checked
+        self.probe_now()
+        self.assertEqual((self.health(), self.docker_says_healthy()), ((True, "", 0.0), True))
+        self.cli.connected, self.cli.connect_rc = False, 1  # the tunnel drops and the reconnect fails
+        self.tick(30)
+        self.assertEqual((self.health(), self.docker_says_healthy()), ((False, "", None), False))
+        self.assertEqual(len(self.cli.argvs("connect")), 2)  # the one failed attempt is the loop's, not a probe's
+
+    def test_a_late_result_after_a_disconnect_restores_neither_health_nor_the_exit_ip(self):
+        self.cli.connected = True  # adopted: with no connect output the probe would supply the exit IP
+        self.make()
+        self.tick()
+        gate = Gate(PROBE_OK)
+        worker = self.worker(gate)
+        self.sup.request_disconnect()
+        self.cli.connected = False
+        self.tick(30)
+        self.finish(gate, worker)
+        snap = self.sup.snapshot()
+        self.assertEqual((snap["connected"], snap["tunnel_healthy"], snap["exit_ip"]), (False, False, ""))
+        self.assertFalse(self.docker_says_healthy())
+        self.assertEqual(self.health_lines(), [])
+
+    def test_a_late_result_of_the_old_connection_is_not_the_new_connections(self):
+        self.make()
+        self.tick()
+        gate = Gate(PROBE_OK)
+        worker = self.worker(gate)
+        self.cli.connected = False  # the tunnel drops; the loop reconnects while the probe is still out
+        self.tick(30)
+        self.assertEqual(len(self.cli.argvs("connect")), 2)
+        self.finish(gate, worker)
+        self.assertEqual((self.health(), self.docker_says_healthy()), ((None, "", None), False))
+        self.probe_now()  # the new connection is probed on its own
+        self.assertEqual((self.health(), self.docker_says_healthy()), ((True, "", 0.0), True))
+
+    def test_a_slow_probe_delays_neither_the_loop_nor_the_port_lease(self):
+        self.tool.responses[UDP] = self.tool.responses[TCP] = mapped(41404)
+        self.make(environ={"PORT_FORWARDING": "on"})
+        self.tick()
+        gate = Gate(PROBE_OK)
+        worker = self.worker(gate)
+        self.tick(45)  # the renewal falls due while the probe waits for the network
+        snap = self.sup.snapshot()
+        self.assertEqual(self.tool.calls.count(UDP), 2)
+        self.assertEqual((snap["connected"], snap["tunnel_healthy"], snap["forwarded_port"]), (True, None, 41404))
+        self.finish(gate, worker)
+        self.assertFalse(gate.timed_out)  # nothing the loop did had to wait for the probe
+        self.assertEqual(self.health(), (True, "", 0.0))
+
+    def test_a_verdict_written_late_cannot_overwrite_a_revocation(self):
+        self.make()
+        self.tick()
+        written, entered, proceed, write = [], threading.Event(), threading.Event(), write_health
+
+        def slow_first_write(path, healthy, stamp):
+            written.append(healthy)
+            if len(written) == 1:  # the worker's pass: it is still being written when the disconnect revokes it
+                entered.set()
+                proceed.wait(5)
+            write(path, healthy, stamp)
+
+        with redirect_stdout(self.out), mock.patch(f"{SUPERVISOR}.write_health", side_effect=slow_first_write):
+            worker = threading.Thread(target=self.sup.health_tick)
+            worker.start()
+            self.assertTrue(entered.wait(5))
+            revoke = threading.Thread(target=self.sup.request_disconnect)
+            revoke.start()
+            for _ in range(500):  # the revocation has changed the state, and waits for the file
+                if not self.sup.snapshot()["connected"]:
+                    break
+                time.sleep(0.01)
+            proceed.set()
+            worker.join(5)
+            revoke.join(5)
+        self.assertEqual(written, [True, False])
+        self.assertFalse(self.docker_says_healthy())
+
+    def test_an_unwritable_health_file_is_logged_once_and_changes_nothing_else(self):
+        self.health_file = os.path.join(self.dir, "missing", "health.json")
+        self.make()
+        self.tick()
+        self.probe_now()
+        self.probe_now(30)
+        self.assertEqual(self.health(), (True, "", 0.0))
+        self.assertEqual(self.out.getvalue().count("[health] cannot write"), 1)
+        self.assertFalse(self.docker_says_healthy())
 
 
-class ExitIpLookupTest(unittest.TestCase):
-    def lookup(self, body):
-        with mock.patch(URLOPEN, return_value=echo_reply(body)):
-            return lookup_exit_ip()
+class ExitIpTest(HealthCase):
+    """A connection whose connect output we never saw (adopted at start, or made by hand) gets its exit IP from the probe."""
 
-    def test_accepts_only_a_single_ip_literal(self):
-        self.assertEqual(self.lookup(ECHO_IP), "205.147.16.74")
-        self.assertEqual(self.lookup(b"2a02:6ea0:c041:6653::23\n"), "2a02:6ea0:c041:6653::23")
+    IP = ECHO_IP
 
-    def test_malformed_echo_is_rejected(self):
-        for body in (b"", b"<html>502</html>", b"node-nl-307.protonvpn.net", b"205.147.16.74/24", b'{"IP":"205.147.16.74"}', b"\xff"):
-            with self.subTest(body=body), self.assertRaises(ValueError):
-                self.lookup(body)
-
-
-class ExitIpTest(SupervisorCase):
-    """A connection the CLI reports as connected but whose connect output we never saw: adopted at start, or made by hand."""
-
-    IP = "205.147.16.74"
-
-    def adopt(self, *replies):
+    def adopt(self):
         self.cli.connected = True
-        self.locate.replies = list(replies)
         self.make()
 
     def exit_ip(self):
         return self.sup.snapshot()["exit_ip"]
 
-    def test_an_adopted_connection_resolves_its_exit_ip(self):
-        self.adopt(self.IP)
-        seen = []  # asked after a state check that showed it connected, with no lock held
-        self.locate.during = lambda: seen.append((self.sup.snapshot()["connected"], len(self.cli.argvs("status"))))
+    def test_an_adopted_connection_gets_its_exit_ip_from_the_probe(self):
+        self.adopt()
         self.tick()
+        self.assertEqual((self.exit_ip(), self.cli.argvs("connect"), PROBE in self.tool.calls), ("", [], False))
+        self.probe_now()
         self.assertEqual(self.exit_ip(), self.IP)
-        self.assertEqual(seen, [(True, 1)])
-        self.assertEqual(self.cli.argvs("connect"), [])
         self.assertIn(f"exit IP {self.IP}", self.out.getvalue())
-
-    def test_a_known_exit_ip_is_not_looked_up_again(self):
-        self.adopt(self.IP)
-        self.tick()
-        self.tick(30)
-        self.tick(30)
-        self.assertEqual((self.locate.calls, self.exit_ip()), (1, self.IP))
 
     def test_the_connect_output_stays_the_primary_source(self):
         self.make()
         self.tick()
-        self.tick(30)
-        self.assertEqual((self.exit_ip(), self.locate.calls), ("205.147.16.78", 0))
+        self.probe_now()
+        self.probe_now(30)
+        self.assertEqual(self.exit_ip(), "205.147.16.78")
 
-    def test_a_failed_lookup_changes_nothing_else_and_is_retried_at_the_next_check(self):
-        self.adopt(OSError("timed out"), ValueError("unexpected reply"), http.client.IncompleteRead(b""), self.IP)
+    def test_a_failed_probe_finds_no_exit_ip_and_a_later_one_does(self):
+        self.adopt()
         self.tick()
-        for calls in (1, 2, 3):
+        self.tool.responses[PROBE] = [BIND_FAILED, TIMED_OUT, PROBE_OK]
+        for expected in ("", "", self.IP):
+            self.probe_now(30)
             snap = self.sup.snapshot()
-            self.assertEqual((self.locate.calls, snap["connected"], snap["last_error"], snap["exit_ip"]), (calls, True, "", ""))
-            self.tick(1)  # the next state check is not due: no new lookup
-            self.assertEqual(self.locate.calls, calls)
-            self.tick(29)
-        self.assertEqual((self.locate.calls, self.exit_ip()), (4, self.IP))
-        self.assertEqual(self.out.getvalue().count("exit IP lookup failed"), 3)
+            self.assertEqual((snap["connected"], snap["last_error"], snap["exit_ip"]), (True, "", expected))
 
     def test_an_exit_ip_is_forgotten_with_its_connection_and_found_again(self):
-        self.adopt(self.IP, "205.147.16.99")
+        self.adopt()
         self.tick()
+        self.probe_now()
         self.assertEqual(self.exit_ip(), self.IP)
         self.cli.connected, self.cli.connect_rc = False, 1  # the tunnel drops and our reconnect fails
         self.tick(30)
@@ -1019,17 +1197,10 @@ class ExitIpTest(SupervisorCase):
         self.assertEqual((snap["connected"], snap["exit_ip"]), (False, ""))
         self.cli.connected = True  # one made by hand while we back off
         self.tick(30)
-        self.assertEqual((self.exit_ip(), self.locate.calls), ("205.147.16.99", 2))
-
-    def test_failed_echo_changes_no_connection_state_and_later_lookup_recovers(self):
-        self.cli.connected = True
-        self.make(locate=lookup_exit_ip)
-        replies = [urllib.error.URLError("no route"), echo_reply(b"<html>error</html>"), echo_reply(ECHO_IP)]
-        with mock.patch(URLOPEN, side_effect=replies):
-            for advance, expected in ((0, ""), (30, ""), (30, "205.147.16.74")):
-                self.tick(advance)
-                snap = self.sup.snapshot()
-                self.assertEqual((snap["connected"], snap["last_error"], snap["exit_ip"]), (True, "", expected))
+        self.assertEqual(self.exit_ip(), "")
+        self.tool.responses[PROBE] = Result(0, "205.147.16.99\n")
+        self.probe_now()
+        self.assertEqual(self.exit_ip(), "205.147.16.99")
 
 
 class TrafficTest(SupervisorCase):
@@ -1061,11 +1232,12 @@ class StopTest(SupervisorCase):
     def test_stop_disconnects_and_joins(self):
         self.make()
         self.tick()
-        self.sup.start()
         with redirect_stdout(self.out):
+            self.sup.start()
             self.sup.stop()
         self.assertIn(("disconnect",), self.cli.argvs("disconnect"))
         self.assertFalse(self.sup._thread.is_alive())
+        self.assertFalse(self.sup._health_thread.is_alive())
 
     def test_stop_respects_the_time_it_is_given(self):
         self.make()
@@ -1073,6 +1245,45 @@ class StopTest(SupervisorCase):
         self.assertEqual(self.cli.timeouts[-1], (("disconnect",), 2))
         self.sup.stop()
         self.assertEqual(self.cli.timeouts[-1], (("disconnect",), 5))
+
+
+class HealthStopTest(HealthCase):
+    def test_stop_revokes_a_fresh_pass(self):
+        self.make()
+        self.tick()
+        self.probe_now()
+        self.assertTrue(self.docker_says_healthy())
+        with redirect_stdout(self.out):
+            self.sup.stop()
+        self.assertEqual((self.health(), self.docker_says_healthy()), ((False, "", None), False))
+
+    def test_start_revokes_what_an_earlier_run_left_in_the_file(self):
+        self.cli.signed_in = False  # nothing to connect: the loop stays quiet
+        self.make()
+        write_health(self.health_file, True, self.clock.now)
+        self.assertTrue(self.docker_says_healthy())
+        with redirect_stdout(self.out):
+            self.sup.start()
+            self.assertFalse(self.docker_says_healthy())
+            self.sup.stop()
+
+    def test_stop_stays_within_its_budget_while_a_probe_hangs_and_the_late_pass_is_dropped(self):
+        self.make()
+        self.tick()
+        gate = Gate(PROBE_OK)
+        self.tool.responses[PROBE] = gate
+        self.addCleanup(gate.release.set)
+        with redirect_stdout(self.out):
+            self.sup.start()
+            self.assertTrue(gate.started.wait(5))
+            begin = time.monotonic()
+            self.sup.stop(timeout=0.5)
+            self.assertLess(time.monotonic() - begin, 3)
+            self.assertEqual((self.health(), self.docker_says_healthy()), ((False, "", None), False))
+            gate.release.set()
+            self.sup._health_thread.join(5)
+        self.assertFalse(self.sup._health_thread.is_alive())
+        self.assertEqual((self.health(), self.docker_says_healthy(), self.health_lines()), ((False, "", None), False, []))
 
 
 if __name__ == "__main__":

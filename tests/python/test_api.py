@@ -69,7 +69,8 @@ class ApiTest(WebuiCase):
         self.sup.snapshot = lambda: snapshot.copy()
         _, status = self.api("GET", "/api/v1/status")
         self.assertEqual(status, {key: snapshot[key] for key in (
-            "signed_in", "account", "connected", "server", "location", "load", "protocol", "exit_ip", "forwarded_port", "last_error")})
+            "signed_in", "account", "connected", "server", "location", "load", "protocol", "exit_ip", "forwarded_port",
+            "last_error", "tunnel_healthy", "health_error", "health_checked_ago")})
         self.assertEqual(self.api("GET", "/api/v1/port")[1], {"port": 41404})
         resp, raw = self.api("GET", "/api/v1/port?format=text")
         self.assertEqual((raw, resp.getheader("Content-Type")), (b"41404", "text/plain"))
@@ -133,6 +134,7 @@ class ApiTest(WebuiCase):
                 supervisor = Supervisor(
                     self.store, run=cli, tool=FakeTool(), clock=clock,
                     port_file=self.settings_path + ".port",
+                    health_file=self.settings_path + ".health",
                 )
                 supervisor.tick()
                 self.server.ui.supervisor = supervisor
@@ -197,7 +199,8 @@ class ApiTest(WebuiCase):
         tool.responses[UDP] = tool.responses[TCP] = mapped(41404)
         self.port_file = self.settings_path + ".port"
         supervisor = Supervisor(
-            self.store, run=self.cli, tool=tool, clock=self.clock, port_file=self.port_file, timer=FakeTimers()
+            self.store, run=self.cli, tool=tool, clock=self.clock, port_file=self.port_file, timer=FakeTimers(),
+            health_file=self.settings_path + ".health",
         )
         self.server.ui.supervisor = supervisor
         supervisor.tick()
@@ -227,6 +230,47 @@ class ApiTest(WebuiCase):
         self.assertEqual(self.consumer_view(), (True, False, None, None, ""))  # one error is not a signout
         self.assertEqual(self.api("GET", "/api/v1/port?format=text")[1], b"")
         self.assertIn("state check failed (rc 124)", self.api("GET", "/api/v1/status")[1]["last_error"])
+
+    def test_status_carries_the_traffic_check_fields(self):
+        self.sup.overrides = {
+            "connected": True, "tunnel_healthy": False,
+            "health_error": "IPv4 HTTPS probe timed out", "health_checked_ago": 12.5,
+        }
+        _, status = self.api("GET", "/api/v1/status")
+        self.assertEqual(
+            {field: status[field] for field in ("connected", "tunnel_healthy", "health_error", "health_checked_ago")},
+            self.sup.overrides,
+        )
+
+    @unittest.skipIf(Draft202012Validator is None, "needs jsonschema: runs in CI, outside the image")
+    def test_traffic_check_states_match_the_status_schema(self):
+        _, document = self.get_json("/api/v1/openapi.json")
+        schema = {**document["components"]["schemas"]["Status"], "components": document["components"]}
+        states = (
+            {"connected": False, "tunnel_healthy": False, "health_error": "", "health_checked_ago": None},
+            {"connected": True, "tunnel_healthy": None, "health_error": "", "health_checked_ago": None},
+            {"connected": True, "tunnel_healthy": True, "health_error": "", "health_checked_ago": 4.5},
+            {
+                "connected": True,
+                "tunnel_healthy": False,
+                "health_error": "IPv4 HTTPS probe timed out",
+                "health_checked_ago": 75.0,
+            },
+        )
+        for overrides in states:
+            with self.subTest(**overrides):
+                self.sup.overrides = overrides
+                _, status = self.api("GET", "/api/v1/status")
+                self.assertEqual(list(Draft202012Validator(schema).iter_errors(status)), [])
+
+    @unittest.skipIf(Draft202012Validator is None, "needs jsonschema: runs in CI, outside the image")
+    def test_documented_status_examples_match_the_status_schema(self):
+        _, document = self.get_json("/api/v1/openapi.json")
+        schema = {**document["components"]["schemas"]["Status"], "components": document["components"]}
+        examples = document["paths"]["/status"]["get"]["responses"]["200"]["content"]["application/json"]["examples"]
+        for name, example in examples.items():
+            with self.subTest(example=name):
+                self.assertEqual(list(Draft202012Validator(schema).iter_errors(example["value"])), [])
 
     def test_short_key_warning_only_at_start(self):
         for key, count in (("k" * 16, 1), ("k" * 64, 0), ("", 0)):

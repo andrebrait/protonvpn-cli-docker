@@ -38,7 +38,7 @@ docker run -d --name protonvpn-cli \
   ghcr.io/andrebrait/protonvpn-cli-docker:latest
 ```
 
-Open `http://YOUR_DOCKER_HOST:8788/`, unlock the WebUI, and sign in to Proton. Until signed in and connected, the container remains running but unhealthy. Keep the published port on a trusted network; the built-in server uses HTTP, not TLS. Use a trusted HTTPS reverse proxy for remote access, rather than exposing it directly to the internet.
+Open `http://YOUR_DOCKER_HOST:8788/`, unlock the WebUI, and sign in to Proton. Until the VPN is connected and the traffic check passes, the container remains running but unhealthy. Keep the published port on a trusted network; the built-in server uses HTTP, not TLS. Use a trusted HTTPS reverse proxy for remote access, rather than exposing it directly to the internet.
 
 To build locally instead of pulling a published image:
 
@@ -174,7 +174,7 @@ Only the VPN container's own cgroup, including `docker exec` sessions, can use d
 
 Proton's additional kill switch is fixed to **Standard**, not exposed as an environment variable, WebUI field, or API setting. Standard blocks traffic after an accidental VPN drop but restores it after an intentional disconnect. The container firewall remains enforced in both cases: intentionally disconnecting does **not** give attached applications an unprotected internet route. Neither protection layer can be disabled through the WebUI or API.
 
-The WebUI uses readable labels such as **Default**, **On**, and **Off**. CLI/API values remain lowercase. When adopting a running tunnel after a restart, a missing exit IPv4 address is recovered from the HTTPS IP-echo service `api.ipify.org`; lookup failure does not determine VPN health. Proton's location API cannot be used here because it refuses requests from VPN exits.
+The WebUI uses readable labels such as **Default**, **On**, and **Off**. CLI/API values remain lowercase. The traffic check described under [Health and troubleshooting](#health-and-troubleshooting) also fills a missing exit IPv4 address from the HTTPS IP-echo service `api.ipify.org`; the CLI's own connect output stays primary. Proton's location API cannot be used here because it refuses requests from VPN exits.
 
 ## Port forwarding
 
@@ -205,7 +205,7 @@ curl --fail --silent --show-error \
 
 | GET endpoint | Result |
 | --- | --- |
-| `/api/v1/status` | Sign-in, connection, server, exit IP, forwarded port, and last error. |
+| `/api/v1/status` | Sign-in, connection, server, exit IP, forwarded port, last error, and the traffic check (`tunnel_healthy`, `health_error`, `health_checked_ago`). |
 | `/api/v1/port` | `{"port": 41404}` or `{"port": null}`. |
 | `/api/v1/port?format=text` | Bare port number, or an empty body when unavailable. |
 | `/api/v1/traffic` | RX/TX totals and samples relative to the newest sample (0 seconds). |
@@ -236,15 +236,24 @@ WebUI login lockout is per client IP: five failed attempts in 60 seconds lock th
 
 ## Health and troubleshooting
 
-Docker checks the connection every 30 seconds, with a 10-second timeout, 60-second startup grace, and three retries. Healthy means the CLI reports `Status: Connected`, not that a forwarded port exists. The supervisor checks every `RECONNECT_INTERVAL` seconds and retries failed connections with backoff up to 300 seconds. A WebUI disconnect pauses automatic reconnection until you connect again or restart the container.
+Docker runs `healthcheck.sh` every 30 seconds, with a 10-second timeout, 60-second startup grace, and three retries. The container is healthy only when both of these hold:
 
-**Docker health status does not trigger restarts.** `restart: unless-stopped` handles process exits, not an unhealthy status; the supervisor handles reconnects. A signed-out container intentionally remains unhealthy.
+1. The CLI reports `Status: Connected`.
+2. A traffic check passed within the last 60 seconds: a WireGuard-bound IPv4 HTTPS request to `https://api.ipify.org` returned a public IPv4 address.
+
+The check runs every 30 seconds in a worker thread inside the supervisor. It uses `curl --interface proton0 --ipv4` with no proxy, so it fails rather than falling back to the host's route. It sends no credentials and verifies IPv4 HTTPS only; IPv6 tunnel traffic is not separately checked. A forwarded port does not affect health.
+
+The probe depends on a third-party service. If `api.ipify.org` is down, blocked, or answers with something other than a public IPv4 address, the check fails and the container reports unhealthy even though the tunnel works. A failed check never disconnects or reconnects the VPN, never changes the CLI's `connected` state, never clears the forwarded port, and never overwrites the CLI's last error. Automatic reconnection still follows only the CLI's own state: the supervisor checks every `RECONNECT_INTERVAL` seconds and retries failed connections with backoff up to 300 seconds. A WebUI disconnect pauses automatic reconnection until you connect again or restart the container.
+
+**Docker health status does not trigger restarts.** `restart: unless-stopped` handles process exits, not an unhealthy status, and a failed traffic check does not restart or reconnect the VPN. The Docker restart policy alone does not heal an unhealthy status. A signed-out container intentionally remains unhealthy.
 
 ```bash
 docker logs --tail 100 protonvpn-cli
 docker exec protonvpn-cli protonvpn status
 docker inspect --format '{{.State.Health.Status}}' protonvpn-cli
 ```
+
+`/api/v1/status` reports `connected`, `tunnel_healthy`, `health_error`, and `health_checked_ago` side by side. Use it to tell a CLI connection problem from a failed traffic check.
 
 CLI logs are persisted at `/config/cache/VPN/logs/vpn-cli.log`. Check firewall startup errors for missing cgroup v2, `xt_cgroup`, kernel support, or required run flags. If an application UI is unreachable, check the VPN container's published ports, `LAN_NETWORKS`, port collisions, and whether the application joined a replaced namespace. Do not disable the firewall to work around a connection problem.
 

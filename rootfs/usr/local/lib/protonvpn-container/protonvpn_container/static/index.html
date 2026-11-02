@@ -47,6 +47,13 @@
       <h2 id="h-conn">Connection</h2>
       <p class="pill-row" aria-live="polite"><span id="pill" class="pill pill-off">Disconnected</span></p>
       <p id="where" class="where"></p>
+      <div id="traffic" class="traffic" hidden>
+        <div class="traffic-head">
+          <span class="label">Traffic check</span>
+          <span id="traffic-pill" class="pill pill-sm pill-wait" aria-live="polite">Checking</span>
+        </div>
+        <p id="traffic-note" class="note"></p>
+      </div>
       <dl class="facts">
         <dt>Exit IP</dt><dd id="exit-ip" class="num">—</dd>
         <dt>Load</dt><dd id="load" class="num">—</dd>

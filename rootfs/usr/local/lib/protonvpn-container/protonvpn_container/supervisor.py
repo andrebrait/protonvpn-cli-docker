@@ -1,22 +1,24 @@
-"""Supervisor: signin wait, settings apply, connect/reconnect, NAT-PMP refresh, traffic samples.
+"""Supervisor: signin wait, settings apply, connect/reconnect, NAT-PMP refresh, traffic samples, tunnel health.
 
 One loop, one base wait of 1 s: every activity has a next-due time from the injected clock, so
 tests drive `tick()` directly. Requests from other threads only set flags and make the next
 check due; the loop thread does the work.
+
+The tunnel probe runs on a second thread, `health_tick()`, because it can take seconds: it never holds
+`_cli_lock` and takes `_lock` only for state, so a slow probe delays neither the loop nor the port lease.
+Its result is kept only while the connection it was made on is still the current one.
 """
 
 import collections
-import http.client
-import ipaddress
 import os
 import sys
 import threading
 import time
 import traceback
-import urllib.request
 
 from . import cli
 from .config import DEFAULTS, SETTINGS, SettingsStore, connect_args, is_true, settings_pairs
+from .health import FRESH_FOR, HEALTH_FILE, TUNNEL, ProbeError, probe, write_health
 from .parsing import (
     Status,
     parse_account,
@@ -28,16 +30,13 @@ from .parsing import (
 
 PORT_FILE = "/config/forwarded_port"
 GATEWAY = "10.2.0.1"
-TUNNEL = "proton0"
 HINT = "Not signed in. Sign in from the WebUI or run: docker exec -it <name> protonvpn signin <username>"
 HINT_EVERY = 60
 BACKOFF = (30, 60, 120, 300)
 NATPMP_EVERY = 45
 NATPMP_LEASE = 60  # seconds a mapping lives without a renewal
-# A display-only IPv4 echo: Proton's location API refuses requests from VPN exits.
-EXIT_IP_URL = "https://api.ipify.org"
-EXIT_IP_TIMEOUT = 5
-EXIT_IP_MAX = 128
+HEALTH_EVERY = 30  # seconds between probes, counted from the end of one
+HEALTH_POLL = 1  # the worker looks for a newly connected tunnel this often
 TRAFFIC_EVERY = 5
 TRAFFIC_KEEP = 180  # 15 minutes
 # Cap for `protonvpn disconnect` during shutdown; the caller's total budget may be shorter.
@@ -60,15 +59,6 @@ def say(out: str) -> None:
         log(f"[protonvpn] {line}")
 
 
-def lookup_exit_ip() -> str:
-    """Read a single IP literal; lookup failure never determines tunnel health.
-
-    shortcut: urllib's timeout does not cover DNS resolution; use a separate bounded worker if resolver stalls become material.
-    """
-    with urllib.request.urlopen(EXIT_IP_URL, timeout=EXIT_IP_TIMEOUT) as reply:
-        return str(ipaddress.ip_address(reply.read(EXIT_IP_MAX).decode("ascii").strip()))
-
-
 def decide(signed_in: bool, connected: bool, user_disconnected: bool) -> str:
     if not signed_in:
         return "wait_signin"
@@ -88,12 +78,12 @@ class Supervisor:
         port_file: str = PORT_FILE,
         exit_fn=os._exit,
         timer=threading.Timer,
-        locate=lookup_exit_ip,
+        health_file: str = HEALTH_FILE,
     ):
         self._store, self._run, self._tool, self._clock = store, run, tool, clock
         self._interval, self._port_file, self._exit, self._timer = interval, port_file, exit_fn, timer
-        self._locate = locate
-        self._thread = None
+        self._health_file = health_file
+        self._thread = self._health_thread = None
         self._stop = threading.Event()
         self._cli_lock = threading.Lock()  # one CLI mutation at a time: tick vs apply_setting
         self._lock = threading.Lock()  # guards the state read by snapshot() and the request flags
@@ -102,6 +92,14 @@ class Supervisor:
         self._st = Status()
         self._exit_ip, self._last_error, self._check_error = "", "", ""
         self._port, self._port_synced = None, False
+        # The tunnel probe's result, under _lock. A probe for an older connection finds `_health_gen` moved on and is dropped.
+        self._health_gen = 0
+        self._health_at: float | None = None  # when the current connection's last probe completed
+        self._health_error = ""  # that probe's failure; "" when it passed
+        self._next_probe = 0.0
+        self._health_io = threading.Lock()  # serialises the file writes; taken before _lock
+        self._health_published: bool | None = None  # what the file says; None: not written yet, or the write failed
+        self._health_write_failed = False
         self._lease_end = self._lease_timer = None  # of the published port: the timer clears it unless a renewal replaced it
         self._traffic = collections.deque(maxlen=TRAFFIC_KEEP)
         self._settings_errors: dict[str, str] = {}
@@ -115,30 +113,38 @@ class Supervisor:
     # --- lifecycle ---
 
     def start(self) -> None:
-        self._thread = threading.Thread(target=self._loop, name="supervisor", daemon=True)
+        self._reset_health()  # whatever an earlier run left in the file no longer holds
+        self._thread = threading.Thread(target=self._loop, args=(self.tick, 1), name="supervisor", daemon=True)
+        self._health_thread = threading.Thread(
+            target=self._loop, args=(self.health_tick, HEALTH_POLL), name="health", daemon=True
+        )
         self._thread.start()
+        self._health_thread.start()
 
     def stop(self, timeout: float = 6.0) -> None:
-        """Disconnect and stop the loop, within `timeout` seconds in total."""
+        """Disconnect and stop the loop and the health worker, within `timeout` seconds in total."""
         end = time.monotonic() + timeout
         self._stop.set()
+        self._reset_health()  # not healthy while shutting down; a probe still running is dropped
         say(self._run("disconnect", timeout=min(STOP_DISCONNECT_TIMEOUT, timeout)).out)
-        if self._thread is not None:
-            self._thread.join(timeout=max(0.0, end - time.monotonic()))
+        for thread in (self._thread, self._health_thread):
+            if thread is not None:
+                thread.join(timeout=max(0.0, end - time.monotonic()))
 
-    def _loop(self) -> None:
+    def _loop(self, step, wait: float) -> None:
         while not self._stop.is_set():
             try:
-                self.tick()
+                step()
             except Exception:  # a bug must not end supervision
                 traceback.print_exc(file=sys.stdout)
                 sys.stdout.flush()
-            self._stop.wait(1)
+            self._stop.wait(wait)
 
     # --- requests from other threads ---
 
     def snapshot(self) -> dict:
         with self._lock:
+            tunnel_healthy, health_error, health_checked_ago = self._health_view(self._clock())
             return {
                 "signed_in": self._signed_in,
                 "account": self._account,
@@ -153,6 +159,9 @@ class Supervisor:
                 "last_error": self._check_error or self._last_error,
                 "settings_errors": dict(self._settings_errors),
                 "user_disconnected": self._user_disconnected,
+                "tunnel_healthy": tunnel_healthy,
+                "health_error": health_error,
+                "health_checked_ago": health_checked_ago,
             }
 
     def request_connect(self) -> None:
@@ -310,7 +319,6 @@ class Supervisor:
             self._failures = 0
             if not self._was_connected:
                 self._new_connection()
-            self._find_exit_ip()
         else:
             self._set_port(None)
             with self._lock:
@@ -335,30 +343,85 @@ class Supervisor:
             self._new_connection()
         return ok
 
-    def _find_exit_ip(self) -> None:
-        """Ask Proton for the exit IP of a connection that came without connect output of ours (adopted at start or after a drop).
+    # --- tunnel health: its own thread, see the module docstring ---
 
-        Called only on a state check that just showed it connected, so the answer is the tunnel's, not the host's.
-        Nothing but the IP is kept; a failure changes nothing else and is tried again at the next check.
-        """
+    def health_tick(self) -> None:
+        """Probe the tunnel when due. A failed probe changes nothing but the health fields: it never disconnects or
+        reconnects, drops the port, or touches the CLI's own `last_error`. The same probe supplies a missing exit IP."""
+        now = self._clock()
         with self._lock:
-            if self._exit_ip or not self._st.connected:
+            if not self._st.connected or now < self._next_probe:
                 return
-        try:
-            ip = self._locate()
-        except (OSError, ValueError, http.client.HTTPException) as exc:
-            log(f"[protonvpn] exit IP lookup failed (retried at the next state check): {exc}")
-            return
+            generation = self._health_gen
+            self._next_probe = now + HEALTH_EVERY  # also when the probe breaks: it must not spin
+        try:  # no lock held: this waits for the network
+            ip, error = probe(self._tool), ""
+        except ProbeError as exc:
+            ip, error = "", str(exc)
+        found = ""
         with self._lock:
-            found = self._st.connected  # not dropped by a disconnect request while the lookup ran
-            if found:
-                self._exit_ip = ip
+            if generation != self._health_gen or not self._st.connected or self._stop.is_set():
+                return  # made on a connection that is gone, or shutdown began: not a result for the current one
+            done = self._clock()
+            previous, first = self._health_error, self._health_at is None
+            self._health_at, self._health_error, self._next_probe = done, error, done + HEALTH_EVERY
+            if ip and not self._exit_ip:  # the connect output stays the primary source
+                self._exit_ip = found = ip
+        if error and error != previous:  # one line per change, not per probe
+            log(f"[health] tunnel check failed: {error}")
+        elif not error and previous:
+            log("[health] tunnel check recovered")
+        elif not error and first:
+            log("[health] tunnel check passed")
         if found:
-            log(f"[protonvpn] exit IP {ip}")
+            log(f"[protonvpn] exit IP {found}")
+        self._publish_health()
+
+    def _health_view(self, now: float) -> tuple[bool | None, str, float | None]:
+        """`tunnel_healthy`, `health_error` and `health_checked_ago`; call with _lock held.
+
+        Never healthy without a native connection, nor on a pass older than FRESH_FOR; None: connected, not checked yet.
+        """
+        if not self._st.connected or self._stop.is_set():
+            return False, "", None
+        if self._health_at is None:
+            return None, "", None
+        ago = round(max(0.0, now - self._health_at), 1)
+        if self._health_error:
+            return False, self._health_error, ago
+        if now - self._health_at > FRESH_FOR:
+            return False, f"no successful check in the last {FRESH_FOR} s", ago
+        return True, "", ago
+
+    def _reset_health(self) -> None:
+        """The tunnel is unchecked: its connection is new, gone, or no longer vouched for. A probe still running is dropped."""
+        with self._lock:
+            self._health_gen += 1
+            self._health_at, self._health_error, self._next_probe = None, "", 0.0
+        self._publish_health()
+
+    def _publish_health(self) -> None:
+        """Write the current verdict to the file Docker's healthcheck reads."""
+        with self._health_io:  # the state is read inside it: whichever writer is last leaves the newest verdict
+            with self._lock:
+                now = self._clock()
+                healthy = self._health_view(now)[0] is True
+                stamp = self._health_at if healthy else now
+            if not healthy and self._health_published is False:
+                return  # already revoked; a disconnected loop revokes at every check
+            try:
+                write_health(self._health_file, healthy, stamp)
+            except OSError as exc:
+                if not self._health_write_failed:  # once per failure streak
+                    log(f"[health] cannot write {self._health_file}: {exc}")
+                self._health_write_failed, self._health_published = True, None
+                return
+            self._health_write_failed, self._health_published = False, healthy
 
     def _new_connection(self) -> None:
         with self._lock:
             self._traffic.clear()
+        self._reset_health()
         self._next_traffic = self._next_natpmp = 0.0
 
     def _new_session(self) -> None:
@@ -424,7 +487,7 @@ class Supervisor:
             self._refresh_port()
 
     def _drop_connection(self, ended: bool = True) -> None:
-        """Forget the status and forwarded port of a connection that is going away or can no longer be vouched for.
+        """Forget the status, forwarded port and tunnel check of a connection that is going away or can no longer be vouched for.
 
         `ended`: it really is going away, so its exit IP is forgotten too.
         """
@@ -432,6 +495,7 @@ class Supervisor:
             self._st = Status()
             if ended:
                 self._exit_ip = ""
+        self._reset_health()
         self._set_port(None)
 
     def _refresh_port(self) -> None:

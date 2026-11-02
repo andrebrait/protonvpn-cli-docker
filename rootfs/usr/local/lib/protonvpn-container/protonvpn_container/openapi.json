@@ -25,7 +25,7 @@
       "get": {
         "operationId": "getStatus",
         "summary": "Connection status",
-        "description": "Current account, connection and forwarded port. Empty strings mean unavailable.",
+        "description": "Current account, CLI connection, forwarded port and traffic check. Empty strings mean unavailable. connected is the CLI state; tunnel_healthy is the traffic check and is never true without a fresh passing probe.",
         "responses": {
           "200": {
             "description": "Success",
@@ -34,17 +34,61 @@
                 "schema": {
                   "$ref": "#/components/schemas/Status"
                 },
-                "example": {
-                  "signed_in": false,
-                  "account": "",
-                  "connected": false,
-                  "server": "",
-                  "location": "",
-                  "load": "",
-                  "protocol": "",
-                  "exit_ip": "",
-                  "forwarded_port": null,
-                  "last_error": ""
+                "examples": {
+                  "signed_out": {
+                    "summary": "Signed out",
+                    "value": {
+                      "signed_in": false,
+                      "account": "",
+                      "connected": false,
+                      "server": "",
+                      "location": "",
+                      "load": "",
+                      "protocol": "",
+                      "exit_ip": "",
+                      "forwarded_port": null,
+                      "last_error": "",
+                      "tunnel_healthy": false,
+                      "health_error": "",
+                      "health_checked_ago": null
+                    }
+                  },
+                  "connected_check_passed": {
+                    "summary": "Connected, traffic check passed",
+                    "value": {
+                      "signed_in": true,
+                      "account": "user@example.com",
+                      "connected": true,
+                      "server": "NL#914",
+                      "location": "Netherlands",
+                      "load": "23%",
+                      "protocol": "WireGuard",
+                      "exit_ip": "203.0.113.7",
+                      "forwarded_port": null,
+                      "last_error": "",
+                      "tunnel_healthy": true,
+                      "health_error": "",
+                      "health_checked_ago": 4.5
+                    }
+                  },
+                  "connected_check_failed": {
+                    "summary": "Connected, traffic check failed",
+                    "value": {
+                      "signed_in": true,
+                      "account": "user@example.com",
+                      "connected": true,
+                      "server": "NL#914",
+                      "location": "Netherlands",
+                      "load": "23%",
+                      "protocol": "WireGuard",
+                      "exit_ip": "203.0.113.7",
+                      "forwarded_port": null,
+                      "last_error": "",
+                      "tunnel_healthy": false,
+                      "health_error": "IPv4 HTTPS probe timed out",
+                      "health_checked_ago": 75.0
+                    }
+                  }
                 }
               }
             }
@@ -427,6 +471,9 @@
                   "exit_ip": "",
                   "forwarded_port": null,
                   "last_error": "",
+                  "tunnel_healthy": false,
+                  "health_error": "",
+                  "health_checked_ago": null,
                   "traffic": [],
                   "settings_errors": {},
                   "user_disconnected": false,
@@ -1522,6 +1569,25 @@
           },
           "last_error": {
             "type": "string"
+          },
+          "tunnel_healthy": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "True only while connected and the last successful IPv4 HTTPS probe through the tunnel is at most 60 seconds old. Null while connected but not yet checked. False when disconnected, failed or stale."
+          },
+          "health_error": {
+            "type": "string",
+            "description": "Short reason for the last failed traffic check. Empty when there is none."
+          },
+          "health_checked_ago": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": 0,
+            "description": "Seconds since the last completed traffic check of the current connection. Null when there is none."
           }
         },
         "required": [
@@ -1534,7 +1600,10 @@
           "protocol",
           "exit_ip",
           "forwarded_port",
-          "last_error"
+          "last_error",
+          "tunnel_healthy",
+          "health_error",
+          "health_checked_ago"
         ]
       },
       "Port": {

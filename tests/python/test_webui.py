@@ -25,6 +25,7 @@ class StubSupervisor:
         self.apply_result = (True, "saved")
         self.apply_error = None
         self.signout_result = (True, "You have been successfully signed out.")
+        self.overrides = {}  # snapshot fields a test sets, such as the traffic check
 
     def snapshot(self):
         return {
@@ -41,6 +42,10 @@ class StubSupervisor:
             "last_error": "",
             "settings_errors": {},
             "user_disconnected": False,
+            "tunnel_healthy": False,
+            "health_error": "",
+            "health_checked_ago": None,
+            **self.overrides,
         }
 
     def request_connect(self):
@@ -572,6 +577,28 @@ class LogHygieneTest(WebuiCase):
             self.assertNotIn(char, logged)
         self.assertIn(r'"GET /\x1b[2K\x1b[1G[webui]fake\x9b\x07 HTTP/1.1" 404', logged)
         self.assertTrue(all(line.startswith("[webui] ") for line in logged.splitlines()))
+
+
+class TrafficCheckTest(WebuiCase):
+    FIELDS = ("connected", "tunnel_healthy", "health_error", "health_checked_ago")
+
+    def test_state_carries_each_traffic_check_state(self):
+        cases = (
+            {"connected": False, "tunnel_healthy": False, "health_error": "", "health_checked_ago": None},
+            {"connected": True, "tunnel_healthy": None, "health_error": "", "health_checked_ago": None},
+            {"connected": True, "tunnel_healthy": True, "health_error": "", "health_checked_ago": 4.5},
+            {
+                "connected": True,
+                "tunnel_healthy": False,
+                "health_error": "no successful check in the last 60 s",
+                "health_checked_ago": 75.0,
+            },
+        )
+        for case in cases:
+            with self.subTest(**case):
+                self.sup.overrides = case
+                _, state = self.get_json("/api/v1/state")
+                self.assertEqual({field: state[field] for field in self.FIELDS}, case)
 
 
 if __name__ == "__main__":

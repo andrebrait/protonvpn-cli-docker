@@ -12,7 +12,7 @@ firewall_init
 # The Python service reads the daemons' PIDs from here at shutdown.
 pids=/run/protonvpn-container
 mkdir -p "$pids"
-rm -f /run/session-bus.env "$pids"/*.pid "$pids/nm.log"
+rm -f /run/session-bus.env "$pids"/*.pid "$pids/nm.log" "$pids"/health.json*  # no healthy verdict survives a restart
 
 # Proton hard-codes /etc/Proton and /var/cache/Proton when running as root; persist both under /config.
 mkdir -p /config/Proton /config/cache

@@ -591,3 +591,44 @@ git add -A && git commit -m "docs: Unraid template, README and manual test check
 ```
 
 The credentialed manual checklist on Unraid runs after Task 7 with the user (ledger Ruling R1).
+
+---
+
+### Task 8: Independent operational health (approved after live outage test)
+
+This extension supersedes the earlier CLI-only healthcheck and synchronous exit-address lookup.
+The live five-minute WireGuard outage kept native `connected=true`, so operational reachability
+must be a separate fact. The user chose observation only, not probe-triggered reconnection.
+
+**Backend ownership:** `supervisor.py`, new `health.py` / `healthcheck.py` where appropriate,
+`healthcheck.sh`, image-baked curl in `Dockerfile`, startup health-file invalidation, backend tests.
+**Frontend ownership:** `webui.py`, `openapi.json`, static UI, README/manual, HTTP contract fixtures.
+**Controller ownership:** shared spec, CI tool version, integration and release verification.
+
+**Interfaces:**
+- Snapshot/status/state: `tunnel_healthy: bool | None`, `health_error: str`,
+  `health_checked_ago: float | None` (seconds).
+- One worker in the existing process, independent of CLI locks and the supervisor loop: probe
+  every 30 seconds, first probe promptly after connection. Use curl bound to `if!proton0`,
+  IPv4, five-second complete request limit, six-second process limit, no proxy, HTTPS ipify.
+  Require a valid public IPv4 literal. No interface fallback, no automatic reconnects.
+- Freshness is 60 seconds. Disconnection, stop and new connection invalidate prior success;
+  old in-flight results cannot update a new connection. Log changed health states/errors only.
+- Atomic `/run/protonvpn-container/health.json` with boolean `healthy` and monotonic `checked_at`
+  feeds Docker health; missing, invalid or stale state is unhealthy. No unauthenticated API
+  endpoint or duplicated credential handling.
+- UI separates native connection from Passed/Failed/Checking traffic health, with IPv4 HTTPS
+  scope and age. Existing CLI `connected` and `last_error` meanings remain unchanged.
+
+- [ ] **Step 1:** Backend worker implements the transport, independent scheduling, stale-result
+  guards, health-file reader/writer and deterministic failure/freshness/concurrency tests.
+- [ ] **Step 2:** Frontend worker integrates the exact three fields in API/schema/UI and adds
+  behavioral HTTP contracts, including native-connected/probe-failed state.
+- [ ] **Step 3:** Controller runs Python units and JSON-schema contracts, OpenAPI validation,
+  shell checks and image smoke after both slices finish. On an image without `proton0`, the real
+  bound probe must fail even if ordinary direct HTTPS works.
+- [ ] **Step 4:** Real Unraid run: connected probe passes; block WireGuard UDP, observe CLI still
+  connected but operational API/UI/Docker health fail; remove the block and recover without
+  reconnect/signin. Preserve the port-renewal timer and normal CLI state.
+- [ ] **Step 5:** Scoped adversarial review, resolve findings, commit, update the PR and release
+  `latest` / `0.0.1` only after CI and acceptance pass.

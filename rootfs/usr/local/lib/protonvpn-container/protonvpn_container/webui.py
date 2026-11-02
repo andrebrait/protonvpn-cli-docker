@@ -288,6 +288,7 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {key: state[key] for key in (
             "signed_in", "account", "connected", "server", "location", "load", "protocol",
             "exit_ip", "forwarded_port", "last_error",
+            "tunnel_healthy", "health_error", "health_checked_ago",
         )})
 
     def get_port(self, body: dict) -> None:
