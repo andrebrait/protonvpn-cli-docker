@@ -466,6 +466,85 @@ class ConnectTest(SupervisorCase):
         self.assertFalse(self.sup.snapshot()["user_disconnected"])
         self.assertEqual(len(self.cli.argvs("connect")), 2)
 
+    def test_disconnect_during_connect_withdraws_the_late_tunnel_without_backoff(self):
+        self.enterContext(redirect_stdout(self.out))
+        self.tool.responses[UDP] = self.tool.responses[TCP] = mapped(41404)
+        self.make(environ={"PORT_FORWARDING": "on"})
+        started, release = threading.Event(), threading.Event()
+
+        def hold_connect():
+            started.set()
+            release.wait(5)
+
+        self.cli.during[("connect",)] = hold_connect
+        worker = threading.Thread(target=self.sup.tick)
+        self.addCleanup(worker.join, 5)
+        self.addCleanup(release.set)
+        worker.start()
+        self.assertTrue(started.wait(5))
+        self.sup.request_disconnect()
+        release.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(self.cli.connected)
+        snap = self.sup.snapshot()
+        self.assertEqual((snap["connected"], snap["tunnel_healthy"], snap["forwarded_port"], snap["last_error"]),
+                         (False, False, None, ""))
+        self.assertEqual(self.read_port_file(), "")
+        self.assertNotIn(UDP, self.tool.calls)
+        self.assertNotIn("connect failed; retrying", self.out.getvalue())
+        self.assertEqual(len(self.cli.argvs("status")), 1)  # compensate before another potentially slow CLI call
+        del self.cli.during[("connect",)]
+        self.cli.connect_rc = 1
+        self.sup.request_connect()
+        first = self.next_connect()
+        self.assertEqual(self.next_connect() - first, 30)
+
+    def test_connect_supersedes_disconnect_while_late_connect_is_being_compensated(self):
+        self.make()
+        self.cli.during[("connect",)] = self.sup.request_disconnect
+        self.cli.during[("disconnect",)] = self.sup.request_connect
+        self.tick()
+        self.assertFalse(self.cli.connected)
+        self.assertFalse(self.sup.snapshot()["user_disconnected"])
+        del self.cli.during[("connect",)]
+        self.tick(1)
+        self.assertTrue(self.cli.connected)
+        self.assertTrue(self.sup.snapshot()["connected"])
+        self.assertEqual(len(self.cli.argvs("connect")), 2)
+        self.assertEqual(len(self.cli.argvs("disconnect")), 1)
+        self.assertNotIn("connect failed; retrying", self.out.getvalue())
+
+    def test_disconnect_during_connect_status_does_not_publish_the_late_tunnel(self):
+        self.make()
+        statuses = []
+
+        def disconnect_after_connect():
+            statuses.append(self.cli.connected)
+            if self.cli.connected:
+                self.sup.request_disconnect()
+
+        self.cli.during[("status",)] = disconnect_after_connect
+        self.tick()
+        self.assertEqual(statuses, [False, True])
+        self.assertFalse(self.cli.connected)
+        self.assertFalse(self.sup.snapshot()["connected"])
+        self.assertEqual(self.sup.snapshot()["last_error"], "")
+
+    def test_connect_supersedes_late_disconnect_before_compensation_starts(self):
+        self.make()
+
+        def newest_intent():
+            self.sup.request_disconnect()
+            self.sup.request_connect()
+
+        self.cli.during[("connect",)] = newest_intent
+        self.tick()
+        self.assertTrue(self.cli.connected)
+        self.assertTrue(self.sup.snapshot()["connected"])
+        self.assertEqual(self.cli.argvs("disconnect"), [])
+        self.assertEqual(self.sup.snapshot()["last_error"], "")
+
 
 class SignoutTest(SupervisorCase):
     def test_signout_excludes_a_setting_change_while_it_runs(self):
@@ -843,6 +922,21 @@ class ApplySettingsTest(SupervisorCase):
         self.assertIn("Connection failed", message)
         self.assertEqual(self.store.effective("COUNTRY"), "NL")
 
+    def test_target_change_canceled_by_disconnect_is_saved_without_a_failure(self):
+        self.make(file={"COUNTRY": "NL"})
+        self.tick()
+        self.cli.during[("connect", "--country", "CH")] = self.sup.request_disconnect
+        self.assertEqual(self.apply("COUNTRY", "CH"), (True, "saved; applies at next connect"))
+        self.assertEqual(self.store.effective("COUNTRY"), "CH")
+        self.assertFalse(self.cli.connected)
+        self.assertFalse(self.sup.snapshot()["connected"])
+        self.assertEqual(self.sup.snapshot()["last_error"], "")
+        self.sup.request_connect()
+        del self.cli.during[("connect", "--country", "CH")]
+        self.tick(1)
+        self.assertTrue(self.cli.connected)
+        self.assertEqual(self.cli.argvs("connect")[-1], ("connect", "--country", "CH"))
+
     def test_apply_target_setting_while_disconnected_only_saves(self):
         self.make()
         self.tick()
@@ -956,6 +1050,19 @@ class NatpmpTest(SupervisorCase):
         self.tick(1)
         self.assertEqual(self.read_port_file(), "")  # a later check retries the failed clear
 
+    def test_failed_changed_port_write_unlinks_old_publication_and_retries(self):
+        self.make(environ={"PORT_FORWARDING": "on"})
+        self.tick()
+        self.assertEqual(self.read_port_file(), "41404\n")
+        self.tool.responses[UDP] = self.tool.responses[TCP] = mapped(41405)
+        with mock.patch(f"{SUPERVISOR}.os.replace", side_effect=OSError("replace denied")):
+            self.tick(45)
+        self.assertEqual(self.sup.snapshot()["forwarded_port"], 41405)
+        self.assertFalse(os.path.exists(self.port_file))
+        self.tick(45)
+        self.assertEqual(self.read_port_file(), "41405\n")
+        self.assertEqual(self.sup.snapshot()["forwarded_port"], 41405)
+
     def test_failed_clear_when_unlink_is_denied_still_revokes_the_api_and_retries(self):
         self.make(environ={"PORT_FORWARDING": "on"})
         self.tick()
@@ -966,6 +1073,223 @@ class NatpmpTest(SupervisorCase):
         self.assertEqual(self.read_port_file(), "41404\n")  # no writable-storage guarantee is possible
         self.tick(1)
         self.assertEqual(self.read_port_file(), "")
+
+    def native_natpmp(self, delete_action=""):
+        """An executable gateway model: source identity/protocol state changes, not an argv echo."""
+        path = os.path.join(self.dir, "natpmpc")
+        state = path + ".json"
+        with open(state, "w") as f:
+            json.dump({"own": {}, "other": {"udp": 50000, "tcp": 50000}, "deletes": []}, f)
+        with open(path, "w") as f:
+            f.write(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys, time\n"
+                "path = __file__ + '.json'\n"
+                "with open(path) as f: state = json.load(f)\n"
+                "if os.path.exists(__file__ + '.disabled'): sys.exit('public-address query: connection refused')\n"
+                "args = sys.argv[1:]\n"
+                "assert len(args) == 7 and args[0] == '-a' and args[5:] == ['-g', '10.2.0.1'], args\n"
+                "public, private, proto, lifetime = args[1:5]\n"
+                "assert private == '0' and proto in ('udp', 'tcp'), args\n"
+                "if lifetime == '0':\n"
+                "    assert public == '0', args\n"
+                "    state['deletes'].append(proto)\n"
+                "    with open(path, 'w') as f: json.dump(state, f)\n"
+                f"    {delete_action or 'pass'}\n"
+                "    state['own'].pop(proto, None)\n"
+                "    port = 0\n"
+                "else:\n"
+                "    assert public == '1' and lifetime == '60', args\n"
+                "    port = 41404\n"
+                "    state['own'][proto] = port\n"
+                "with open(path, 'w') as f: json.dump(state, f)\n"
+                "print(f'Mapped public port {port} protocol {proto.upper()} to local port 0 lifetime {lifetime}')\n"
+            )
+        os.chmod(path, 0o755)
+
+        def tool(*argv, timeout=10):
+            if argv[0] == "natpmpc":
+                return run_tool(path, *argv[1:], timeout=timeout)
+            return self.tool(*argv, timeout=timeout)
+
+        self.sup._tool = tool
+        return state
+
+    def native_forwarding_config(self, off_rc=0):
+        """Native config OFF removes the gateway endpoint before returning, as Proton does."""
+        path = os.path.join(self.dir, "protonvpn")
+        disabled = os.path.join(self.dir, "natpmpc.disabled")
+        with open(path, "w") as f:
+            f.write(
+                "#!/usr/bin/env python3\n"
+                "import os, sys\n"
+                "assert sys.argv[1:4] == ['config', 'set', 'port-forwarding'], sys.argv\n"
+                f"disabled = {disabled!r}\n"
+                "if sys.argv[4] == 'off':\n"
+                f"    if {off_rc}: sys.exit({off_rc})\n"
+                "    with open(disabled, 'w'): pass\n"
+                "else:\n"
+                "    assert sys.argv[4] == 'on', sys.argv\n"
+                "    if os.path.exists(disabled): os.unlink(disabled)\n"
+                "print('Port forwarding setting applied')\n"
+            )
+        os.chmod(path, 0o755)
+        original = self.sup._run
+
+        def run(*argv, timeout=120):
+            if argv[:3] == ("config", "set", "port-forwarding"):
+                return run_tool(path, *argv, timeout=timeout)
+            return original(*argv, timeout=timeout)
+
+        self.sup._run = run
+        return disabled
+
+    def test_off_deletes_only_this_source_protocols_once_and_on_reacquires(self):
+        self.make(file={"PORT_FORWARDING": "on"})
+        state = self.native_natpmp()
+        disabled = self.native_forwarding_config()
+        self.tick()
+        self.assertEqual(self.read_port_file(), "41404\n")
+        self.assertTrue(self.apply("PORT_FORWARDING", "off")[0])
+        self.assertTrue(os.path.exists(disabled))
+        self.assertIsNone(self.sup.snapshot()["forwarded_port"])
+        self.assertEqual(self.read_port_file(), "")
+        self.tick(1)
+        self.tick(1)
+        with open(state) as f:
+            remote = json.load(f)
+        self.assertEqual(remote, {"own": {}, "other": {"udp": 50000, "tcp": 50000}, "deletes": ["udp", "tcp"]})
+        self.assertTrue(self.cli.connected)
+        self.assertTrue(self.apply("PORT_FORWARDING", "on")[0])
+        self.tick(1)
+        self.assertEqual((self.sup.snapshot()["forwarded_port"], self.read_port_file()), (41404, "41404\n"))
+
+    def test_failed_native_off_keeps_on_saved_and_renews_after_withdrawal(self):
+        self.make(file={"PORT_FORWARDING": "on"})
+        state = self.native_natpmp()
+        disabled = self.native_forwarding_config(off_rc=1)
+        self.tick()
+        self.assertFalse(self.apply("PORT_FORWARDING", "off")[0])
+        self.assertEqual(self.store.effective("PORT_FORWARDING"), "on")
+        self.assertFalse(os.path.exists(disabled))
+        self.assertEqual((self.sup.snapshot()["forwarded_port"], self.read_port_file()), (None, ""))
+        with open(state) as f:
+            remote = json.load(f)
+        self.assertEqual(remote["own"], {})
+        self.assertEqual(remote["deletes"], ["udp", "tcp"])
+        self.tick(1)
+        self.assertEqual((self.sup.snapshot()["forwarded_port"], self.read_port_file()), (41404, "41404\n"))
+        with open(state) as f:
+            remote = json.load(f)
+        self.assertEqual(remote["own"], {"udp": 41404, "tcp": 41404})
+        self.assertEqual(remote["deletes"], ["udp", "tcp"])
+
+    def test_default_forwarding_withdraws_and_deletes_without_forcing_a_native_setting(self):
+        self.make(file={"PORT_FORWARDING": "on"})
+        state = self.native_natpmp()
+        disabled = self.native_forwarding_config()
+        self.tick()
+        self.assertTrue(self.apply("PORT_FORWARDING", "")[0])
+        self.assertEqual(self.store.effective("PORT_FORWARDING"), "")
+        self.assertFalse(os.path.exists(disabled))
+        self.assertEqual((self.sup.snapshot()["forwarded_port"], self.read_port_file()), (None, ""))
+        with open(state) as f:
+            remote = json.load(f)
+        self.assertEqual(remote["own"], {})
+        self.assertEqual(remote["deletes"], ["udp", "tcp"])
+
+    def test_off_rejected_deletions_do_not_restore_publication_or_repeat(self):
+        self.make(file={"PORT_FORWARDING": "on"})
+        state = self.native_natpmp("sys.exit('gateway refuses deletion')")
+        self.tick()
+        self.assertTrue(self.apply("PORT_FORWARDING", "off")[0])
+        self.assertEqual((self.sup.snapshot()["forwarded_port"], self.read_port_file()), (None, ""))
+        self.tick(1)
+        with open(state) as f:
+            remote = json.load(f)
+        self.assertEqual(remote["own"], {"udp": 41404, "tcp": 41404})
+        self.assertEqual(remote["deletes"], ["udp", "tcp"])
+        self.assertIn("[natpmp] udp deletion failed", self.out.getvalue())
+        self.assertIn("[natpmp] tcp deletion failed", self.out.getvalue())
+
+    def test_off_hung_deletions_are_bounded_and_not_retried(self):
+        self.make(file={"PORT_FORWARDING": "on"})
+        state = self.native_natpmp("time.sleep(20)")
+        self.tick()
+        begin = time.monotonic()
+        self.assertTrue(self.apply("PORT_FORWARDING", "off")[0])
+        self.assertLess(time.monotonic() - begin, 6)
+        self.assertEqual((self.sup.snapshot()["forwarded_port"], self.read_port_file()), (None, ""))
+        self.tick(1)
+        with open(state) as f:
+            remote = json.load(f)
+        self.assertEqual(remote["own"], {"udp": 41404, "tcp": 41404})
+        self.assertEqual(remote["deletes"], ["udp", "tcp"])
+        self.assertIn("udp deletion failed (rc 124)", self.out.getvalue())
+        self.assertIn("tcp deletion failed (rc 124)", self.out.getvalue())
+
+    def test_off_withdraws_before_bounded_deletions_without_holding_state_or_port_locks(self):
+        self.enterContext(redirect_stdout(self.out))
+        self.make(file={"PORT_FORWARDING": "on"})
+        self.tick()
+        gate = Gate(Result(0, ""))
+        original, timeouts = self.tool, []
+
+        def tool(*argv, timeout=10):
+            if argv[:4] == ("natpmpc", "-a", "0", "0"):
+                timeouts.append(timeout)
+                return gate(0)
+            return original(*argv, timeout=timeout)
+
+        self.sup._tool = tool
+        results = []
+        worker = threading.Thread(target=lambda: results.append(self.sup.apply_setting("PORT_FORWARDING", "off")))
+        self.addCleanup(worker.join, 5)
+        self.addCleanup(gate.release.set)
+        worker.start()
+        try:
+            self.assertTrue(gate.started.wait(1))
+            self.assertEqual((self.sup.snapshot()["forwarded_port"], self.read_port_file()), (None, ""))
+            self.sup.request_disconnect()
+        finally:
+            gate.release.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertTrue(results[0][0])
+        self.assertEqual(timeouts, [2, 2])
+        self.assertFalse(gate.timed_out)
+
+    def test_off_deletes_partial_mapping_after_failed_refresh_and_status_withdrawal(self):
+        self.tool.responses[UDP], self.tool.responses[TCP] = mapped(41404), NATPMP_FAILED
+        self.make(file={"PORT_FORWARDING": "on"})
+        self.tick()
+        self.assertEqual((self.sup.snapshot()["forwarded_port"], self.read_port_file()), (None, ""))
+        self.cli.responses[("status",)] = Result(1, "unavailable")
+        self.tick(30)
+        self.assertTrue(self.apply("PORT_FORWARDING", "off")[0])
+        deletes = [argv for argv in self.tool.calls if argv[:4] == ("natpmpc", "-a", "0", "0")]
+        self.assertEqual(deletes, [("natpmpc", "-a", "0", "0", "udp", "0", "-g", "10.2.0.1")])
+
+    def test_off_does_not_delete_an_expired_mapping(self):
+        self.make(file={"PORT_FORWARDING": "on"})
+        self.tick()
+        self.clock.now += 61
+        self.assertTrue(self.apply("PORT_FORWARDING", "off")[0])
+        self.assertFalse(any(argv[:4] == ("natpmpc", "-a", "0", "0") for argv in self.tool.calls))
+
+    def test_off_deletes_a_known_remote_lease_after_publication_has_expired(self):
+        self.tool.responses[UDP] = self.tool.responses[TCP] = mapped(41404, 120)
+        self.make(file={"PORT_FORWARDING": "on"})
+        self.tick()
+        self.clock.now += 61
+        self.timers.fire_live()
+        self.assertEqual((self.sup.snapshot()["forwarded_port"], self.read_port_file()), (None, ""))
+        self.assertTrue(self.apply("PORT_FORWARDING", "off")[0])
+        deletes = [argv for argv in self.tool.calls if argv[:4] == ("natpmpc", "-a", "0", "0")]
+        self.assertEqual(deletes, [
+            ("natpmpc", "-a", "0", "0", "udp", "0", "-g", "10.2.0.1"),
+            ("natpmpc", "-a", "0", "0", "tcp", "0", "-g", "10.2.0.1"),
+        ])
 
 
 class LeaseTest(SupervisorCase):

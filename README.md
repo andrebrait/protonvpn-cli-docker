@@ -198,7 +198,9 @@ IPv4 and IPv6 filter rules load before NetworkManager starts and remain installe
 
 Only the VPN container's own cgroup, including `docker exec` sessions, can use direct TCP 443 for Proton API access and UDP/TCP 53 to the startup DNS resolvers while disconnected. Loopback, WebUI replies, encrypted WireGuard packets, and IPv6 neighbor discovery have the necessary firewall exceptions. This is not a destination allow-list for Proton domains.
 
-Proton's additional kill switch is fixed to **Standard**, not exposed as an environment variable, WebUI field, or API setting. Standard blocks traffic after an accidental VPN drop but restores it after an intentional disconnect. The container firewall remains enforced in both cases: intentionally disconnecting does **not** give attached applications an unprotected internet route. Neither protection layer can be disabled through the WebUI or API.
+Proton's additional kill-switch target is fixed to **Standard**, not exposed as an environment variable, WebUI field, or API setting. Standard blocks traffic after an accidental VPN drop but restores it after an intentional disconnect. The container firewall remains enforced in both cases: intentionally disconnecting does **not** give attached applications an unprotected internet route. Neither protection layer can be disabled through the WebUI or API.
+
+The service applies the Standard target while disconnected. If it adopts an already connected tunnel, the CLI refuses kill-switch changes, so that tunnel retains its existing Proton setting until a disconnected opportunity; the service does not interrupt a working tunnel merely to change that setting. Do not assume Proton's Standard layer was verified for an adopted connection. The mandatory container firewall remains the primary leak protection throughout.
 
 The WebUI uses readable labels such as **Default**, **On**, and **Off**. CLI/API values remain lowercase. The traffic check described under [Health and troubleshooting](#health-and-troubleshooting) also fills a missing exit IPv4 address from the HTTPS IP-echo service `api.ipify.org`; the CLI's own connect output stays primary. Proton's location API cannot be used here because it refuses requests from VPN exits.
 
@@ -206,13 +208,15 @@ The WebUI uses readable labels such as **Default**, **On**, and **Off**. CLI/API
 
 Enable port forwarding in the WebUI (or set `PORT_FORWARDING=on`) and select an eligible P2P server/account. The supervisor requests 60-second NAT-PMP leases about every 45 seconds and exposes the current port in the WebUI, `/config/forwarded_port`, and the API. A port is published only when both UDP and TCP map the same number with a positive granted lifetime. Its deadline uses the shorter granted lifetime, capped at 60 seconds from the first request. A shorter grant can expire before the next scheduled renewal. A failed or mismatched refresh, expired lease, disconnect, sign-out, reconnect, or failed state check withdraws the port; a lease failure alone does not make the container unhealthy.
 
-The forwarded-port file is empty when no mapping is valid. If clearing it fails, the supervisor tries to remove it and retries later. Fully read-only or failed storage can prevent both operations and leave a stale number on disk: treat `/api/v1/port` as authoritative during storage errors and repair `/config` before trusting the file again.
+Switching forwarding **Off** immediately withdraws the advertised port, then makes one best-effort NAT-PMP deletion attempt per locally known live protocol before disabling the native preference. Each attempt has a two-second timeout; native Off can close the gateway endpoint, so cleanup must precede it. The tunnel stays connected. Proton uses internal port zero, so deletion covers all mappings for that tunnel's source identity and protocol, including attached applications sharing it; it cannot distinguish processes. Other Proton clients are outside that scope. Gateways may reject deletion, and mappings left by an earlier process or an unreceived response cannot be tracked. In those cases, remote access can persist until the granted lease expires; withdrawing the advertised port is not proof of immediate remote revocation.
+
+The forwarded-port file is empty when no mapping is valid. If publishing or clearing it fails, the supervisor tries to remove the old file and retries later. Fully read-only or failed storage can prevent both operations and leave a stale number on disk: treat `/api/v1/port` as authoritative during storage errors and repair `/config` before trusting the file again.
 
 Configure your torrent client's listening port to the reported value, and update it if the lease changes. The project does **not** configure qBittorrent automatically. VPN-forwarded traffic reaches the shared namespace through the tunnel; publishing a Docker host port is not a substitute for the Proton forwarded port.
 
 ## API
 
-Open [the API documentation](http://localhost:8788/api) or [OpenAPI 3.1 JSON](http://localhost:8788/api/v1/openapi.json) on your Docker host (replace `localhost` for remote hosts). Both are available without authentication, but `WEBUI_ALLOWED_NETWORKS` still applies: a client it denies cannot load them. The WebUI uses this same versioned API.
+Open [the API documentation](http://192.168.1.10:8788/api) or [OpenAPI 3.1 JSON](http://192.168.1.10:8788/api/v1/openapi.json), replacing `192.168.1.10` with your published LAN address. Both are available without authentication, but `WEBUI_ALLOWED_NETWORKS` still applies: a client it denies cannot load them. The WebUI uses this same versioned API.
 
 Set a random `API_KEY` in the VPN container's environment for bearer authentication. Generate it with either command:
 
@@ -225,7 +229,7 @@ docker run --rm python:3-alpine python -c "import secrets; print(secrets.token_u
 
 ```bash
 export API_KEY='your-generated-key'
-export VPN_URL='http://localhost:8788'
+export VPN_URL='http://192.168.1.10:8788'
 curl --fail --silent --show-error \
   -H "Authorization: Bearer $API_KEY" \
   "$VPN_URL/api/v1/status"

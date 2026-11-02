@@ -35,6 +35,7 @@ HINT_EVERY = 60
 BACKOFF = (30, 60, 120, 300)
 NATPMP_EVERY = 45
 NATPMP_LEASE = 60  # seconds a mapping lives without a renewal
+NATPMP_DELETE_TIMEOUT = 2
 HEALTH_EVERY = 30  # seconds between probes, counted from the end of one
 HEALTH_POLL = 1  # the worker looks for a newly connected tunnel this often
 TRAFFIC_EVERY = 5
@@ -105,6 +106,7 @@ class Supervisor:
         self._settings_errors: dict[str, str] = {}
         self._user_disconnected = self._disconnect_pending = False
         # Loop state, only touched under _cli_lock (or by single float stores from requests).
+        self._mappings: dict[str, float] = {}  # known per-protocol leases, independent of API/file publication
         self._was_connected = False
         self._applied: set[str] = set()  # CLI setting keys applied in this signed-in session
         self._failures = self._unapplied_checks = 0
@@ -191,6 +193,7 @@ class Supervisor:
             if res.rc != 0:
                 return False, res.out.strip() or f"signout failed (exit code {res.rc})"
             self._new_session()  # Proton resets its settings on signout: all are applied again at the next signin
+            self._mappings.clear()
             self._drop_connection()  # signing out ends the connection too
             with self._lock:
                 self._signed_in, self._account = False, ""
@@ -212,6 +215,8 @@ class Supervisor:
             if setting.cli_key is None:
                 return self._apply_target(setting, value)
             words = (value or DEFAULTS.get(env, "")).split()
+            if env == "PORT_FORWARDING" and not is_true(value or DEFAULTS.get(env, "")):
+                self._withdraw_forwarding()  # native OFF disables the gateway endpoint needed for deletion
             message = "saved; the CLI keeps its current value"
             if words:
                 res = self._run("config", "set", setting.cli_key, *words)
@@ -243,7 +248,8 @@ class Supervisor:
         self._drop_connection()  # reconnecting: the old connection and its port are gone from here on
         say(self._run("disconnect").out)
         if self._connect():
-            return True, "reconnected"
+            with self._lock:
+                return True, "reconnected" if self._st.connected else "saved; applies at next connect"
         self._store.save(env, previous)
         with self._lock:
             return False, self._last_error
@@ -350,20 +356,29 @@ class Supervisor:
         return st
 
     def _connect(self) -> bool:
-        if self._stop.is_set():
-            return False
+        """False means a connection failure; a canceled attempt is handled without backoff or target rollback."""
+        with self._lock:
+            if self._stop.is_set() or self._user_disconnected:
+                return True
+        self._mappings.clear()  # a fresh connect may have a different Proton source identity
         res = self._run("connect", *connect_args(self._store))
         say(res.out)
-        if self._stop.is_set():  # stop's disconnect may have run before this late connect completed
+        with self._lock:
+            canceled = self._stop.is_set() or self._user_disconnected
+        st = Status() if canceled or res.rc != 0 else parse_status(self._run("status").out)
+        with self._lock:
+            canceled = canceled or self._stop.is_set() or self._user_disconnected
+            if not canceled:
+                self._st = st
+                ok = res.rc == 0 and st.connected
+                self._last_error = "" if ok else (res.out.strip() or f"connect failed (exit code {res.rc})")
+                if ok:
+                    self._exit_ip, self._check_error = parse_exit_ip(res.out), ""
+        if canceled:  # stop or the user's disconnect may have preceded this late connect
             say(self._run("disconnect", timeout=STOP_DISCONNECT_TIMEOUT).out)
             self._drop_connection()
-            return False
-        ok = res.rc == 0 and self._read_status().connected
-        with self._lock:
-            ok = ok and not self._stop.is_set()
-            self._last_error = "" if ok else (res.out.strip() or f"connect failed (exit code {res.rc})")
-            if ok:
-                self._exit_ip, self._check_error = parse_exit_ip(res.out), ""
+            self._next_check = 0.0  # a newer Connect during compensation must not wait for the old check interval
+            return True
         if ok:
             self._new_connection()
         return ok
@@ -500,15 +515,29 @@ class Supervisor:
             with self._lock:
                 self._traffic.append([now, *transfer])
 
+    def _withdraw_forwarding(self) -> None:
+        """Withdraw before bounded network calls; the caller owns _cli_lock, not the publication locks."""
+        self._set_port(None)
+        self._next_natpmp = 0.0
+        mappings, self._mappings = self._mappings, {}  # one best-effort attempt, not a periodic delete poller
+        for proto, lease_end in mappings.items():
+            if lease_end <= self._clock():
+                continue
+            # RFC 6886 §3.4: private 0 deletes this source IP's protocol mappings, not a particular public port.
+            res = self._tool("natpmpc", "-a", "0", "0", proto, "0", "-g", GATEWAY, timeout=NATPMP_DELETE_TIMEOUT)
+            if res.rc != 0:
+                log(f"[natpmp] {proto} deletion failed (rc {res.rc}); lease will expire: {res.out.strip()}")
+
     def _forward_port(self) -> None:
         """Request or renew the forwarded port when due, ahead of CLI calls that can be slow."""
+        if not is_true(self._store.effective("PORT_FORWARDING")):
+            self._withdraw_forwarding()
+            return
         with self._lock:
             connected, leaving = self._st.connected, self._disconnect_pending
         if not connected or leaving or self._stop.is_set():
             return
-        if not is_true(self._store.effective("PORT_FORWARDING")):
-            self._set_port(None)
-        elif self._clock() >= self._next_natpmp:
+        if self._clock() >= self._next_natpmp:
             self._refresh_port()
 
     def _drop_connection(self, ended: bool = True) -> None:
@@ -534,6 +563,7 @@ class Supervisor:
                 log(f"[natpmp] refresh failed (rc {res.rc}): {(res.out.strip().splitlines() or [''])[-1]}")
                 self._set_port(None)
                 return
+            self._mappings[proto] = self._clock() + mapping[1]  # latest possible remote expiry, not publication's cap
             mappings.append(mapping)
         (udp_port, udp_lifetime), (tcp_port, tcp_lifetime) = mappings
         if udp_port != tcp_port:  # one number must serve both protocols
@@ -566,13 +596,12 @@ class Supervisor:
                 if self._port_synced is not None:  # log once per failure streak; the tick may retry every second
                     log(f"[natpmp] cannot write {self._port_file}: {exc}")
                 self._port_synced = None
-                if port is None:
-                    try:
-                        os.unlink(self._port_file)  # a failed atomic replacement must not leave a usable old number
-                    except FileNotFoundError:
-                        pass
-                    except OSError:
-                        pass  # read-only storage cannot be revoked; the API remains authoritative until a clear succeeds
+                try:
+                    os.unlink(self._port_file)  # failed publication must not leave a usable old number
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass  # read-only storage cannot be revoked; the API remains authoritative until a write succeeds
                 return
             self._port_synced = True
             if port is not None:

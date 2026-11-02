@@ -211,7 +211,7 @@ Container variables (environment only, not editable in the WebUI):
 | Variable | Purpose | Default |
 |---|---|---|
 | `LAN_NETWORKS` | Comma-separated CIDRs reachable outside the tunnel (e.g. Unraid LAN for WebUIs of sharing containers) | empty |
-| `WEBUI_PORT` | Decimal WebUI listen port `1`–`65535`, without leading zeros; invalid values stop startup before firewall loading (attached apps must use different ports) | `8788` |
+| `WEBUI_PORT` | Decimal WebUI listen port `1`–`65535`, without leading zeros; invalid values stop startup after deny-only baselines load and before allow rules (attached apps must use different ports) | `8788` |
 | `WEBUI_PASSWORD` | WebUI password; empty leaves the WebUI open (warning logged, dismissible banner) | empty |
 | `WEBUI_ALLOWED_NETWORKS` | Optional comma-separated source IPv4/IPv6 CIDRs or IPs for all HTTP access; empty allows normal non-VPN sources | empty |
 | `API_KEY` | Bearer token for scripts using the API; empty disables token access (see Public API) | empty |
@@ -272,9 +272,11 @@ rules apply to them too.
     HTTPS/DNS exception. That is intended (signin runs there).
 - No hostname allow-list and no re-resolution: the exception is scoped by origin, not
   destination.
-- The CLI's own kill switch is fixed to **Standard** as defence in depth, applied internally
-  while disconnected before connecting. It is not configurable through the environment, UI or API.
-  Standard restores internet after an intentional disconnect; the container firewall does not.
+- The CLI's own kill-switch target is fixed to **Standard** as defence in depth, applied while
+  disconnected. It is not configurable through the environment, UI or API. An adopted connected
+  tunnel retains its prior Proton setting until a disconnected opportunity because the CLI refuses
+  changes while connected; adoption does not force an interruption or verify that prior value.
+  Standard restores internet after an intentional disconnect; the mandatory container firewall does not.
 - OUTPUT `ESTABLISHED,RELATED` on `eth0` is accepted only for this container's own cgroup, plus
   replies from `WEBUI_PORT` (a lingering flow from an attached container must not keep leaving
   `eth0` after the tunnel drops). IPv6 neighbour discovery is accepted on `eth0` so IPv6
@@ -312,8 +314,13 @@ A thread in the Python service, every `RECONNECT_INTERVAL` seconds:
    log when N changes. The deadline is the first request's start plus the lesser of 60 seconds and
    both granted lifetimes. Renewals run before state checks; a timer withdraws an unrenewed mapping,
    even during a blocked CLI call. A short grant can expire before the next 45-second renewal.
-   Failed file clearing attempts unlink; storage that prevents both can retain a stale disk number,
+   Failed file publication attempts unlink; storage that prevents both can retain a stale disk number,
    so the API is authoritative during storage errors. Normal CLI timeouts do not shrink with lease age.
+   Turning forwarding Off withdraws publication, then attempts one bounded lifetime-zero deletion per
+   locally known live protocol before disabling the native preference and its control endpoint.
+   Proton uses internal port zero, so deletion is source/protocol-wide
+   within the shared tunnel identity, not per process. Unknown prior-process or unreceived mappings
+   and rejected/timed-out deletion rely on remote lease expiry; no immediate revocation guarantee.
    Signout, disconnect
    and reconnect immediately invalidate connection-specific state. Duplicate completion of an
    already-observed sign-in does not reapply settings or drop a healthy connection. Failed state

@@ -275,6 +275,11 @@
   const valueOf = (f) => (f.setting.kind === "bool" ? String(f.input.checked) : f.input.value.trim());
   const serverValue = (f) => (f.setting.kind === "bool" ? String(isTrue(f.setting.value)) : f.setting.value);
 
+  function updateSaveButton() {
+    const all = Object.values(fields);
+    $("save").disabled = all.some((f) => f.saving) || !all.some((f) => f.dirty);
+  }
+
   function setValue(f) {
     if (f.setting.kind === "bool") {
       f.input.checked = isTrue(f.setting.value);
@@ -323,12 +328,12 @@
     input.id = id;
     input.setAttribute("aria-describedby", note.id);
     row.append(note);
-    const f = { setting, input, note, meta, dirty: false, result: null };
+    const f = { setting, input, note, meta, dirty: false, saving: false, result: null };
     input.addEventListener(input.type === "text" ? "input" : "change", () => {
       f.dirty = valueOf(f) !== serverValue(f);
       f.result = null;
       renderNote(f);
-      $("save").disabled = !Object.values(fields).some((x) => x.dirty);
+      updateSaveButton();
     });
     fields[setting.env] = f;
     return row;
@@ -386,27 +391,43 @@
       f.setting = setting;
       f.input.disabled = setting.locked;
       if (setting.locked) f.dirty = false;
-      if (!f.dirty) setValue(f);
+      if (!f.dirty && !f.saving) setValue(f);
       renderNote(f);
     }
-    $("save").disabled = !Object.values(fields).some((x) => x.dirty);
+    updateSaveButton();
   }
 
   async function saveSettings(event) {
     event.preventDefault();
+    const status = $("save-status");
+    if (!status || Object.values(fields).some((f) => f.saving)) return;
     const pending = Object.values(fields).filter((f) => f.dirty && !f.setting.locked);
     if (!pending.length) return;
     $("save").disabled = true;
     let failed = 0;
     for (const f of pending) {
       const value = valueOf(f);
-      const { data } = await api("/api/v1/settings", { env: f.setting.env, value });
+      f.saving = true;
+      let data;
+      try {
+        const response = await api("/api/v1/settings", { env: f.setting.env, value });
+        if (response.status === 401) return; // api() already replaced the form with the login view
+        data = response.data;
+      } catch (_) {
+        data = { ok: false, error: "Cannot reach the container. Try again." };
+      } finally {
+        f.saving = false;
+      }
+      if (!status.isConnected) return;
       f.result = { ok: Boolean(data.ok), text: data.error || data.message || (data.ok ? "Saved" : "Not saved") };
-      if (!data.ok) failed += 1;
-      else f.dirty = valueOf(f) !== value;
+      if (!data.ok) {
+        failed += 1;
+        f.dirty = true;
+      } else f.dirty = valueOf(f) !== value;
       renderNote(f);
     }
-    $("save-status").textContent = failed ? `${failed} of ${pending.length} not saved. See the messages above.` : `Saved ${pending.length} ${pending.length === 1 ? "setting" : "settings"}.`;
+    status.textContent = failed ? `${failed} of ${pending.length} not saved. See the messages above.` : `Saved ${pending.length} ${pending.length === 1 ? "setting" : "settings"}.`;
+    updateSaveButton();
     afterAction();
   }
 

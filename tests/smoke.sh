@@ -438,34 +438,76 @@ for family, addr in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):
     if family == socket.AF_INET6:
         s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
     s.bind((addr, 4444)); s.listen()
-    sel.register(s, selectors.EVENT_READ)
+    sel.register(s, selectors.EVENT_READ, True)
 while True:
     for key, _ in sel.select():
-        conn, _ = key.fileobj.accept()
-        with conn:
-            conn.settimeout(3)
-            conn.sendall(conn.recv(5, socket.MSG_WAITALL))
+        if key.data:
+            conn, _ = key.fileobj.accept()
+            sel.register(conn, selectors.EVENT_READ, False)
+            continue
+        conn = key.fileobj
+        try:
+            data = conn.recv(1024)
+            if data:
+                conn.sendall(data)
+                continue
+        except ConnectionError:
+            pass
+        sel.unregister(conn)
+        conn.close()
 '
 }
-# failure_exchange <open|drop|down> <client> <address>: only timeouts prove a filter drop.
+# failure_exchange <open|drop|down|hold> <client> <address> [address6]: only timeouts prove a filter drop.
 # With disabled interfaces, explicit network/host-unreachable errors are also valid; refusals and exec errors never are.
+# hold acknowledges both live sockets, then waits for restore_failure to trigger another payload on those same sockets.
 failure_exchange() {
-  docker exec "$2" python3 -c '
-import errno, socket, sys
-mode, addr = sys.argv[1:]
+  fe_detach=
+  [ "$1" = hold ] && fe_detach=-d
+  docker exec ${fe_detach:+"$fe_detach"} "$2" python3 -c '
+import errno, socket, sys, time
+from pathlib import Path
+mode, addr, addr6 = sys.argv[1:]
+held = mode == "hold"
+
+def exchange(s, expected, payload, address=None):
+    try:
+        if address is not None:
+            s.connect((address, 4444))
+        s.sendall(payload)
+        assert s.recv(5, socket.MSG_WAITALL) == payload, "EOF or incorrect echo is not containment"
+    except TimeoutError:
+        assert expected in ("drop", "down")
+    except OSError as err:
+        assert expected == "down" and err.errno in (errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH), err
+    else:
+        assert expected == "open", "application payload escaped the failed firewall install"
+
+sockets = []
 try:
-    with socket.socket(socket.AF_INET6 if ":" in addr else socket.AF_INET) as s:
+    for address in (addr, addr6) if held else (addr,):
+        s = socket.socket(socket.AF_INET6 if ":" in address else socket.AF_INET)
+        sockets.append(s)
         s.settimeout(3)
-        s.connect((addr, 4444))
-        s.sendall(b"probe")
-        assert s.recv(5, socket.MSG_WAITALL) == b"probe"
-except TimeoutError:
-    assert mode in ("drop", "down")
-except OSError as err:
-    assert mode == "down" and err.errno in (errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH), err
-else:
-    assert mode == "open", "application payload escaped the failed firewall install"
-' "$1" "$3"
+        exchange(s, "open" if held else mode, b"probe", address)
+    if held:
+        Path("/tmp/failure-held-ready").touch()
+        mode_file = Path("/tmp/failure-held-mode")
+        deadline = time.monotonic() + 60
+        while not mode_file.exists():
+            assert time.monotonic() < deadline, "held-flow trigger was not delivered"
+            time.sleep(.05)
+        mode = mode_file.read_text()
+        for s in sockets:
+            exchange(s, mode, b"after")
+        Path("/tmp/failure-held-result").write_text("ok")
+except Exception:
+    if held:
+        Path("/tmp/failure-held-result").write_text("failed")
+    raise
+finally:
+    for s in sockets:
+        s.close()
+' "$1" "$3" "${4:-}"
 }
 # restore_failure <4|6> <full|baseline> <peer> <network>: inject only at the chosen restore boundary.
 restore_failure() {
@@ -494,6 +536,9 @@ EOF
     eventually 10 failure_exchange open "$rf_app" "$rf_peer6" &&
     eventually 10 failure_exchange open "$rf_peer" "$rf_hold4" &&
     eventually 10 failure_exchange open "$rf_peer" "$rf_hold6" || return 1
+  failure_exchange hold "$rf_app" "$rf_peer4" "$rf_peer6" &&
+    eventually 10 docker exec "$rf_app" test -f /tmp/failure-held-ready &&
+    failure_exchange open "$rf_app" "$rf_peer4" || return 1
   # No test firewall or entrypoint replaces the product: only its selected restore executable is wrapped.
   docker run -d --name "$rf_product" --network "container:$rf_hold" --cap-add NET_ADMIN --device /dev/net/tun \
     -v "$TMP:/config" -v "$rf_bin:/test-firewall-bin:ro" -e FAIL_RESTORE_STAGE="$rf_stage" \
@@ -508,7 +553,10 @@ EOF
     logged "$rf_product" 'non-loopback interfaces disabled' || return 1
     docker exec "$rf_hold" sh -c '[ -z "$(ip -o link show up | grep -v " lo:")" ]' || return 1
   fi
-  failure_exchange "$rf_expect" "$rf_app" "$rf_peer4" &&
+  docker exec "$rf_app" sh -c 'printf "%s" "$1" > /tmp/failure-held-mode' sh "$rf_expect" &&
+    eventually 10 docker exec "$rf_app" test -f /tmp/failure-held-result &&
+    docker exec "$rf_app" grep -qx ok /tmp/failure-held-result &&
+    failure_exchange "$rf_expect" "$rf_app" "$rf_peer4" &&
     failure_exchange "$rf_expect" "$rf_app" "$rf_peer6" &&
     failure_exchange "$rf_expect" "$rf_peer" "$rf_hold4" &&
     failure_exchange "$rf_expect" "$rf_peer" "$rf_hold6"
