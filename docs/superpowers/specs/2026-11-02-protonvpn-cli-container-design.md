@@ -86,7 +86,10 @@ All scripts are POSIX `sh`, checked with `shellcheck`.
 
 ### Image contents
 
-- Base: `debian:trixie-slim`.
+- Base: `debian:13-slim` (latest Debian 13 slim), set as a build argument so CI rebuilds pick up
+  base-image security updates.
+- Everything is installed and configured at build time, in Dockerfile layers. The entrypoint never
+  runs `apt`, `dpkg`, `pip` or downloads; a fresh container from the image works as-is.
 - Proton apt repo via `protonvpn-stable-release_<ver>_all.deb` from `repo.protonvpn.com`, version
   pinned by a build argument.
 - Packages, `--no-install-recommends`: `proton-vpn-cli`, `network-manager`, `dbus`,
