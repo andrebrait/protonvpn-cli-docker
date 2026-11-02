@@ -273,7 +273,8 @@ health does not depend on the port (a failing NAT-PMP refresh is logged, not fat
   activates a `permissions=user:root` profile (a dummy connection) to catch this without
   credentials.
 - The cgroup-scoped firewall exception requires cgroup v2 and the `xt_cgroup` match in the host
-  kernel. Unraid 7 defaults to cgroup v2; confirm `xt_cgroup` on Unraid's kernel before release.
-  The container fails closed when either is missing.
+  kernel; the container fails closed when either is missing. Verified 2026-11-02 on the target
+  Unraid 7.3.4 (kernel 6.18.58, Docker 29.8.2, cgroup v2, iptables 1.8.13 legacy, `wireguard`
+  module present): owning container allowed, attached container blocked.
 - Not yet verified: arm64, CLI behaviour after long outages (supervisor covers it), security-key
   (FIDO2) signin through `docker exec`.
