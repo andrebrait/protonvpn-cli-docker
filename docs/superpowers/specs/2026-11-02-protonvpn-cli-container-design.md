@@ -181,30 +181,36 @@ Container variables:
 ### Kill switch (container firewall)
 
 Fail-closed iptables rules (IPv4 and IPv6) installed before NetworkManager starts and never
-removed:
+removed. Containers attached with `--network=container:…` share this network namespace, so these
+rules apply to them too.
 
 - `OUTPUT`/`INPUT` policy `DROP`; `FORWARD` `DROP`.
-- Allow: `lo`; `ESTABLISHED,RELATED`; any traffic on the tunnel interface (`proton0`);
-  packets carrying Proton's WireGuard fwmark `0xea13b2c` (the encrypted handshake/data packets to
-  the VPN endpoint); `LAN_NETWORKS` on `eth0` in both directions.
-- Proton API while disconnected: the CLI needs the API to sign in, refresh the server list and
-  connect. Allow TCP 443 to the resolved addresses of the hosts the CLI uses, plus DNS (UDP/TCP 53)
-  on `eth0` to the resolvers in Docker's original `/etc/resolv.conf` (read at start, before NM
-  rewrites it). The DNS rule cannot be limited per hostname, so while disconnected DNS queries
-  (not traffic) can reach that resolver; accepted. Known hosts from the
-  package: `vpn-api.proton.me`, `account.proton.me`. The full set must be measured during
-  implementation (capture the CLI's outbound connections during signin, server-list refresh and
-  connect). proton-core's `AlternativeRoutingTransport` falls back to DoH-discovered domains when
-  the API is blocked; if that fallback is needed for correct operation the allow-list must cover
-  it, otherwise force a direct transport through `PROTON_LOADER_OVERRIDES`. Decide based on the
-  measurement and record the decision in the README.
-- API addresses are re-resolved by the supervisor before each reconnect attempt; rules are
-  replaced atomically (`iptables-restore`).
+- Allow for everyone in the namespace: `lo`; `ESTABLISHED,RELATED`; any traffic on the tunnel
+  interface (`proton0`); packets carrying Proton's WireGuard fwmark `0xea13b2c` (the encrypted
+  packets to the VPN endpoint, sent by the kernel); `LAN_NETWORKS` on `eth0` in both directions.
+- Allow **only for this container's own processes**: TCP 443 and UDP/TCP 53 out of `eth0`, to any
+  address. The CLI needs the Proton API (and possibly proton-core's DoH-based alternative routing)
+  while disconnected to sign in, refresh the server list and connect.
+  - Mechanism: `-m cgroup --path <own cgroup>` matches the cgroup of the sending socket. Every
+    container has its own cgroup, so sockets opened by attached containers never match.
+  - `<own cgroup>` is read from `/proc/self/cgroup` (`0::<path>`) at start. That works with both
+    private cgroup namespaces (path `/`, Docker's default on cgroup v2) and `--cgroupns=host`
+    (path `/system.slice/docker-<id>.scope`).
+  - cgroup v2 is required. If `/proc/self/cgroup` has no `0::` line, or the rule cannot be
+    installed, the container logs the reason and exits with the firewall still closed.
+  - Verified 2026-11-02 on Docker 29.9 / kernel 6.12: the owning container reached the internet
+    with `OUTPUT DROP` plus `-m cgroup --path / -j ACCEPT`, an attached container was blocked.
+  - `docker exec` sessions join the container's cgroup, so console commands get the same
+    HTTPS/DNS exception. That is intended (signin runs there).
+- No hostname allow-list and no re-resolution: the exception is scoped by origin, not
+  destination.
 - The CLI's own `standard` kill switch stays enabled as defence in depth.
 
-Acceptance: with the CLI killed (`pkill -f /usr/bin/protonvpn`), after `protonvpn disconnect`,
-and while signed out, an outbound request from the container (and from a container sharing its
-namespace) to a non-LAN, non-Proton-API address fails.
+Acceptance, each case checked from this container **and** from an attached container: with the CLI
+killed (`pkill -f /usr/bin/protonvpn`), after `protonvpn disconnect`, and while signed out:
+
+- the attached container cannot reach any non-LAN address on any port, DNS included;
+- this container can reach only TCP 443 and port 53 outside the tunnel.
 
 ### Supervisor
 
@@ -212,7 +218,7 @@ Foreground loop in `entrypoint.sh`:
 
 1. Not signed in → log the signin hint every 60 s, keep checking.
 2. Signed in, settings not yet applied this session → apply settings.
-3. `protonvpn status` first line is not `Status: Connected` → refresh API firewall rules, run
+3. `protonvpn status` first line is not `Status: Connected` → run
    `protonvpn connect <target args>`; on failure log the CLI output and retry with backoff
    (30 s, 60 s, 120 s, capped at 300 s).
 4. Connected and `PORT_FORWARDING=on` → every 45 s run
@@ -266,6 +272,8 @@ health does not depend on the port (a failing NAT-PMP refresh is logged, not fat
   `/run/systemd/users/<uid>`). An NM change could break it; the smoke test should assert NM
   activates a `permissions=user:root` profile (a dummy connection) to catch this without
   credentials.
-- The API allow-list is not yet measured.
+- The cgroup-scoped firewall exception requires cgroup v2 and the `xt_cgroup` match in the host
+  kernel. Unraid 7 defaults to cgroup v2; confirm `xt_cgroup` on Unraid's kernel before release.
+  The container fails closed when either is missing.
 - Not yet verified: arm64, CLI behaviour after long outages (supervisor covers it), security-key
   (FIDO2) signin through `docker exec`.
