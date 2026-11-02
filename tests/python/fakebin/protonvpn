@@ -1,7 +1,10 @@
 #!/bin/sh
-# Test double for the protonvpn CLI: prints its args one per line, writes to stderr,
-# optionally sleeps ($FAKE_SLEEP) and exits with $FAKE_RC.
+# Test double for the protonvpn CLI: prints its args one per line, writes to stderr, then
+# optionally prints $FAKE_PRINT, reads one line from stdin ($FAKE_READ), sleeps ($FAKE_SLEEP)
+# and exits with $FAKE_RC.
 printf '%s\n' "$@"
 echo "stderr line" >&2
+if [ -n "$FAKE_PRINT" ]; then echo "$FAKE_PRINT"; fi
+if [ -n "$FAKE_READ" ]; then read -r x || echo "eof"; fi
 if [ -n "$FAKE_SLEEP" ]; then exec sleep "$FAKE_SLEEP"; fi
 exit "${FAKE_RC:-0}"

@@ -19,14 +19,18 @@ def run(*args: str, timeout: float = 120) -> Result:
     try:
         proc = subprocess.run(
             ["protonvpn", *args],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             timeout=timeout,
             check=False,
         )
-    except subprocess.TimeoutExpired:
-        return Result(124, f"protonvpn timed out after {timeout}s\n")
+    except subprocess.TimeoutExpired as exc:
+        partial = exc.output.decode(errors="replace") if isinstance(exc.output, bytes) else (exc.output or "")
+        if partial and not partial.endswith("\n"):
+            partial += "\n"
+        return Result(124, f"{partial}protonvpn timed out after {timeout}s\n")
     except OSError as exc:
         return Result(127, f"cannot run protonvpn: {exc}\n")
     return Result(proc.returncode, proc.stdout)

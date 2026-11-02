@@ -27,8 +27,6 @@ COPY rootfs/ /
 
 ENV HOME=/config \
     PROTON_LOADER_OVERRIDES=keyring=json \
-    KILL_SWITCH=standard \
-    ANONYMOUS_CRASH_REPORTS=off \
     TZ=UTC \
     DEBUG=false \
     RECONNECT_INTERVAL=30 \
