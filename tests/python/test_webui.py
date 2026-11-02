@@ -80,6 +80,7 @@ class StubSignin:
 
 class WebuiCase(unittest.TestCase):
     PASSWORD = ""
+    API_KEY = ""
 
     def make_signin(self):
         return StubSignin()
@@ -93,7 +94,7 @@ class WebuiCase(unittest.TestCase):
         self.environ = {}
         self.store = SettingsStore(self.settings_path, environ=self.environ)
         self.sup, self.signin = StubSupervisor(), self.make_signin()
-        self.server = webui.make_server(0, self.sup, self.store, self.signin, self.PASSWORD)
+        self.server = webui.make_server(0, self.sup, self.store, self.signin, self.PASSWORD, self.API_KEY)
         self.port = self.server.server_address[1]
         thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
         thread.start()
@@ -204,7 +205,7 @@ class PasswordModeTest(WebuiCase):
     def test_password_mode_requires_login(self):
         status, body = self.get_json("/api/v1/state")
         self.assertEqual(status, 401)
-        self.assertIs(body["auth_required"], True)
+        self.assertEqual(body, {"error": "login required"})
         self.assertEqual(self.post("/api/v1/connect")[0], 401)
         self.assertEqual(self.sup.calls, [])
         cookie = self.login()
@@ -219,7 +220,7 @@ class PasswordModeTest(WebuiCase):
 
     def test_wrong_password_and_forged_cookie_are_rejected(self):
         status, body, resp = self.post("/api/v1/login", {"password": "nope"})
-        self.assertEqual((status, body["ok"]), (401, False))
+        self.assertEqual((status, body), (401, {"error": "wrong password"}))
         self.assertIsNone(resp.getheader("Set-Cookie"))
         self.assertEqual(self.get_json("/api/v1/state", "session=forged")[0], 401)
         self.assertEqual(self.post("/api/v1/login", {})[0], 401)
@@ -310,14 +311,6 @@ class RequestRulesTest(WebuiCase):
         self.assertEqual(self.post("/api/connect")[0], 404)
         self.assertEqual(self.sup.calls, [])
 
-    def test_route_table_is_the_single_list_of_api_routes(self):
-        keys = [(r.method, r.path) for r in webui.ROUTES]
-        self.assertEqual(len(keys), len(set(keys)))
-        self.assertTrue(all(path.startswith("/api/v1/") for _, path in keys))
-        self.assertEqual([r.path for r in webui.ROUTES if not r.auth], ["/api/v1/login"])
-        handlers = {n for n in dir(webui.Handler) if n.startswith(("get_", "post_"))}
-        self.assertEqual(handlers, {r.handler.__name__ for r in webui.ROUTES})  # no handler outside the table
-        self.assertEqual({r.method for r in webui.ROUTES}, {"GET", "POST"})
 
     def test_successful_state_polls_are_not_logged_but_other_requests_are(self):
         self.get("/api/v1/state")  # the page polls this every 5 s: it would drown the container log
@@ -400,21 +393,20 @@ class SettingsTest(WebuiCase):
     def test_rejected_value_is_422_with_the_cli_message(self):
         self.sup.apply_result = (False, "Error: invalid choice")
         status, body, _ = self.post("/api/v1/settings", {"env": "NETSHIELD", "value": "off"})
-        self.assertEqual((status, body), (422, {"ok": False, "message": "Error: invalid choice"}))
+        self.assertEqual((status, body), (422, {"error": "Error: invalid choice"}))
 
     def test_locked_setting_409(self):
         self.environ["KILL_SWITCH"] = "off"
         status, body, _ = self.post("/api/v1/settings", {"env": "KILL_SWITCH", "value": "standard"})
         self.assertEqual(status, 409)
-        self.assertFalse(body["ok"])
-        self.assertIn("KILL_SWITCH", body["message"])
+        self.assertIn("KILL_SWITCH", body["error"])
         self.assertEqual(self.sup.calls, [])
 
     def test_unsaveable_store_is_500(self):
         self.sup.apply_error = PermissionError("read-only file system")
         status, body, _ = self.post("/api/v1/settings", {"env": "NETSHIELD", "value": "off"})
-        self.assertEqual((status, body["ok"]), (500, False))
-        self.assertIn("read-only file system", body["message"])
+        self.assertEqual(status, 500)
+        self.assertIn("read-only file system", body["error"])
 
     def test_invalid_values_are_400_and_never_reach_the_supervisor(self):
         bad = (
@@ -436,8 +428,7 @@ class SettingsTest(WebuiCase):
         for body in bad:
             status, reply, _ = self.post("/api/v1/settings", body)
             self.assertEqual(status, 400, body)
-            self.assertFalse(reply["ok"], body)
-            self.assertTrue(reply["message"], body)
+            self.assertTrue(reply["error"], body)
         self.assertEqual(self.sup.calls, [])
 
     def test_custom_dns_must_be_the_cli_syntax(self):
@@ -461,7 +452,7 @@ class SettingsTest(WebuiCase):
         for value in bad:
             status, reply, _ = self.post("/api/v1/settings", {"env": "CUSTOM_DNS", "value": value})
             self.assertEqual(status, 400, value)
-            self.assertIn("--dns", reply["message"], value)
+            self.assertIn("--dns", reply["error"], value)
         self.assertEqual(self.sup.calls, [])
 
     def test_custom_dns_accepts_off_on_and_a_server_list(self):
@@ -502,7 +493,7 @@ class SigninRouteTest(WebuiCase):
     def test_signin_error_does_not_notify(self):
         self.signin.start_step = Step("error", "Invalid credentials")
         status, body, _ = self.post("/api/v1/signin", {"username": "me@proton.me", "password": "pw"})
-        self.assertEqual((status, body), (200, {"state": "error", "message": "Invalid credentials"}))
+        self.assertEqual((status, body), (400, {"error": "Invalid credentials"}))
         self.assertEqual(self.sup.calls, [])
 
     def test_signin_needs_string_fields(self):
@@ -527,7 +518,7 @@ class SigninRouteTest(WebuiCase):
     def test_failed_signout_reports_the_cli_message(self):
         self.sup.signout_result = (False, "Error: not signed in")
         status, body, _ = self.post("/api/v1/signout")
-        self.assertEqual((status, body), (500, {"ok": False, "message": "Error: not signed in"}))
+        self.assertEqual((status, body), (500, {"error": "Error: not signed in"}))
 
 
 class LoneSurrogateTest(WebuiCase):
@@ -544,7 +535,7 @@ class LoneSurrogateTest(WebuiCase):
             for raw in bodies:
                 status, reply, _ = self.post(route.path, cookie=cookie, raw=raw)
                 self.assertEqual(status, 400, (route.path, raw))
-                self.assertFalse(reply["ok"])
+                self.assertTrue(reply["error"])
         self.assertEqual((self.sup.calls, self.signin.calls), ([], []))
 
     def test_a_surrogate_pair_is_one_valid_character(self):

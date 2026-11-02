@@ -170,3 +170,14 @@ input:disabled, select:disabled { background: var(--surface-2); color: var(--mut
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; }
 }
+
+/* API reference shares the WebUI surfaces, typography and theme. */
+.btn:is(a) { display: inline-flex; align-items: center; text-decoration: none; }
+.api-docs pre { max-width: 100%; overflow-x: auto; padding: 0.875rem; background: var(--surface-2); border-radius: 8px; }
+.api-docs pre code { padding: 0; background: transparent; overflow-wrap: normal; white-space: pre; }
+.api-docs h3 { font-size: 1rem; }
+.api-docs details { margin-top: 0.75rem; }
+.api-docs summary { cursor: pointer; padding-block: 0.25rem; }
+.endpoint-title { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; text-transform: none; letter-spacing: normal; }
+.method { padding: 0.25rem 0.5rem; border-radius: 4px; background: var(--ok-bg); color: var(--ok-fg); }
+.method.post { background: var(--warn-bg); color: var(--warn-fg); }

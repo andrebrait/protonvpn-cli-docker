@@ -114,15 +114,15 @@ resolv_survives_nm() {
 }
 bridge_field() { docker network inspect bridge -f "{{(index .IPAM.Config 0).$1}}"; }
 bad_lan_fails_closed() {
-  start_container t3-bad -e LAN_NETWORKS=not-a-cidr || return 1
+  start_container "t5b-$$-bad" -e LAN_NETWORKS=not-a-cidr || return 1
   i=0
   while [ "$i" -lt 10 ]; do
-    [ "$(docker inspect -f '{{.State.Running}}' t3-bad)" = false ] && break
+    [ "$(docker inspect -f '{{.State.Running}}' "t5b-$$-bad")" = false ] && break
     i=$((i + 1)); sleep 1
   done
-  [ "$(docker inspect -f '{{.State.Running}}' t3-bad)" = false ] || return 1
-  [ "$(docker inspect -f '{{.State.ExitCode}}' t3-bad)" -ne 0 ] || return 1
-  docker logs t3-bad 2>&1 | grep -qF '[firewall]'
+  [ "$(docker inspect -f '{{.State.Running}}' "t5b-$$-bad")" = false ] || return 1
+  [ "$(docker inspect -f '{{.State.ExitCode}}' "t5b-$$-bad")" -ne 0 ] || return 1
+  docker logs "t5b-$$-bad" 2>&1 | grep -qF '[firewall]'
 }
 
 # Task 4 helpers: supervisor, health, shutdown.
@@ -181,7 +181,33 @@ WEBUI_WARNING='[webui] WARNING: WEBUI_PASSWORD is not set; the WebUI is open to 
 logged() { docker logs "$1" 2>&1 | grep -qF "$2"; }
 not_logged() { ! logged "$@"; }
 
-C=t1-smoke
+bearer_smoke() {
+  docker exec "$1" python3 -c '
+import json, sys, urllib.error, urllib.request
+base = "http://127.0.0.1:8788"
+def request(path, key=None, data=None):
+    headers = {"Authorization": "Bearer " + key} if key else {}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(base + path, data=data, headers=headers)
+    try:
+        resp = urllib.request.urlopen(req, timeout=5)
+    except urllib.error.HTTPError as err:
+        resp = err
+    return resp.status, json.load(resp)
+key = sys.argv[1]
+status, state = request("/api/v1/status", key)
+assert status == 200 and state["signed_in"] is False
+assert request("/api/v1/status")[0] == 401
+assert request("/api/v1/status", "wrong")[0] == 401
+assert request("/api/v1/openapi.json")[1]["openapi"] == "3.1.0"
+assert request("/api/v1/disconnect", key, b"{}")[0] == 200
+assert request("/api/v1/connect", "wrong", b"{}")[0] == 403
+print("bearer status 200; absent/wrong 401; public OpenAPI 200; bearer write 200; invalid write 403")
+' "$2"
+}
+
+C=t5b-$$-smoke
 mkdir -p "$TMP/Proton"
 echo '{}' > "$TMP/Proton/stale.json"
 chmod 644 "$TMP/Proton/stale.json"
@@ -204,69 +230,71 @@ assert "no runtime installs" no_runtime_installs
 
 # Task 3: kill switch. $C sits on the default bridge, attached containers share its namespace.
 assert "resolv.conf survives nm up/down" resolv_survives_nm
-attach t3-att "$C" || { echo "FAIL attach"; exit 1; }
+attach "t5b-$$-att" "$C" || { echo "FAIL attach"; exit 1; }
 assert "own 443 allowed" tcp_from "$C" 1.1.1.1 443
 assert "own 80 blocked" blocked_from "$C" 1.1.1.1 80
 assert "own dns allowed" dns_from "$C"
-assert "attached 443 blocked" blocked_from t3-att 1.1.1.1 443
-assert "attached dns blocked" dns_blocked_from t3-att
+assert "attached 443 blocked" blocked_from "t5b-$$-att" 1.1.1.1 443
+assert "attached dns blocked" dns_blocked_from "t5b-$$-att"
 
-NETWORKS="$NETWORKS t3-net"
-docker network create t3-net >/dev/null
-run_container t3-emb --network t3-net || { echo "FAIL embedded boot"; exit 1; }
-attach t3-emb-att t3-emb || { echo "FAIL attach"; exit 1; }
-assert "own embedded dns allowed" dns_from t3-emb
-assert "attached embedded dns blocked" dns_blocked_from t3-emb-att
+NETWORKS="$NETWORKS t5b-$$-net"
+docker network create "t5b-$$-net" >/dev/null
+run_container "t5b-$$-emb" --network "t5b-$$-net" || { echo "FAIL embedded boot"; exit 1; }
+attach "t5b-$$-emb-att" "t5b-$$-emb" || { echo "FAIL attach"; exit 1; }
+assert "own embedded dns allowed" dns_from "t5b-$$-emb"
+assert "attached embedded dns blocked" dns_blocked_from "t5b-$$-emb-att"
 
 GW=$(bridge_field Gateway)
-run_container t3-lan -e LAN_NETWORKS="$(bridge_field Subnet)" || { echo "FAIL lan boot"; exit 1; }
-attach t3-lan-att t3-lan || { echo "FAIL attach"; exit 1; }
-assert "lan allowed" reachable_from t3-lan-att "$GW" 9
-assert "lan blocked without LAN_NETWORKS" blocked_from t3-att "$GW" 9
+run_container "t5b-$$-lan" -e LAN_NETWORKS="$(bridge_field Subnet)" || { echo "FAIL lan boot"; exit 1; }
+attach "t5b-$$-lan-att" "t5b-$$-lan" || { echo "FAIL attach"; exit 1; }
+assert "lan allowed" reachable_from "t5b-$$-lan-att" "$GW" 9
+assert "lan blocked without LAN_NETWORKS" blocked_from "t5b-$$-att" "$GW" 9
 
 # WebUI port: the WebUI (a listener in $C's own cgroup) must complete the handshake with an outside peer.
 CIP=$(docker inspect -f '{{.NetworkSettings.Networks.bridge.IPAddress}}' "$C")
-CONTAINERS="$CONTAINERS t3-peer"
-docker run -d --name t3-peer --entrypoint sleep "$IMAGE" infinity >/dev/null
-assert "webui port open inbound" eventually 20 tcp_from t3-peer "$CIP" 8788
-assert "other inbound port blocked" blocked_from t3-peer "$CIP" 8789
+CONTAINERS="$CONTAINERS t5b-$$-peer"
+docker run -d --name "t5b-$$-peer" --entrypoint sleep "$IMAGE" infinity >/dev/null
+assert "webui port open inbound" eventually 20 tcp_from "t5b-$$-peer" "$CIP" 8788
+assert "other inbound port blocked" blocked_from "t5b-$$-peer" "$CIP" 8789
 
 # IPv6 LAN: neighbour discovery must work for LAN_NETWORKS on an IPv6 network.
-NETWORKS="$NETWORKS t3-v6"
-docker network create --ipv6 --subnet fd00:3:3:3::/64 t3-v6 >/dev/null
-CONTAINERS="$CONTAINERS t3-v6peer"
-docker run -d --name t3-v6peer --network t3-v6 --entrypoint sleep "$IMAGE" infinity >/dev/null
-V6PEER=$(docker inspect -f '{{(index .NetworkSettings.Networks "t3-v6").GlobalIPv6Address}}' t3-v6peer)
-run_container t3-v6 --network t3-v6 -e LAN_NETWORKS=fd00:3:3:3::/64 || { echo "FAIL v6 boot"; exit 1; }
-attach t3-v6-att t3-v6 || { echo "FAIL attach"; exit 1; }
-assert "ipv6 lan allowed" reachable_from t3-v6-att "$V6PEER" 9
-run_container t3-v6n --network t3-v6 || { echo "FAIL v6n boot"; exit 1; }
-attach t3-v6n-att t3-v6n || { echo "FAIL attach"; exit 1; }
-assert "ipv6 lan blocked without LAN_NETWORKS" blocked_from t3-v6n-att "$V6PEER" 9
+NETWORKS="$NETWORKS t5b-$$-v6"
+docker network create --ipv6 --subnet fd00:3:3:3::/64 "t5b-$$-v6" >/dev/null
+CONTAINERS="$CONTAINERS t5b-$$-v6peer"
+docker run -d --name "t5b-$$-v6peer" --network "t5b-$$-v6" --entrypoint sleep "$IMAGE" infinity >/dev/null
+V6PEER=$(docker inspect -f "{{(index .NetworkSettings.Networks \"t5b-$$-v6\").GlobalIPv6Address}}" "t5b-$$-v6peer")
+run_container "t5b-$$-v6" --network "t5b-$$-v6" -e LAN_NETWORKS=fd00:3:3:3::/64 || { echo "FAIL v6 boot"; exit 1; }
+attach "t5b-$$-v6-att" "t5b-$$-v6" || { echo "FAIL attach"; exit 1; }
+assert "ipv6 lan allowed" reachable_from "t5b-$$-v6-att" "$V6PEER" 9
+run_container "t5b-$$-v6n" --network "t5b-$$-v6" || { echo "FAIL v6n boot"; exit 1; }
+attach "t5b-$$-v6n-att" "t5b-$$-v6n" || { echo "FAIL attach"; exit 1; }
+assert "ipv6 lan blocked without LAN_NETWORKS" blocked_from "t5b-$$-v6n-att" "$V6PEER" 9
 assert "bad LAN fails closed" bad_lan_fails_closed
 
 # Task 4: supervisor while signed out.
-run_container t4-main || { echo "FAIL supervisor boot"; exit 1; }
-assert "signin hint logged" eventually 20 hint_logged t4-main
-assert "unhealthy when signed out" unhealthy_when_signed_out t4-main
-assert "forwarded_port is empty, mode 644" eventually 5 port_file_empty_644 t4-main
-assert "pid file: NetworkManager" pid_file_is t4-main nm.pid NetworkManager
-assert "pid file: system bus" pid_file_is t4-main dbus-system.pid dbus-daemon
-assert "pid file: session bus" pid_file_is t4-main dbus-session.pid dbus-daemon
-assert "graceful stop" graceful_stop t4-main
+run_container "t5b-$$-main" || { echo "FAIL supervisor boot"; exit 1; }
+assert "signin hint logged" eventually 20 hint_logged "t5b-$$-main"
+assert "unhealthy when signed out" unhealthy_when_signed_out "t5b-$$-main"
+assert "forwarded_port is empty, mode 644" eventually 5 port_file_empty_644 "t5b-$$-main"
+assert "pid file: NetworkManager" pid_file_is "t5b-$$-main" nm.pid NetworkManager
+assert "pid file: system bus" pid_file_is "t5b-$$-main" dbus-system.pid dbus-daemon
+assert "pid file: session bus" pid_file_is "t5b-$$-main" dbus-session.pid dbus-daemon
+assert "graceful stop" graceful_stop "t5b-$$-main"
 
 # Task 5: WebUI, open (default) and with a password.
-run_container t5-open || { echo "FAIL webui boot"; exit 1; }
-assert "webui open: state is signed out with the banner" eventually 20 webui_state_signed_out_with_banner t5-open
-assert "webui open: warning logged" logged t5-open "$WEBUI_WARNING"
-assert "webui open: page served" webui_says t5-open / '<title>Proton VPN</title>'
-assert "webui open: script served" webui_says t5-open /static/app.js '^200$'
-assert "webui open: traversal refused" webui_says t5-open /static/../webui.py '^404$'
-run_container t5-pw -e WEBUI_PASSWORD=x || { echo "FAIL webui password boot"; exit 1; }
-assert "webui password: state is 401" eventually 20 webui_says t5-pw /api/v1/state '^401$'
-assert "webui password: page still loads" webui_says t5-pw / '<title>Proton VPN</title>'
-assert "webui password: no open warning" not_logged t5-pw "$WEBUI_WARNING"
-assert "webui stops within the shutdown budget" graceful_stop t5-open
+run_container "t5b-$$-open" || { echo "FAIL webui boot"; exit 1; }
+assert "webui open: state is signed out with the banner" eventually 20 webui_state_signed_out_with_banner "t5b-$$-open"
+assert "webui open: warning logged" logged "t5b-$$-open" "$WEBUI_WARNING"
+assert "webui open: page served" webui_says "t5b-$$-open" / '<title>Proton VPN</title>'
+assert "webui open: script served" webui_says "t5b-$$-open" /static/app.js '^200$'
+assert "webui open: traversal refused" webui_says "t5b-$$-open" /static/../webui.py '^404$'
+API_KEY=$(openssl rand -hex 32)
+run_container "t5b-$$-pw" -e WEBUI_PASSWORD=x -e API_KEY="$API_KEY" || { echo "FAIL webui password boot"; exit 1; }
+assert "webui password: state is 401" eventually 20 webui_says "t5b-$$-pw" /api/v1/state '^401$'
+assert "webui password: page still loads" webui_says "t5b-$$-pw" / '<title>Proton VPN</title>'
+assert "webui password: no open warning" not_logged "t5b-$$-pw" "$WEBUI_WARNING"
+assert "public api: real bearer HTTP contract" bearer_smoke "t5b-$$-pw" "$API_KEY"
+assert "webui stops within the shutdown budget" graceful_stop "t5b-$$-open"
 
 [ "$FAILED" -eq 0 ] && echo "all ok"
 exit "$FAILED"

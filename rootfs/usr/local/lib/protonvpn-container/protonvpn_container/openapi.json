@@ -1,0 +1,1850 @@
+{
+  "openapi": "3.1.0",
+  "jsonSchemaDialect": "https://json-schema.org/draft/2020-12/schema",
+  "info": {
+    "title": "Proton VPN API",
+    "version": "1.0.0",
+    "description": "One versioned API for the WebUI and scripts. Configure API_KEY separately from WEBUI_PASSWORD. Access is allowed with a valid bearer key, valid session cookie, or while WEBUI_PASSWORD is empty. An empty API_KEY disables bearer authentication, not open-mode access. Only valid bearer-authenticated writes bypass X-Requested-With. All POSTs require a JSON object (maximum 8192 bytes). Use HTTPS via a trusted reverse proxy outside a trusted local network. Errors use {\"error\": \"message\"}; no legacy error fields."
+  },
+  "servers": [
+    {
+      "url": "/api/v1"
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    },
+    {
+      "cookieAuth": []
+    },
+    {}
+  ],
+  "paths": {
+    "/status": {
+      "get": {
+        "operationId": "getStatus",
+        "summary": "Connection status",
+        "description": "Current account, connection and forwarded port. Empty strings mean unavailable.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Status"
+                },
+                "example": {
+                  "signed_in": false,
+                  "account": "",
+                  "connected": false,
+                  "server": "",
+                  "location": "",
+                  "load": "",
+                  "protocol": "",
+                  "exit_ip": "",
+                  "forwarded_port": null,
+                  "last_error": ""
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required or wrong password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "login required"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal or CLI failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "internal error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/port": {
+      "get": {
+        "operationId": "getPort",
+        "summary": "Forwarded port",
+        "description": "Null when unavailable. With format=text, returns a bare port number or an empty body.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Port"
+                },
+                "example": {
+                  "port": null
+                }
+              },
+              "text/plain": {
+                "schema": {
+                  "type": "string",
+                  "pattern": "^[0-9]*$"
+                },
+                "examples": {
+                  "available": {
+                    "value": "41404"
+                  },
+                  "unavailable": {
+                    "value": ""
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required or wrong password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "login required"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal or CLI failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "internal error"
+                }
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "format",
+            "in": "query",
+            "description": "Use text for shell scripts; otherwise JSON.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "json",
+                "text"
+              ],
+              "default": "json"
+            }
+          }
+        ]
+      }
+    },
+    "/traffic": {
+      "get": {
+        "operationId": "getTraffic",
+        "summary": "Traffic totals and samples",
+        "description": "Last 15 minutes. Samples are [relative_seconds, received_bytes, sent_bytes]; newest sample is at 0 seconds. Totals are since connection, zero without samples.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Traffic"
+                },
+                "example": {
+                  "rx_bytes": 0,
+                  "tx_bytes": 0,
+                  "samples": []
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required or wrong password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "login required"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal or CLI failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "internal error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/settings": {
+      "get": {
+        "operationId": "getSettings",
+        "summary": "Effective settings",
+        "description": "Every setting with value, lock, source and kind. Choice settings include allowed choices; bool values use true or false. Environment values are read-only. No WebUI password or API key is exposed.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Settings"
+                },
+                "example": {
+                  "settings": [
+                    {
+                      "env": "NETSHIELD",
+                      "value": "off",
+                      "locked": false,
+                      "source": "file",
+                      "kind": "choice",
+                      "choices": [
+                        "off",
+                        "malware-only",
+                        "malware-ads-trackers"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required or wrong password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "login required"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal or CLI failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "internal error"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "saveSetting",
+        "summary": "Save a setting",
+        "description": "Validates and applies one setting. Environment-locked settings return 409; CLI rejection returns 422.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Message"
+                },
+                "example": {
+                  "ok": true,
+                  "message": "saved"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or failed sign-in",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "a JSON object body of valid text is required"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required or wrong password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "login required"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing write header (unless valid bearer)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "missing X-Requested-With header"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Setting locked by environment",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "KILL_SWITCH is set by the container config"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Body exceeds 8192 bytes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "request body too large"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "CLI rejected setting",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "invalid choice"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal or CLI failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "internal error"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SettingRequest"
+              },
+              "example": {
+                "env": "NETSHIELD",
+                "value": "off"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "X-Requested-With",
+            "in": "header",
+            "required": false,
+            "description": "Required for cookie/open-mode writes; not needed with a valid bearer key.",
+            "schema": {
+              "const": "protonvpn-webui"
+            }
+          }
+        ]
+      }
+    },
+    "/state": {
+      "get": {
+        "operationId": "getState",
+        "summary": "WebUI aggregate state",
+        "description": "Status, settings, banner and traffic for the WebUI. Aggregate traffic sample times use the supervisor monotonic clock; use /traffic for relative seconds.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/State"
+                },
+                "example": {
+                  "signed_in": false,
+                  "account": "",
+                  "connected": false,
+                  "server": "",
+                  "location": "",
+                  "load": "",
+                  "protocol": "",
+                  "exit_ip": "",
+                  "forwarded_port": null,
+                  "last_error": "",
+                  "traffic": [],
+                  "settings_errors": {},
+                  "user_disconnected": false,
+                  "auth_required": true,
+                  "banner": false,
+                  "settings": [
+                    {
+                      "env": "NETSHIELD",
+                      "value": "off",
+                      "locked": false,
+                      "source": "file",
+                      "kind": "choice",
+                      "choices": [
+                        "off",
+                        "malware-only",
+                        "malware-ads-trackers"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required or wrong password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "login required"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal or CLI failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "internal error"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "operationId": "getOpenAPI",
+        "summary": "OpenAPI document",
+        "description": "Public OpenAPI 3.1.0 document using JSON Schema 2020-12. No authentication required.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenAPI"
+                },
+                "example": {
+                  "openapi": "3.1.0",
+                  "info": {
+                    "title": "Proton VPN API",
+                    "version": "1.0.0"
+                  },
+                  "paths": {},
+                  "components": {}
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal or CLI failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "internal error"
+                }
+              }
+            }
+          }
+        },
+        "security": []
+      }
+    },
+    "/connect": {
+      "post": {
+        "operationId": "connect",
+        "summary": "Connect or retry",
+        "description": "Requests connection asynchronously. Read /status for its result.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok"
+                },
+                "example": {
+                  "ok": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or failed sign-in",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "a JSON object body of valid text is required"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required or wrong password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "login required"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing write header (unless valid bearer)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "missing X-Requested-With header"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Body exceeds 8192 bytes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "request body too large"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal or CLI failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "internal error"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmptyRequest"
+              },
+              "example": {}
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "X-Requested-With",
+            "in": "header",
+            "required": false,
+            "description": "Required for cookie/open-mode writes; not needed with a valid bearer key.",
+            "schema": {
+              "const": "protonvpn-webui"
+            }
+          }
+        ]
+      }
+    },
+    "/disconnect": {
+      "post": {
+        "operationId": "disconnect",
+        "summary": "Disconnect",
+        "description": "Requests disconnection and pauses automatic reconnect.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok"
+                },
+                "example": {
+                  "ok": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or failed sign-in",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "a JSON object body of valid text is required"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required or wrong password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "login required"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing write header (unless valid bearer)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "missing X-Requested-With header"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Body exceeds 8192 bytes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "request body too large"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal or CLI failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "internal error"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmptyRequest"
+              },
+              "example": {}
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "X-Requested-With",
+            "in": "header",
+            "required": false,
+            "description": "Required for cookie/open-mode writes; not needed with a valid bearer key.",
+            "schema": {
+              "const": "protonvpn-webui"
+            }
+          }
+        ]
+      }
+    },
+    "/signin": {
+      "post": {
+        "operationId": "signin",
+        "summary": "Sign in to Proton",
+        "description": "Credentials go to the existing PTY sign-in flow, never persistent settings. need_code requires /signin/code; done completes sign-in. Security keys require the console. Failed sign-in returns 400.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Step"
+                },
+                "example": {
+                  "state": "need_code",
+                  "message": ""
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or failed sign-in",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "a JSON object body of valid text is required"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required or wrong password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "login required"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing write header (unless valid bearer)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "missing X-Requested-With header"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Body exceeds 8192 bytes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "request body too large"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal or CLI failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "internal error"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SigninRequest"
+              },
+              "example": {
+                "username": "your-proton-username",
+                "password": "your-proton-password"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "X-Requested-With",
+            "in": "header",
+            "required": false,
+            "description": "Required for cookie/open-mode writes; not needed with a valid bearer key.",
+            "schema": {
+              "const": "protonvpn-webui"
+            }
+          }
+        ]
+      }
+    },
+    "/signin/code": {
+      "post": {
+        "operationId": "signinCode",
+        "summary": "Submit two-factor code",
+        "description": "Requires an active sign-in waiting for a code. need_code means retry; done completes sign-in.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Step"
+                },
+                "example": {
+                  "state": "need_code",
+                  "message": ""
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or failed sign-in",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "a JSON object body of valid text is required"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required or wrong password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "login required"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing write header (unless valid bearer)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "missing X-Requested-With header"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Body exceeds 8192 bytes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "request body too large"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal or CLI failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "internal error"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CodeRequest"
+              },
+              "example": {
+                "code": "123456"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "X-Requested-With",
+            "in": "header",
+            "required": false,
+            "description": "Required for cookie/open-mode writes; not needed with a valid bearer key.",
+            "schema": {
+              "const": "protonvpn-webui"
+            }
+          }
+        ]
+      }
+    },
+    "/signout": {
+      "post": {
+        "operationId": "signout",
+        "summary": "Sign out of Proton",
+        "description": "Disconnects and signs out of the Proton account. Does not log out the WebUI session.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Message"
+                },
+                "example": {
+                  "ok": true,
+                  "message": "saved"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or failed sign-in",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "a JSON object body of valid text is required"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required or wrong password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "login required"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing write header (unless valid bearer)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "missing X-Requested-With header"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Body exceeds 8192 bytes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "request body too large"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal or CLI failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "internal error"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmptyRequest"
+              },
+              "example": {}
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "X-Requested-With",
+            "in": "header",
+            "required": false,
+            "description": "Required for cookie/open-mode writes; not needed with a valid bearer key.",
+            "schema": {
+              "const": "protonvpn-webui"
+            }
+          }
+        ]
+      }
+    },
+    "/banner/dismiss": {
+      "post": {
+        "operationId": "dismissBanner",
+        "summary": "Dismiss open-mode warning",
+        "description": "Persists banner dismissal. Does not enable authentication.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok"
+                },
+                "example": {
+                  "ok": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or failed sign-in",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "a JSON object body of valid text is required"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required or wrong password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "login required"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing write header (unless valid bearer)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "missing X-Requested-With header"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Body exceeds 8192 bytes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "request body too large"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal or CLI failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "internal error"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmptyRequest"
+              },
+              "example": {}
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "X-Requested-With",
+            "in": "header",
+            "required": false,
+            "description": "Required for cookie/open-mode writes; not needed with a valid bearer key.",
+            "schema": {
+              "const": "protonvpn-webui"
+            }
+          }
+        ]
+      }
+    },
+    "/login": {
+      "post": {
+        "operationId": "login",
+        "summary": "Log in to the WebUI",
+        "description": "Checks WEBUI_PASSWORD and sets the HttpOnly SameSite=Strict session cookie. API_KEY does not replace the password here. Open mode is a no-op. Five failed logins per minute trigger a 60-second lockout.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok"
+                },
+                "example": {
+                  "ok": true
+                }
+              }
+            },
+            "headers": {
+              "Set-Cookie": {
+                "description": "session=<opaque token>; HttpOnly; SameSite=Strict; Path=/; Max-Age=604800 (password mode only)",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or failed sign-in",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "a JSON object body of valid text is required"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required or wrong password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "login required"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing write header (unless valid bearer)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "missing X-Requested-With header"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Body exceeds 8192 bytes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "request body too large"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Login rate limited",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "too many failed logins; try again in a minute"
+                }
+              }
+            },
+            "headers": {
+              "Retry-After": {
+                "schema": {
+                  "type": "integer"
+                },
+                "description": "Seconds until another login attempt is allowed."
+              }
+            }
+          },
+          "500": {
+            "description": "Internal or CLI failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "internal error"
+                }
+              }
+            }
+          }
+        },
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginRequest"
+              },
+              "example": {
+                "password": "your-webui-password"
+              }
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "X-Requested-With",
+            "in": "header",
+            "required": false,
+            "description": "Required for cookie/open-mode writes; not needed with a valid bearer key.",
+            "schema": {
+              "const": "protonvpn-webui"
+            }
+          }
+        ]
+      }
+    },
+    "/logout": {
+      "post": {
+        "operationId": "logout",
+        "summary": "Log out of the WebUI",
+        "description": "Invalidates the current session cookie and clears it. Does not sign out the Proton account or revoke API_KEY.",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ok"
+                },
+                "example": {
+                  "ok": true
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid input or failed sign-in",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "a JSON object body of valid text is required"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Authentication required or wrong password",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "login required"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Missing write header (unless valid bearer)",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "missing X-Requested-With header"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Body exceeds 8192 bytes",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "request body too large"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal or CLI failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                },
+                "example": {
+                  "error": "internal error"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmptyRequest"
+              },
+              "example": {}
+            }
+          }
+        },
+        "parameters": [
+          {
+            "name": "X-Requested-With",
+            "in": "header",
+            "required": false,
+            "description": "Required for cookie/open-mode writes; not needed with a valid bearer key.",
+            "schema": {
+              "const": "protonvpn-webui"
+            }
+          }
+        ]
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer"
+      },
+      "cookieAuth": {
+        "type": "apiKey",
+        "in": "cookie",
+        "name": "session"
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "error"
+        ]
+      },
+      "Ok": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "const": true
+          }
+        },
+        "required": [
+          "ok"
+        ]
+      },
+      "Message": {
+        "type": "object",
+        "properties": {
+          "ok": {
+            "const": true
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "message"
+        ]
+      },
+      "Status": {
+        "type": "object",
+        "properties": {
+          "signed_in": {
+            "type": "boolean"
+          },
+          "account": {
+            "type": "string"
+          },
+          "connected": {
+            "type": "boolean"
+          },
+          "server": {
+            "type": "string"
+          },
+          "location": {
+            "type": "string"
+          },
+          "load": {
+            "type": "string"
+          },
+          "protocol": {
+            "type": "string"
+          },
+          "exit_ip": {
+            "type": "string"
+          },
+          "forwarded_port": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "last_error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "signed_in",
+          "account",
+          "connected",
+          "server",
+          "location",
+          "load",
+          "protocol",
+          "exit_ip",
+          "forwarded_port",
+          "last_error"
+        ]
+      },
+      "Port": {
+        "type": "object",
+        "properties": {
+          "port": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1,
+            "maximum": 65535
+          }
+        },
+        "required": [
+          "port"
+        ]
+      },
+      "Sample": {
+        "type": "array",
+        "prefixItems": [
+          {
+            "type": "number"
+          },
+          {
+            "type": "integer",
+            "minimum": 0
+          },
+          {
+            "type": "integer",
+            "minimum": 0
+          }
+        ],
+        "items": false,
+        "minItems": 3,
+        "maxItems": 3
+      },
+      "Traffic": {
+        "type": "object",
+        "properties": {
+          "rx_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "tx_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "samples": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Sample"
+            }
+          }
+        },
+        "required": [
+          "rx_bytes",
+          "tx_bytes",
+          "samples"
+        ]
+      },
+      "Setting": {
+        "type": "object",
+        "properties": {
+          "env": {
+            "type": "string",
+            "enum": [
+              "SERVER",
+              "COUNTRY",
+              "CITY",
+              "P2P",
+              "SECURE_CORE",
+              "TOR",
+              "NETSHIELD",
+              "PORT_FORWARDING",
+              "VPN_ACCELERATOR",
+              "MODERATE_NAT",
+              "IPV6",
+              "CUSTOM_DNS",
+              "KILL_SWITCH",
+              "ANONYMOUS_CRASH_REPORTS"
+            ]
+          },
+          "value": {
+            "type": "string"
+          },
+          "locked": {
+            "type": "boolean"
+          },
+          "source": {
+            "type": "string",
+            "enum": [
+              "env",
+              "file",
+              "default"
+            ]
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "text",
+              "bool",
+              "choice"
+            ]
+          },
+          "choices": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "env",
+          "value",
+          "locked",
+          "source",
+          "kind"
+        ]
+      },
+      "Settings": {
+        "type": "object",
+        "properties": {
+          "settings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Setting"
+            }
+          }
+        },
+        "required": [
+          "settings"
+        ]
+      },
+      "State": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Status"
+          },
+          {
+            "$ref": "#/components/schemas/Settings"
+          },
+          {
+            "type": "object",
+            "properties": {
+              "traffic": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Sample"
+                }
+              },
+              "settings_errors": {
+                "type": "object",
+                "additionalProperties": {
+                  "type": "string"
+                }
+              },
+              "user_disconnected": {
+                "type": "boolean"
+              },
+              "auth_required": {
+                "type": "boolean"
+              },
+              "banner": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "traffic",
+              "settings_errors",
+              "user_disconnected",
+              "auth_required",
+              "banner"
+            ]
+          }
+        ]
+      },
+      "Step": {
+        "type": "object",
+        "properties": {
+          "state": {
+            "type": "string",
+            "enum": [
+              "need_code",
+              "done"
+            ]
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "message"
+        ]
+      },
+      "EmptyRequest": {
+        "type": "object"
+      },
+      "LoginRequest": {
+        "type": "object",
+        "properties": {
+          "password": {
+            "type": "string",
+            "writeOnly": true
+          }
+        },
+        "required": [
+          "password"
+        ]
+      },
+      "SigninRequest": {
+        "type": "object",
+        "properties": {
+          "username": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string",
+            "writeOnly": true
+          }
+        },
+        "required": [
+          "username",
+          "password"
+        ]
+      },
+      "CodeRequest": {
+        "type": "object",
+        "properties": {
+          "code": {
+            "type": "string",
+            "writeOnly": true
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "SettingRequest": {
+        "type": "object",
+        "properties": {
+          "env": {
+            "type": "string",
+            "enum": [
+              "SERVER",
+              "COUNTRY",
+              "CITY",
+              "P2P",
+              "SECURE_CORE",
+              "TOR",
+              "NETSHIELD",
+              "PORT_FORWARDING",
+              "VPN_ACCELERATOR",
+              "MODERATE_NAT",
+              "IPV6",
+              "CUSTOM_DNS",
+              "KILL_SWITCH",
+              "ANONYMOUS_CRASH_REPORTS"
+            ]
+          },
+          "value": {
+            "type": "string",
+            "maxLength": 256,
+            "description": "Empty clears the saved value. Choice values come from GET /settings; bool values are true or false. CUSTOM_DNS: off, on, or on --dns <comma-separated IPs>. Target fields must not start with a dash; control characters are rejected."
+          }
+        },
+        "required": [
+          "env",
+          "value"
+        ]
+      },
+      "OpenAPI": {
+        "type": "object",
+        "properties": {
+          "openapi": {
+            "const": "3.1.0"
+          },
+          "info": {
+            "type": "object"
+          },
+          "paths": {
+            "type": "object"
+          },
+          "components": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "openapi",
+          "info",
+          "paths",
+          "components"
+        ]
+      }
+    },
+    "responses": {
+      "NotFound": {
+        "description": "Unknown route",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Error"
+            },
+            "example": {
+              "error": "not found"
+            }
+          }
+        }
+      }
+    }
+  }
+}

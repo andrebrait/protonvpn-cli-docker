@@ -1,9 +1,9 @@
 """WebUI: the static page and a small JSON API on a ThreadingHTTPServer.
 
 The JSON API lives under `/api/v1/`; ROUTES (end of this module) is the one place listing every route.
-Every route except `login` needs a session cookie while a password is set. Every POST needs the
-`X-Requested-With` header (a cross-site form cannot send it) and a JSON object body. Log lines carry
-the request line and status only: never bodies, passwords or 2FA codes.
+Protected routes accept a session cookie or API bearer key while a password is set. POSTs need
+`X-Requested-With` unless authenticated by bearer key, and a JSON object body. Log lines carry
+the request line and status only: never bodies, passwords, tokens or 2FA codes.
 """
 
 import hmac
@@ -20,7 +20,7 @@ from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from .config import CHOICES, SETTINGS
 
@@ -84,8 +84,9 @@ def invalid_value(env: str, value: str) -> str:
 class Ui:
     """State shared by the request threads: sessions, login throttling and the collaborators."""
 
-    def __init__(self, supervisor, store, signin_flow, password: str):
+    def __init__(self, supervisor, store, signin_flow, password: str, api_key: str = ""):
         self.supervisor, self.store, self.signin, self.password = supervisor, store, signin_flow, password
+        self.api_key = api_key
         self.clock = time.monotonic
         self._lock = threading.Lock()
         self._sessions: dict[str, float] = {}  # token -> expiry
@@ -94,7 +95,13 @@ class Ui:
 
     def state(self) -> dict:
         state = self.supervisor.snapshot()
-        state["settings"] = [
+        state["settings"] = self.settings()
+        state["auth_required"] = bool(self.password)
+        state["banner"] = not self.password and not self.store.banner_dismissed()
+        return state
+
+    def settings(self) -> list:
+        return [
             {
                 "env": s.env,
                 "value": self.store.effective(s.env),
@@ -105,9 +112,6 @@ class Ui:
             }
             for s in SETTINGS
         ]
-        state["auth_required"] = bool(self.password)
-        state["banner"] = not self.password and not self.store.banner_dismissed()
-        return state
 
     def session_valid(self, token: str) -> bool:
         with self._lock:
@@ -189,7 +193,7 @@ class Handler(BaseHTTPRequestHandler):
             print("[webui] request failed:", flush=True)
             traceback.print_exc(file=sys.stdout)  # code locations only, never request bodies
             sys.stdout.flush()
-            self._json(500, {"ok": False, "message": "internal error"})
+            self._json(500, {"error": "internal error"})
 
     def _cookie(self) -> str:
         for part in self.headers.get("Cookie", "").split(";"):
@@ -198,9 +202,15 @@ class Handler(BaseHTTPRequestHandler):
                 return value
         return ""
 
+    def _bearer_valid(self) -> bool:
+        scheme, _, token = self.headers.get("Authorization", "").partition(" ")
+        return bool(self.ui.api_key) and scheme.lower() == "bearer" and hmac.compare_digest(
+            token.encode(), self.ui.api_key.encode()
+        )
+
     def _authorized(self) -> bool:
-        if self.ui.password and not self.ui.session_valid(self._cookie()):
-            self._json(401, {"ok": False, "message": "login required", "auth_required": True})
+        if self.ui.password and not self._bearer_valid() and not self.ui.session_valid(self._cookie()):
+            self._json(401, {"error": "login required"})
             return False
         return True
 
@@ -216,6 +226,8 @@ class Handler(BaseHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/":
             self._static("index.html")
+        elif path == "/api":
+            self._static("api.html")
         elif path.startswith("/static/"):
             self._static(path[len("/static/") :])
         else:
@@ -228,17 +240,17 @@ class Handler(BaseHTTPRequestHandler):
                 raise FileNotFoundError(name)
             body = resources.files(__package__).joinpath("static", name).read_bytes()
         except OSError:
-            self._json(404, {"ok": False, "message": "not found"})
+            self._json(404, {"error": "not found"})
             return
         self._send(200, body, content_type, {"Cache-Control": "no-cache"})
 
     def _api(self, method: str, path: str) -> None:
         route = ROUTE_INDEX.get((method, path))
         if route is None:
-            self._json(404, {"ok": False, "message": "not found"})
+            self._json(404, {"error": "not found"})
             return
-        if method == "POST" and self.headers.get(CSRF_HEADER) != CSRF_VALUE:
-            self._json(403, {"ok": False, "message": f"missing {CSRF_HEADER} header"})
+        if method == "POST" and not self._bearer_valid() and self.headers.get(CSRF_HEADER) != CSRF_VALUE:
+            self._json(403, {"error": f"missing {CSRF_HEADER} header"})
             return
         if route.auth and not self._authorized():  # answered 401
             return
@@ -253,7 +265,7 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:
             length = -1
         if length > MAX_BODY:
-            self._json(413, {"ok": False, "message": "request body too large"})
+            self._json(413, {"error": "request body too large"})
             return None
         try:
             data = json.loads(self.rfile.read(length)) if length > 0 else None
@@ -264,12 +276,41 @@ class Handler(BaseHTTPRequestHandler):
         except ValueError:  # not JSON, or a lone surrogate (UnicodeEncodeError)
             data = None
         if not isinstance(data, dict):
-            self._json(400, {"ok": False, "message": "a JSON object body of valid text is required"})
+            self._json(400, {"error": "a JSON object body of valid text is required"})
             return None
         return data
 
     def get_state(self, body: dict) -> None:
         self._json(200, self.ui.state())
+
+    def get_status(self, body: dict) -> None:
+        state = self.ui.supervisor.snapshot()
+        self._json(200, {key: state[key] for key in (
+            "signed_in", "account", "connected", "server", "location", "load", "protocol",
+            "exit_ip", "forwarded_port", "last_error",
+        )})
+
+    def get_port(self, body: dict) -> None:
+        port = self.ui.supervisor.snapshot()["forwarded_port"]
+        if parse_qs(urlsplit(self.path).query).get("format") == ["text"]:
+            self._send(200, str(port).encode() if port is not None else b"", "text/plain", {"Cache-Control": "no-store"})
+        else:
+            self._json(200, {"port": port})
+
+    def get_traffic(self, body: dict) -> None:
+        samples = self.ui.supervisor.snapshot()["traffic"]
+        last = samples[-1] if samples else [0, 0, 0]
+        self._json(200, {
+            "rx_bytes": last[1], "tx_bytes": last[2],
+            "samples": [[t - last[0], rx, tx] for t, rx, tx in samples],
+        })
+
+    def get_settings(self, body: dict) -> None:
+        self._json(200, {"settings": self.ui.settings()})
+
+    def get_openapi(self, body: dict) -> None:
+        self._send(200, resources.files(__package__).joinpath("openapi.json").read_bytes(),
+                   "application/json", {"Cache-Control": "no-cache"})
 
     def post_login(self, body: dict) -> None:
         if not self.ui.password:
@@ -282,9 +323,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True}, {"Set-Cookie": cookie})
         elif status == 429:
             message = "too many failed logins; try again in a minute"
-            self._json(429, {"ok": False, "message": message}, {"Retry-After": str(LOGIN_LOCKOUT)})
+            self._json(429, {"error": message}, {"Retry-After": str(LOGIN_LOCKOUT)})
         else:
-            self._json(401, {"ok": False, "message": "wrong password"})
+            self._json(401, {"error": "wrong password"})
 
     def post_logout(self, body: dict) -> None:
         self.ui.end_session(self._cookie())
@@ -301,47 +342,50 @@ class Handler(BaseHTTPRequestHandler):
     def post_settings(self, body: dict) -> None:
         env, value = body.get("env"), body.get("value")
         if not isinstance(env, str) or env not in SETTINGS_BY_ENV or not isinstance(value, str):
-            self._json(400, {"ok": False, "message": "env must name a setting and value must be a string"})
+            self._json(400, {"error": "env must name a setting and value must be a string"})
         elif self.ui.store.locked(env):
-            self._json(409, {"ok": False, "message": f"{env} is set by the container config"})
+            self._json(409, {"error": f"{env} is set by the container config"})
         elif problem := invalid_value(env, value):
-            self._json(400, {"ok": False, "message": problem})
+            self._json(400, {"error": problem})
         else:
             try:
                 ok, message = self.ui.supervisor.apply_setting(env, value)
             except OSError as exc:  # the settings file could not be written
-                self._json(500, {"ok": False, "message": f"could not save the setting: {exc.strerror or exc}"})
+                self._json(500, {"error": f"could not save the setting: {exc.strerror or exc}"})
                 return
-            self._json(200 if ok else 422, {"ok": ok, "message": message})
+            self._json(200 if ok else 422, {"ok": True, "message": message} if ok else {"error": message})
 
     def post_signin(self, body: dict) -> None:
         username, password = body.get("username"), body.get("password")
         if not isinstance(username, str) or not isinstance(password, str):
-            self._json(400, {"ok": False, "message": "username and password must be strings"})
+            self._json(400, {"error": "username and password must be strings"})
         else:
             self._step(self.ui.signin.start(username, password))
 
     def post_signin_code(self, body: dict) -> None:
         code = body.get("code")
         if not isinstance(code, str):
-            self._json(400, {"ok": False, "message": "code must be a string"})
+            self._json(400, {"error": "code must be a string"})
         else:
             self._step(self.ui.signin.submit_code(code))
 
     def _step(self, step) -> None:
+        if step.state == "error":
+            self._json(400, {"error": step.message})
+            return
         if step.state == "done":
             self.ui.supervisor.notify_signed_in()
         self._json(200, asdict(step))
 
     def post_signout(self, body: dict) -> None:
         ok, message = self.ui.supervisor.sign_out()
-        self._json(200 if ok else 500, {"ok": ok, "message": message})
+        self._json(200 if ok else 500, {"ok": True, "message": message} if ok else {"error": message})
 
     def post_banner_dismiss(self, body: dict) -> None:
         try:
             self.ui.store.dismiss_banner()
         except OSError as exc:
-            self._json(500, {"ok": False, "message": f"could not save the setting: {exc.strerror or exc}"})
+            self._json(500, {"error": f"could not save the setting: {exc.strerror or exc}"})
         else:
             self._json(200, {"ok": True})
 
@@ -351,11 +395,16 @@ class Route:
     method: str
     path: str
     handler: Callable  # a Handler method, called as handler(self, body); body is {} for GET
-    auth: bool = True  # needs a session while a password is set
+    auth: bool = True  # needs a session or bearer key while a password is set
 
 
 ROUTES = (
     Route("GET", "/api/v1/state", Handler.get_state),
+    Route("GET", "/api/v1/status", Handler.get_status),
+    Route("GET", "/api/v1/port", Handler.get_port),
+    Route("GET", "/api/v1/traffic", Handler.get_traffic),
+    Route("GET", "/api/v1/settings", Handler.get_settings),
+    Route("GET", "/api/v1/openapi.json", Handler.get_openapi, auth=False),
     Route("POST", "/api/v1/login", Handler.post_login, auth=False),
     Route("POST", "/api/v1/logout", Handler.post_logout),
     Route("POST", "/api/v1/connect", Handler.post_connect),
@@ -369,10 +418,10 @@ ROUTES = (
 ROUTE_INDEX = {(route.method, route.path): route for route in ROUTES}
 
 
-def make_server(port: int, supervisor, store, signin_flow, password: str) -> ThreadingHTTPServer:
+def make_server(port: int, supervisor, store, signin_flow, password: str, api_key: str = "") -> ThreadingHTTPServer:
     """Bind the WebUI on all IPv4 interfaces; the caller runs `serve_forever()`."""
     server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
-    server.ui = Ui(supervisor, store, signin_flow, password)
+    server.ui = Ui(supervisor, store, signin_flow, password, api_key)
     if not password:
         print(OPEN_WARNING, flush=True)
     print(f"[webui] listening on port {server.server_address[1]}", flush=True)

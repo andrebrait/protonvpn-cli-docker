@@ -71,8 +71,11 @@ def webui_port(environ=os.environ) -> int:
 def start_webui(supervisor, store, environ=os.environ):
     """Serve the WebUI from a thread; None when the port cannot be bound (logged: VPN supervision goes on)."""
     port = webui_port(environ)
+    api_key = environ.get("API_KEY", "")
+    if api_key and len(api_key) < 32:
+        print("[webui] WARNING: API_KEY is shorter than 32 characters; generate one with: openssl rand -hex 32", flush=True)
     try:
-        server = make_server(port, supervisor, store, SigninFlow(), environ.get("WEBUI_PASSWORD", ""))
+        server = make_server(port, supervisor, store, SigninFlow(), environ.get("WEBUI_PASSWORD", ""), api_key)
     except OSError as exc:
         print(f"[webui] cannot listen on port {port}: {exc}; the WebUI is disabled", flush=True)
         return None

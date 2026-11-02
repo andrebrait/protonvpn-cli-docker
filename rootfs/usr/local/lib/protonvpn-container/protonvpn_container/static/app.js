@@ -90,7 +90,7 @@
     } catch (_) {
       // an error page that is not JSON: status alone tells enough
     }
-    if (res.status === 401 && data.auth_required) showLogin();
+    if (res.status === 401) showLogin();
     return { status: res.status, data };
   }
 
@@ -367,7 +367,7 @@
     let failed = 0;
     for (const f of pending) {
       const { data } = await api("/api/v1/settings", { env: f.setting.env, value: valueOf(f) });
-      f.result = { ok: Boolean(data.ok), text: data.message || (data.ok ? "Saved" : "Not saved") };
+      f.result = { ok: Boolean(data.ok), text: data.error || data.message || (data.ok ? "Saved" : "Not saved") };
       if (data.ok) f.dirty = false;
       else failed += 1;
       renderNote(f);
@@ -454,7 +454,7 @@
       message("acct-msg", data.message || "Signed in.", "ok");
       afterAction(4); // the supervisor needs a moment to notice the session and connect
     } else {
-      message("acct-msg", data.message || "Sign-in failed.", "error");
+      message("acct-msg", data.error || "Sign-in failed.", "error");
     }
   }
 
@@ -470,7 +470,7 @@
         showApp();
         afterAction();
       } else {
-        message("login-msg", data.message || "Login failed.", "error");
+        message("login-msg", data.error || "Login failed.", "error");
       }
     } catch (_) {
       message("login-msg", "Cannot reach the container. Try again.", "error");
@@ -496,7 +496,7 @@
   $("signout").addEventListener("click", (e) =>
     run(e.currentTarget, async () => {
       const { data } = await api("/api/v1/signout", {});
-      message("acct-msg", data.ok ? "Signed out." : data.message || "Sign-out failed.", data.ok ? "ok" : "error");
+      message("acct-msg", data.ok ? "Signed out." : data.error || "Sign-out failed.", data.ok ? "ok" : "error");
     }),
   );
   $("logout").addEventListener("click", async () => {

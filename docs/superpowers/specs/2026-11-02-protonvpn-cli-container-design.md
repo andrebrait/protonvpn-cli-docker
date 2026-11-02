@@ -321,13 +321,17 @@ containers are others. There is one API, not a WebUI API plus a public one.
 - Read endpoints (`GET`): `/api/v1/status` (signed_in, account, connected, server, location,
   load, protocol, exit_ip, forwarded_port, last_error), `/api/v1/port` (`{"port": 41404}` or
   `{"port": null}`; `?format=text` returns the bare number or an empty body, `text/plain`, for
-  scripts such as qBittorrent port updaters), `/api/v1/traffic` (totals and the 15-minute
-  samples; sample times are relative seconds), `/api/v1/settings` (each setting with value,
-  locked, source, kind, allowed values). The WebUI's aggregate `/api/v1/state` stays.
+  scripts such as qBittorrent port updaters), `/api/v1/traffic` (`rx_bytes`, `tx_bytes`, and
+  `samples`, each `[relative_seconds, received_bytes, sent_bytes]`; newest sample is at 0 seconds,
+  totals are since connection; zero totals and an empty array without samples), `/api/v1/settings`
+  (`settings` array, each with env, value, locked, source, kind, and choices for choice settings).
+  The WebUI's aggregate `/api/v1/state` stays, including its existing monotonic traffic times.
 - Write endpoints (`POST`, JSON body): connect, disconnect, settings, signin, signin/code,
   signout, banner/dismiss, login, logout (the existing WebUI routes).
 - Errors: JSON `{"error": "<message>"}` with the HTTP status (400 validation, 401 auth, 403
   missing header, 404, 409 locked setting, 429 rate limit, 500 internal).
+  Failed Proton sign-in returns 400 with this error shape; a retryable two-factor step remains
+  200 with `state: "need_code"` and a message, and success is `state: "done"`.
 - Auth: a request is authorized when the WebUI is open (`WEBUI_PASSWORD` unset), **or** it
   carries a valid WebUI session cookie, **or** it sends `Authorization: Bearer <API_KEY>`
   (constant-time compare). `API_KEY` unset disables token access. Token-authenticated requests are
@@ -340,10 +344,9 @@ containers are others. There is one API, not a WebUI API plus a public one.
   than 32 characters; generate one with: openssl rand -hex 32`.
 - Contract: a hand-written **OpenAPI 3.1** document shipped in the package and served at
   `GET /api/v1/openapi.json`, with schemas for every request and response, the bearer and cookie
-  security schemes, and examples. It must validate against the OpenAPI 3.1 specification (CI runs
-  `openapi-spec-validator`), and a unit test fails when the server's route table and the document
-  disagree on paths or methods, or when a handler's actual response for a stubbed state lacks a
-  property the schema marks required.
+  security schemes, and examples. Schemas use JSON Schema 2020-12. It must validate against the
+  OpenAPI 3.1 specification (`openapi-spec-validator`), and HTTP contract tests exercise every
+  documented operation and check actual responses for the properties marked required.
 - Docs page at `/api` (same look as the WebUI): renders the OpenAPI document client-side into a
   list of endpoints with method, path, description, parameters, request and response examples, a
   `curl` example per endpoint (with `-H "Authorization: Bearer $API_KEY"`), the key-generation
