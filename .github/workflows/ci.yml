@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    tags: ['v*']
+  schedule:
+    - cron: '23 4 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Lint all shell scripts
+        run: git grep -Il '^#!/bin/sh' -- rootfs tests | xargs shellcheck -s sh
+      - name: Shell unit tests
+        run: sh tests/unit.sh
+
+  smoke:
+    needs: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build test image
+        run: docker build --pull -t protonvpn-cli:test .
+      - name: Python unit tests in the built image
+        run: >-
+          docker run --rm -v "$PWD:/src" -w /src
+          -e PYTHONPATH=/src/rootfs/usr/local/lib/protonvpn-container
+          --entrypoint python3 protonvpn-cli:test
+          -m unittest discover -s tests/python -t .
+      - name: Validate OpenAPI 3.1 contract
+        run: |
+          python3 -m venv "$RUNNER_TEMP/openapi-venv"
+          "$RUNNER_TEMP/openapi-venv/bin/pip" install openapi-spec-validator
+          "$RUNNER_TEMP/openapi-venv/bin/openapi-spec-validator" rootfs/usr/local/lib/protonvpn-container/protonvpn_container/openapi.json
+      - name: Load WireGuard kernel module
+        run: sudo modprobe wireguard
+      - name: Container smoke tests
+        run: IMAGE=protonvpn-cli:test sh tests/smoke.sh
+
+  publish:
+    needs: smoke
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@v4
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ghcr.io/andrebrait/protonvpn-cli
+          flavor: latest=false
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.event_name == 'schedule' }}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-
+      - name: Publish both architectures with a fresh base
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          pull: true
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
