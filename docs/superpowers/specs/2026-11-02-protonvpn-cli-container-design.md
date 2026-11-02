@@ -274,7 +274,8 @@ health does not depend on the port (a failing NAT-PMP refresh is logged, not fat
   credentials.
 - The cgroup-scoped firewall exception requires cgroup v2 and the `xt_cgroup` match in the host
   kernel; the container fails closed when either is missing. Verified 2026-11-02 on the target
-  Unraid 7.3.4 (kernel 6.18.58, Docker 29.8.2, cgroup v2, iptables 1.8.13 legacy, `wireguard`
-  module present): owning container allowed, attached container blocked.
+  Unraid 7.3.4 (kernel 6.18.58, Docker 29.8.2, cgroup v2, host iptables 1.8.13 legacy, `wireguard`
+  module present): owning container allowed, attached container blocked. The test container used
+  the `nf_tables` iptables backend, so the host's legacy backend does not matter.
 - Not yet verified: arm64, CLI behaviour after long outages (supervisor covers it), security-key
   (FIDO2) signin through `docker exec`.
