@@ -36,7 +36,8 @@ Reference implementation of every workaround (throwaway spike, read-only): `/tmp
 - WireGuard fwmark `0xea13b2c`; tunnel interface `proton0`; NAT-PMP gateway `10.2.0.1`.
 - Log prefixes: `[protonvpn]`, `[natpmp]`, `[firewall]`, `[webui]`, `[init]`, `[nm]`.
 - Env defaults: `KILL_SWITCH=standard`, `ANONYMOUS_CRASH_REPORTS=off`, `TZ=UTC`, `DEBUG=false`,
-  `RECONNECT_INTERVAL=30`, `LAN_NETWORKS=` (empty), `WEBUI_PORT=8788`, `WEBUI_PASSWORD=` (empty).
+  `RECONNECT_INTERVAL=30`, `LAN_NETWORKS=` (empty), `WEBUI_PORT=8788`, `WEBUI_PASSWORD=` (empty),
+  `API_KEY=` (empty).
 - Settings precedence: env var (non-empty; locks the WebUI field) → `/config/settings.json`
   (mode `600`) → image default.
 - Signin hint text: `Not signed in. Sign in from the WebUI or run: docker exec -it <name> protonvpn signin <username>`
@@ -465,6 +466,61 @@ git add -A && git commit -m "feat: WebUI for status, sign-in and settings"
 
 ---
 
+### Task 5b: Public API (OpenAPI 3.1, API key, docs page)
+
+**Files:**
+- Create: `protonvpn_container/openapi.json`, `protonvpn_container/static/api.html`,
+  `static/api.js`, `tests/python/test_api.py`
+- Modify: `protonvpn_container/webui.py` (new GET routes, bearer auth, error shape, openapi and
+  docs routes), `protonvpn_container/__main__.py` (read `API_KEY`, short-key warning),
+  `static/index.html` (header link "API"), `tests/smoke.sh`
+
+**Interfaces:**
+- Consumes: `ROUTES` / `Route(method, path, handler, auth)` table in `webui.py`, `make_server`,
+  `Supervisor.snapshot()`, `SettingsStore`, `SETTINGS` and the dropdown values from Task 5.
+- Produces: routes `GET /api/v1/status`, `GET /api/v1/port` (`?format=text`), `GET
+  /api/v1/traffic`, `GET /api/v1/settings`, `GET /api/v1/openapi.json` (no auth), `GET /api` (docs
+  page, no auth); auth rule and error shape exactly as the spec's "Public API" section;
+  `make_server(..., api_key: str = "")`.
+
+- [ ] **Step 1: Write failing tests** (`test_api.py`, server on port 0 with stub supervisor)
+- `test_openapi_matches_routes`: every `(method, path)` in `ROUTES` appears in `openapi.json`
+  `paths` and vice versa (paths without the `/api/v1` server prefix handled consistently).
+- `test_openapi_document_shape`: `openapi` is `3.1.0`; every operation has `operationId`,
+  `summary`, `responses`; `components.securitySchemes` has `bearerAuth` (http, bearer) and
+  `cookieAuth` (apiKey in cookie `session`).
+- `test_responses_have_required_fields`: for each GET route, the stubbed response contains every
+  property the response schema marks `required` (walk `$ref`s into `components.schemas`).
+- `test_bearer_key_authorizes_when_password_set`; `test_wrong_key_401`;
+  `test_no_key_configured_rejects_bearer` (`API_KEY` empty → bearer ignored → 401 when password set);
+  `test_bearer_post_skips_xrw_header`; `test_cookie_post_still_needs_xrw` (403).
+- `test_port_text_format` (`41404` / empty body, `text/plain`); `test_port_json_null`.
+- `test_error_shape` (`{"error": ...}` for 400/401/404/409).
+- `test_openapi_and_docs_need_no_auth` (200 with password set, no cookie).
+- `test_short_api_key_warning` (logged once at start for a 16-char key, not for a 64-char key).
+
+Smoke: with `-e WEBUI_PASSWORD=x -e API_KEY=$(openssl rand -hex 32)`:
+`curl -H "Authorization: Bearer $key" http://127.0.0.1:8788/api/v1/status` (via `docker exec`
+python urllib) returns JSON with `"signed_in": false`; without the header → 401;
+`/api/v1/openapi.json` → 200.
+
+- [ ] **Step 2: Run to verify they fail**
+- [ ] **Step 3: Implement** — write `openapi.json` by hand (OpenAPI 3.1, JSON Schema 2020-12
+  schemas, examples taken from real stubbed responses); docs page renders it client-side
+  (method badge, path, summary, description, parameters, request/response examples, curl example
+  with `-H "Authorization: Bearer $API_KEY"`, key-generation box with `openssl rand -hex 32` and the
+  python alternative from the spec), same CSS as the WebUI, no external library.
+- [ ] **Step 4: Validate the document**: `docker run --rm -v "$PWD:/src" -w /src python:3-slim sh -c "pip install -q openapi-spec-validator && openapi-spec-validator rootfs/usr/local/lib/protonvpn-container/protonvpn_container/openapi.json"` → `OK`.
+- [ ] **Step 5: Run all suites** (Python unit, smoke); visual check of `/api` in light and dark
+  (screenshots in the workspace `screens/`).
+- [ ] **Step 6: Commit**
+
+```bash
+git add -A && git commit -m "feat: public API with OpenAPI 3.1 contract, API key and docs page"
+```
+
+---
+
 ### Task 6: CI and image publishing
 
 **Files:**
@@ -476,7 +532,9 @@ git add -A && git commit -m "feat: WebUI for status, sign-in and settings"
 Jobs:
 1. `lint`: `shellcheck -s sh` on all shell scripts; `sh tests/unit.sh`.
 2. `smoke` (needs lint): `docker build -t protonvpn-cli:test .` on `ubuntu-latest` (amd64),
-   Python unit tests with the command from Task 2, `sudo modprobe wireguard`,
+   Python unit tests with the command from Task 2, OpenAPI validation (`pip install
+   openapi-spec-validator` on the runner, then `openapi-spec-validator
+   rootfs/usr/local/lib/protonvpn-container/protonvpn_container/openapi.json`), `sudo modprobe wireguard`,
    `IMAGE=protonvpn-cli:test sh tests/smoke.sh`.
 3. `publish` (needs smoke; `push` to `main` and tags `v*`; also weekly `schedule` so base-image
    updates land): buildx + QEMU, `linux/amd64,linux/arm64`, push to
@@ -510,11 +568,14 @@ git add -A && git commit -m "ci: lint, tests and multi-arch publish"
   dropdowns (`|`-separated `Default`, first entry empty) for `NETSHIELD`, `PORT_FORWARDING`,
   `VPN_ACCELERATOR`, `MODERATE_NAT`, `IPV6`, `KILL_SWITCH`, `ANONYMOUS_CRASH_REPORTS`, `P2P`,
   `SECURE_CORE`, `TOR`, `DEBUG`, with allowed values from `protonvpn config set <key> --help` in
-  the built image; `WEBUI_PASSWORD` with `Mask="true"`. `Overview`: open the WebUI to sign in and
+  the built image; `WEBUI_PASSWORD` and `API_KEY` with `Mask="true"` (the `API_KEY` description
+  says how to generate one: `openssl rand -hex 32`). `Overview`: open the WebUI to sign in and
   configure (or the Console button); attach other containers with
   `--network=container:protonvpn-cli` and publish their ports on this container; forwarded port
   in `/config/forwarded_port` and the WebUI.
-- README: what/why, quick start (`docker run` + compose), WebUI and sign-in, settings precedence
+- README: what/why, quick start (`docker run` + compose), WebUI and sign-in, API (link to `/api`
+  docs page and `openapi.json`, `API_KEY` with generation commands `openssl rand -hex 32` and the
+  python alternative, a qBittorrent port example using `/api/v1/port?format=text`), settings precedence
   (env locks the WebUI field), env table, kill-switch behaviour (attached containers: tunnel +
   LAN only; own processes: 443/53), requirements (cgroup v2, `xt_cgroup`, `wireguard` module),
   port forwarding, health, troubleshooting (`docker logs`, `/config/cache/VPN/logs/vpn-cli.log`),

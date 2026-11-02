@@ -210,6 +210,7 @@ Container variables (environment only, not editable in the WebUI):
 | `LAN_NETWORKS` | Comma-separated CIDRs reachable outside the tunnel (e.g. Unraid LAN for WebUIs of sharing containers) | empty |
 | `WEBUI_PORT` | WebUI listen port (not 8080: attached apps share this namespace's ports) | `8788` |
 | `WEBUI_PASSWORD` | WebUI password; empty leaves the WebUI open (warning logged, dismissible banner) | empty |
+| `API_KEY` | Bearer token for scripts using the API; empty disables token access (see Public API) | empty |
 | `TZ` | Log timestamps | `UTC` |
 | `DEBUG` | `true` adds `--verbose` to CLI calls and NM debug logging | `false` |
 | `RECONNECT_INTERVAL` | Supervisor status-check period, seconds | `30` |
@@ -309,6 +310,45 @@ All output goes to stdout with `[protonvpn]`, `[natpmp]`, `[firewall]`, `[webui]
   (blocks cross-site form posts).
 - Account takeover is out of reach by design: the WebUI never displays tokens, the password, or
   keyring contents.
+
+### Public API
+
+The WebUI's JSON API is public and versioned: the WebUI is one client of it, scripts and other
+containers are others. There is one API, not a WebUI API plus a public one.
+
+- Base path `/api/v1/`. Backwards-compatible changes only within v1 (new optional fields, new
+  endpoints); breaking changes go to `/api/v2/`.
+- Read endpoints (`GET`): `/api/v1/status` (signed_in, account, connected, server, location,
+  load, protocol, exit_ip, forwarded_port, last_error), `/api/v1/port` (`{"port": 41404}` or
+  `{"port": null}`; `?format=text` returns the bare number or an empty body, `text/plain`, for
+  scripts such as qBittorrent port updaters), `/api/v1/traffic` (totals and the 15-minute
+  samples; sample times are relative seconds), `/api/v1/settings` (each setting with value,
+  locked, source, kind, allowed values). The WebUI's aggregate `/api/v1/state` stays.
+- Write endpoints (`POST`, JSON body): connect, disconnect, settings, signin, signin/code,
+  signout, banner/dismiss, login, logout (the existing WebUI routes).
+- Errors: JSON `{"error": "<message>"}` with the HTTP status (400 validation, 401 auth, 403
+  missing header, 404, 409 locked setting, 429 rate limit, 500 internal).
+- Auth: a request is authorized when the WebUI is open (`WEBUI_PASSWORD` unset), **or** it
+  carries a valid WebUI session cookie, **or** it sends `Authorization: Bearer <API_KEY>`
+  (constant-time compare). `API_KEY` unset disables token access. Token-authenticated requests are
+  exempt from the `X-Requested-With` check (a cross-site page cannot attach the header-borne
+  token). `GET /api/v1/openapi.json` and the docs page need no auth.
+- `API_KEY` should be a random secret; README, docs page and the template field description show
+  how to generate one: `openssl rand -hex 32`, or without openssl
+  `docker run --rm python:3-alpine python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+  At start, an `API_KEY` shorter than 32 characters logs `[webui] WARNING: API_KEY is shorter
+  than 32 characters; generate one with: openssl rand -hex 32`.
+- Contract: a hand-written **OpenAPI 3.1** document shipped in the package and served at
+  `GET /api/v1/openapi.json`, with schemas for every request and response, the bearer and cookie
+  security schemes, and examples. It must validate against the OpenAPI 3.1 specification (CI runs
+  `openapi-spec-validator`), and a unit test fails when the server's route table and the document
+  disagree on paths or methods, or when a handler's actual response for a stubbed state lacks a
+  property the schema marks required.
+- Docs page at `/api` (same look as the WebUI): renders the OpenAPI document client-side into a
+  list of endpoints with method, path, description, parameters, request and response examples, a
+  `curl` example per endpoint (with `-H "Authorization: Bearer $API_KEY"`), the key-generation
+  instructions, and a link to the raw `openapi.json`. No Swagger UI or other external library.
+  The WebUI header links to it.
 
 ### Health
 
