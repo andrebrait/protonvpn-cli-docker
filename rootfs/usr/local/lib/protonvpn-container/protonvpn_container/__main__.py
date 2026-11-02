@@ -1,4 +1,4 @@
-"""Container service: supervisor (and, from the WebUI task on, the HTTP server)."""
+"""Container service: the supervisor and the WebUI."""
 
 import math
 import os
@@ -8,8 +8,11 @@ import threading
 import time
 
 from .config import SettingsStore
+from .signin import SigninFlow
 from .supervisor import Supervisor
+from .webui import make_server
 
+DEFAULT_WEBUI_PORT = 8788
 PID_DIR = "/run/protonvpn-container"
 # NetworkManager first: it needs the system bus until it has exited.
 DAEMON_PID_FILES = ("nm.pid", "dbus-session.pid", "dbus-system.pid")
@@ -53,6 +56,30 @@ def _gone(pid: int) -> bool:
     return False
 
 
+def webui_port(environ=os.environ) -> int:
+    raw = environ.get("WEBUI_PORT", "") or str(DEFAULT_WEBUI_PORT)
+    try:
+        port = int(raw)
+    except ValueError:
+        port = 0
+    if not 1 <= port <= 65535:
+        print(f"[webui] WEBUI_PORT must be a port from 1 to 65535 (got {raw!r}); using {DEFAULT_WEBUI_PORT}", flush=True)
+        return DEFAULT_WEBUI_PORT
+    return port
+
+
+def start_webui(supervisor, store, environ=os.environ):
+    """Serve the WebUI from a thread; None when the port cannot be bound (logged: VPN supervision goes on)."""
+    port = webui_port(environ)
+    try:
+        server = make_server(port, supervisor, store, SigninFlow(), environ.get("WEBUI_PASSWORD", ""))
+    except OSError as exc:
+        print(f"[webui] cannot listen on port {port}: {exc}; the WebUI is disabled", flush=True)
+        return None
+    threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1}, name="webui", daemon=True).start()
+    return server
+
+
 def reconnect_interval(environ=os.environ) -> float:
     raw = environ.get("RECONNECT_INTERVAL", "") or "30"
     try:
@@ -65,23 +92,28 @@ def reconnect_interval(environ=os.environ) -> float:
     return value
 
 
-def shutdown(supervisor, pid_dir: str = PID_DIR, budget: float = SHUTDOWN_BUDGET) -> None:
-    """Disconnect, then stop the daemons; everything finishes within `budget` seconds."""
+def shutdown(supervisor, pid_dir: str = PID_DIR, budget: float = SHUTDOWN_BUDGET, webui=None) -> None:
+    """Stop the WebUI, disconnect, then stop the daemons; everything finishes within `budget` seconds."""
     end = time.monotonic() + budget
+    if webui is not None:
+        webui.shutdown()  # returns within a poll interval; requests in flight are daemon threads
+        webui.server_close()
     supervisor.stop(timeout=budget * SUPERVISOR_SHARE)
     for left, name in zip(range(len(DAEMON_PID_FILES), 0, -1), DAEMON_PID_FILES):
         terminate(os.path.join(pid_dir, name), timeout=(end - time.monotonic()) / left)
 
 
 def main() -> None:
-    supervisor = Supervisor(SettingsStore(), interval=reconnect_interval())
+    store = SettingsStore()
+    supervisor = Supervisor(store, interval=reconnect_interval())
     stop_requested = threading.Event()
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: stop_requested.set())
+    webui = start_webui(supervisor, store)
     supervisor.start()
     stop_requested.wait()
     print("[init] stopping", flush=True)
-    shutdown(supervisor)
+    shutdown(supervisor, webui=webui)
     print("[init] stopped", flush=True)
     sys.exit(0)
 

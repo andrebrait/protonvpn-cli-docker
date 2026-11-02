@@ -38,6 +38,18 @@ SETTINGS = (
     Setting("ANONYMOUS_CRASH_REPORTS", "anonymous-crash-reports", "choice"),
 )
 
+ON_OFF = ("off", "on")
+# Allowed values of the `choice` settings, from `protonvpn config set <key> --help` (CLI 1.0.5).
+CHOICES = {
+    "NETSHIELD": ("off", "malware-only", "malware-ads-trackers"),
+    "PORT_FORWARDING": ON_OFF,
+    "VPN_ACCELERATOR": ON_OFF,
+    "MODERATE_NAT": ON_OFF,
+    "IPV6": ON_OFF,
+    "KILL_SWITCH": ("off", "standard"),
+    "ANONYMOUS_CRASH_REPORTS": ON_OFF,
+}
+
 FLAG_SETTINGS = (("P2P", "--p2p"), ("SECURE_CORE", "--securecore"), ("TOR", "--tor"))
 
 

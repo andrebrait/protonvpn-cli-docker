@@ -157,6 +157,30 @@ graceful_stop() {
   docker logs "$1" 2>&1 | grep -qF '[init] stopped'
 }
 
+# Task 5 helpers: WebUI.
+# webui_get <container> <path>: prints the status on the first line, then the body; a 4xx still reports its status.
+webui_get() {
+  docker exec "$1" python3 -c '
+import sys, urllib.error, urllib.request
+try:
+    resp = urllib.request.urlopen("http://127.0.0.1:8788" + sys.argv[1], timeout=5)
+except urllib.error.HTTPError as err:
+    resp = err
+print(resp.status)
+print(resp.read().decode())
+' "$2"
+}
+# webui_says <container> <path> <grep pattern>
+webui_says() { webui_get "$1" "$2" | grep -q -e "$3"; }
+webui_state_signed_out_with_banner() {
+  out=$(webui_get "$1" /api/state) || return 1
+  case $out in "200"*'"signed_in": false'*'"banner": true'*) return 0 ;; esac
+  return 1
+}
+WEBUI_WARNING='[webui] WARNING: WEBUI_PASSWORD is not set; the WebUI is open to anyone who can reach it'
+logged() { docker logs "$1" 2>&1 | grep -qF "$2"; }
+not_logged() { ! logged "$@"; }
+
 C=t1-smoke
 mkdir -p "$TMP/Proton"
 echo '{}' > "$TMP/Proton/stale.json"
@@ -200,13 +224,11 @@ attach t3-lan-att t3-lan || { echo "FAIL attach"; exit 1; }
 assert "lan allowed" reachable_from t3-lan-att "$GW" 9
 assert "lan blocked without LAN_NETWORKS" blocked_from t3-att "$GW" 9
 
-# WebUI port: a listener in $C (own cgroup) must complete the handshake with an outside peer.
+# WebUI port: the WebUI (a listener in $C's own cgroup) must complete the handshake with an outside peer.
 CIP=$(docker inspect -f '{{.NetworkSettings.Networks.bridge.IPAddress}}' "$C")
 CONTAINERS="$CONTAINERS t3-peer"
 docker run -d --name t3-peer --entrypoint sleep "$IMAGE" infinity >/dev/null
-docker exec -d "$C" python3 -m http.server 8788 --bind 0.0.0.0
-sleep 2
-assert "webui port open inbound" tcp_from t3-peer "$CIP" 8788
+assert "webui port open inbound" eventually 20 tcp_from t3-peer "$CIP" 8788
 assert "other inbound port blocked" blocked_from t3-peer "$CIP" 8789
 
 # IPv6 LAN: neighbour discovery must work for LAN_NETWORKS on an IPv6 network.
@@ -232,6 +254,19 @@ assert "pid file: NetworkManager" pid_file_is t4-main nm.pid NetworkManager
 assert "pid file: system bus" pid_file_is t4-main dbus-system.pid dbus-daemon
 assert "pid file: session bus" pid_file_is t4-main dbus-session.pid dbus-daemon
 assert "graceful stop" graceful_stop t4-main
+
+# Task 5: WebUI, open (default) and with a password.
+run_container t5-open || { echo "FAIL webui boot"; exit 1; }
+assert "webui open: state is signed out with the banner" eventually 20 webui_state_signed_out_with_banner t5-open
+assert "webui open: warning logged" logged t5-open "$WEBUI_WARNING"
+assert "webui open: page served" webui_says t5-open / '<title>Proton VPN</title>'
+assert "webui open: script served" webui_says t5-open /static/app.js '^200$'
+assert "webui open: traversal refused" webui_says t5-open /static/../webui.py '^404$'
+run_container t5-pw -e WEBUI_PASSWORD=x || { echo "FAIL webui password boot"; exit 1; }
+assert "webui password: state is 401" eventually 20 webui_says t5-pw /api/state '^401$'
+assert "webui password: page still loads" webui_says t5-pw / '<title>Proton VPN</title>'
+assert "webui password: no open warning" not_logged t5-pw "$WEBUI_WARNING"
+assert "webui stops within the shutdown budget" graceful_stop t5-open
 
 [ "$FAILED" -eq 0 ] && echo "all ok"
 exit "$FAILED"

@@ -268,6 +268,17 @@ class ConnectTest(SupervisorCase):
         self.assertEqual(len(self.cli.argvs("connect")), 2)
         self.assertTrue(self.sup.snapshot()["connected"])
 
+    def test_snapshot_reports_a_user_disconnect_until_connect_is_requested(self):
+        self.make()
+        self.tick()
+        self.assertIs(self.sup.snapshot()["user_disconnected"], False)
+        self.sup.request_disconnect()
+        self.assertIs(self.sup.snapshot()["user_disconnected"], True)
+        self.tick(1)
+        self.assertIs(self.sup.snapshot()["user_disconnected"], True)
+        self.sup.request_connect()
+        self.assertIs(self.sup.snapshot()["user_disconnected"], False)
+
     def test_console_connect_after_webui_disconnect_is_left_alone(self):
         self.make()
         self.tick()

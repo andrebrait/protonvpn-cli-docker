@@ -1,12 +1,23 @@
 import io
+import json
 import os
+import socket
 import subprocess
 import tempfile
 import time
 import unittest
+import urllib.request
 from contextlib import redirect_stdout
 
-from protonvpn_container.__main__ import DAEMON_PID_FILES, reconnect_interval, shutdown, terminate
+from protonvpn_container.__main__ import (
+    DAEMON_PID_FILES,
+    reconnect_interval,
+    shutdown,
+    start_webui,
+    terminate,
+    webui_port,
+)
+from protonvpn_container.config import SettingsStore
 
 
 class TerminateTest(unittest.TestCase):
@@ -111,6 +122,83 @@ class ShutdownTest(unittest.TestCase):
 
         shutdown(QuickSupervisor(), self.dir, budget=9.0)  # no pid files: nothing to stop
         self.assertEqual(given, [6.0])
+
+    def test_webui_is_stopped_before_the_supervisor(self):
+        events = []
+
+        class Supervisor:
+            def stop(self, timeout):
+                events.append("supervisor")
+
+        class Webui:
+            def shutdown(self):
+                events.append("webui shutdown")
+
+            def server_close(self):
+                events.append("webui close")
+
+        shutdown(Supervisor(), self.dir, budget=9.0, webui=Webui())
+        self.assertEqual(events, ["webui shutdown", "webui close", "supervisor"])
+
+
+class WebuiPortTest(unittest.TestCase):
+    def port(self, environ):
+        out = io.StringIO()
+        with redirect_stdout(out):
+            return webui_port(environ), out.getvalue()
+
+    def test_default_and_valid_values(self):
+        self.assertEqual(self.port({}), (8788, ""))
+        self.assertEqual(self.port({"WEBUI_PORT": ""}), (8788, ""))
+        self.assertEqual(self.port({"WEBUI_PORT": "9000"}), (9000, ""))
+        self.assertEqual(self.port({"WEBUI_PORT": "65535"}), (65535, ""))
+
+    def test_invalid_values_fall_back_with_a_message(self):
+        for raw in ("abc", "0", "65536", "-1", "80.5", " "):
+            port, out = self.port({"WEBUI_PORT": raw})
+            self.assertEqual(port, 8788, raw)
+            self.assertIn("[webui] WEBUI_PORT", out, raw)
+
+
+class StubSupervisor:
+    def snapshot(self):
+        return {"signed_in": False}
+
+
+class StartWebuiTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.store = SettingsStore(os.path.join(tmp.name, "settings.json"), environ={})
+
+    def free_port(self):
+        with socket.socket() as s:
+            s.bind(("0.0.0.0", 0))
+            return s.getsockname()[1]
+
+    def test_serves_the_api_on_the_configured_port_and_stops(self):
+        port = self.free_port()
+        out = io.StringIO()
+        with redirect_stdout(out):
+            server = start_webui(StubSupervisor(), self.store, {"WEBUI_PORT": str(port), "WEBUI_PASSWORD": ""})
+            self.assertIsNotNone(server)
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=5) as resp:
+                self.assertTrue(json.load(resp)["banner"])
+            server.shutdown()
+            server.server_close()
+        self.assertIn("[webui] WARNING: WEBUI_PASSWORD is not set", out.getvalue())
+
+    def test_a_busy_port_disables_the_webui_instead_of_crashing(self):
+        with socket.socket() as blocker:
+            blocker.bind(("0.0.0.0", 0))
+            blocker.listen()
+            out = io.StringIO()
+            with redirect_stdout(out):
+                server = start_webui(
+                    StubSupervisor(), self.store, {"WEBUI_PORT": str(blocker.getsockname()[1])}
+                )
+        self.assertIsNone(server)
+        self.assertIn("[webui] cannot listen on port", out.getvalue())
 
 
 if __name__ == "__main__":

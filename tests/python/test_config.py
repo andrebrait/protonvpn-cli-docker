@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 
-from protonvpn_container.config import SettingsStore, connect_args, is_true, settings_pairs
+from protonvpn_container.config import CHOICES, SETTINGS, SettingsStore, connect_args, is_true, settings_pairs
 
 
 class SettingsStoreTest(unittest.TestCase):
@@ -118,6 +118,18 @@ class SettingsStoreTest(unittest.TestCase):
                 ("anonymous-crash-reports", ["off"]),
             ],
         )
+
+    def test_choices_cover_exactly_the_choice_settings(self):
+        self.assertEqual({s.env for s in SETTINGS if s.kind == "choice"}, set(CHOICES))
+        for env, values in CHOICES.items():
+            self.assertEqual(len(values), len(set(values)), env)
+            self.assertTrue(all(v and v == v.strip() and " " not in v for v in values), env)
+
+    def test_choices_match_the_cli_help(self):  # `protonvpn config set <key> --help`, CLI 1.0.5
+        self.assertEqual(CHOICES["NETSHIELD"], ("off", "malware-only", "malware-ads-trackers"))
+        self.assertEqual(CHOICES["KILL_SWITCH"], ("off", "standard"))
+        for env in ("PORT_FORWARDING", "VPN_ACCELERATOR", "MODERATE_NAT", "IPV6", "ANONYMOUS_CRASH_REPORTS"):
+            self.assertEqual(CHOICES[env], ("off", "on"), env)
 
     def test_is_true_values(self):
         for value in ("true", "1", "yes", "on", "TRUE", "Yes"):

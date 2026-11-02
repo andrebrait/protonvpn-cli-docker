@@ -1,10 +1,39 @@
 #!/bin/sh
-# Test double for the protonvpn CLI: prints its args one per line, writes to stderr, then
-# optionally prints $FAKE_PRINT, reads one line from stdin ($FAKE_READ), sleeps ($FAKE_SLEEP)
-# and exits with $FAKE_RC.
+# Test double for the protonvpn CLI. Two modes:
+#
+# $FAKE_SIGNIN=ok|2fa|bad with `signin <user> --totp`: prompts like the real CLI (`Password: `, and
+# `2FA Token: ` for 2fa, which accepts 123456 only), then prints its verdict; `bad` echoes the
+# password back on purpose so tests can check the secret is redacted. $FAKE_PIDFILE gets its PID.
+#
+# Otherwise: prints its args one per line, writes to stderr, then optionally prints $FAKE_PRINT,
+# reads one line from stdin ($FAKE_READ), sleeps ($FAKE_SLEEP) and exits with $FAKE_RC.
+if [ -n "$FAKE_SIGNIN" ] && [ "$1" = signin ]; then
+  if [ -n "$FAKE_PIDFILE" ]; then echo $$ > "$FAKE_PIDFILE"; fi
+  printf 'Password: '
+  read -r password
+  echo
+  case "$FAKE_SIGNIN" in
+    bad)
+      echo "Invalid credentials for $2 (password: $password)"
+      exit 1
+      ;;
+    2fa)
+      printf '2FA Token: '
+      read -r code
+      echo
+      if [ "$code" != 123456 ]; then
+        echo "Invalid 2FA code: $code"
+        exit 1
+      fi
+      ;;
+  esac
+  echo "Signed in as $2"
+  exit 0
+fi
 printf '%s\n' "$@"
 echo "stderr line" >&2
 if [ -n "$FAKE_PRINT" ]; then echo "$FAKE_PRINT"; fi
+# shellcheck disable=SC2034  # the line is only drained
 if [ -n "$FAKE_READ" ]; then read -r x || echo "eof"; fi
 if [ -n "$FAKE_SLEEP" ]; then exec sleep "$FAKE_SLEEP"; fi
 exit "${FAKE_RC:-0}"

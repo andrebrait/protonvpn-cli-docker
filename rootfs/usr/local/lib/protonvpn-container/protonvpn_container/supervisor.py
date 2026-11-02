@@ -127,6 +127,7 @@ class Supervisor:
                 "traffic": [list(sample) for sample in self._traffic],
                 "last_error": self._last_error,
                 "settings_errors": dict(self._settings_errors),
+                "user_disconnected": self._user_disconnected,
             }
 
     def request_connect(self) -> None:
