@@ -12,7 +12,7 @@ Every build installs exactly one reviewed Proton release: **CLI 1.1.0** with **A
 
 ## Requirements and compatibility
 
-- Linux Docker host with cgroup v2, the `xt_cgroup` iptables match, WireGuard kernel support (`wireguard`), and `/dev/net/tun`.
+- Linux Docker host with cgroup v2, the `xt_cgroup` iptables match, WireGuard kernel support (`wireguard`), `/dev/net/tun`, Linux pidfd support and readable procfs for identity-safe daemon shutdown.
 - The VPN container needs `NET_ADMIN`, the TUN device, and `net.ipv4.conf.all.src_valid_mark=1`. Do not use privileged mode or host networking.
 - A Proton VPN account; some features, including port forwarding, depend on your plan and selected server.
 
@@ -22,7 +22,7 @@ Measured Unraid compatibility is **Unraid 7.3.4, kernel 6.18.58, Docker 29.8.2, 
 
 ### Docker run
 
-Choose a strong WebUI password, and change the LAN CIDR to your own network. Leave `LAN_NETWORKS` empty if no direct LAN access is needed.
+Choose a strong WebUI password. Replace `192.168.1.10` with the Docker host's trusted LAN address and change the LAN CIDR to your own network. Leave `LAN_NETWORKS` empty if no direct LAN access is needed. Binding a LAN address does not replace source filtering or authentication.
 
 ```bash
 export WEBUI_PASSWORD='replace-this-with-a-strong-password'
@@ -31,7 +31,7 @@ docker run -d --name protonvpn-cli \
   --cap-add=NET_ADMIN \
   --device=/dev/net/tun \
   --sysctl net.ipv4.conf.all.src_valid_mark=1 \
-  -p 8788:8788 \
+  -p 192.168.1.10:8788:8788 \
   -v protonvpn-config:/config \
   -e WEBUI_PASSWORD \
   -e LAN_NETWORKS=192.168.1.0/24 \
@@ -39,6 +39,8 @@ docker run -d --name protonvpn-cli \
 ```
 
 Open `http://YOUR_DOCKER_HOST:8788/`, unlock the WebUI, and sign in to Proton. Until the VPN is connected and the traffic check passes, the container remains running but unhealthy. Keep the published port on a trusted network, and set `WEBUI_ALLOWED_NETWORKS` to limit which clients may connect; the built-in server uses HTTP, not TLS. Use a trusted HTTPS reverse proxy for remote access, rather than exposing it directly to the internet.
+
+For HTTPS access, let the reverse proxy terminate TLS, redirect plain HTTP to HTTPS, and add `Secure` to the `session` cookie. Restrict direct access to the backend HTTP port to trusted clients or the proxy with `WEBUI_ALLOWED_NETWORKS`; do not trust forwarded headers for access control. The backend intentionally omits `Secure` because direct LAN HTTP is supported. For example, an Nginx HTTPS proxy can set [`proxy_cookie_flags session secure;`](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_cookie_flags) in its proxy location. Use the equivalent response-cookie option on other proxies, and enable HSTS on a dedicated HTTPS hostname once HTTPS-only access works.
 
 To build locally instead of pulling a published image:
 
@@ -48,7 +50,7 @@ docker build -t ghcr.io/andrebrait/protonvpn-cli-docker:latest .
 
 ### Docker Compose with an attached application
 
-Save this as `compose.yaml`. Replace the LAN CIDR, set `WEBUI_PASSWORD` as above, and run `docker compose up -d`. qBittorrent starts only after the VPN reports healthy. On first use, sign in to Proton through port 8788 while Compose waits for that health check; if the dependency times out, run `docker compose up -d` again after connecting.
+Save this as `compose.yaml`. Replace `192.168.1.10` with the Docker host's trusted LAN address, replace the LAN CIDR, set `WEBUI_PASSWORD` as above, and run `docker compose up -d`. qBittorrent starts only after the VPN reports healthy. On first use, sign in to Proton through port 8788 while Compose waits for that health check; if the dependency times out, run `docker compose up -d` again after connecting.
 
 ```yaml
 services:
@@ -63,8 +65,8 @@ services:
     sysctls:
       net.ipv4.conf.all.src_valid_mark: "1"
     ports:
-      - "8788:8788"
-      - "8080:8080" # qBittorrent WebUI, published on the VPN container
+      - "192.168.1.10:8788:8788"
+      - "192.168.1.10:8080:8080" # qBittorrent WebUI, published on the VPN container
     environment:
       WEBUI_PASSWORD: ${WEBUI_PASSWORD:?Set WEBUI_PASSWORD first}
       LAN_NETWORKS: 192.168.1.0/24
@@ -176,6 +178,8 @@ The example allows loopback and a private `10.0.0.0/8` network. Use your real LA
 
 Use `--network=container:protonvpn-cli` with Docker run, or `network_mode: service:protonvpn-cli` with Compose. Publish attached applications' ports **on the VPN container**, not on the attached container. Allow the trusted LAN CIDR in `LAN_NETWORKS` for direct access to those application ports. All services in the namespace must use different listen ports.
 
+Startup installs deny-only IPv4 and IPv6 filters before loading any allow rules. A later filter or configuration failure exits with those restrictions retained, including when an attached container keeps the namespace alive. If a baseline filter cannot be installed, startup disables non-loopback interfaces and exits; recreate the VPN and attached containers to obtain a fresh namespace before retrying. If interface shutdown also fails, the log explicitly says containment cannot be guaranteed. Do not attach applications to an unsuccessful startup.
+
 Direct WebUI/LAN routes are captured from Docker's `eth0` routes at startup. Restart after changing those routes or attaching a different Docker network. Proton's `10.2.0.1` DNS/forwarding gateway stays inside the tunnel even when a broad LAN range such as `10.0.0.0/8` is allowed.
 
 Drop `NET_RAW` from attached containers (`--cap-drop=NET_RAW`), **never grant them `NET_ADMIN`**, and start them only after the VPN container reports healthy. Do not start attached applications alongside an uninitialized VPN namespace: firewall setup happens early in startup, but not atomically with namespace creation.
@@ -200,7 +204,9 @@ The WebUI uses readable labels such as **Default**, **On**, and **Off**. CLI/API
 
 ## Port forwarding
 
-Enable port forwarding in the WebUI (or set `PORT_FORWARDING=on`) and select an eligible P2P server/account. The supervisor renews NAT-PMP leases about every 45 seconds (each lease lasts 60) and exposes the current port in the WebUI, `/config/forwarded_port`, and the API. A port is published only when the gateway maps the same number for both UDP and TCP. The file is empty when no valid port is available: a failed or mismatched refresh, a lease that runs out unrenewed, a disconnect, a sign-out, a reconnect for a new server, or a failed state check all clear it at once and log why. A lease failure alone does not make the container unhealthy.
+Enable port forwarding in the WebUI (or set `PORT_FORWARDING=on`) and select an eligible P2P server/account. The supervisor requests 60-second NAT-PMP leases about every 45 seconds and exposes the current port in the WebUI, `/config/forwarded_port`, and the API. A port is published only when both UDP and TCP map the same number with a positive granted lifetime. Its deadline uses the shorter granted lifetime, capped at 60 seconds from the first request. A shorter grant can expire before the next scheduled renewal. A failed or mismatched refresh, expired lease, disconnect, sign-out, reconnect, or failed state check withdraws the port; a lease failure alone does not make the container unhealthy.
+
+The forwarded-port file is empty when no mapping is valid. If clearing it fails, the supervisor tries to remove it and retries later. Fully read-only or failed storage can prevent both operations and leave a stale number on disk: treat `/api/v1/port` as authoritative during storage errors and repair `/config` before trusting the file again.
 
 Configure your torrent client's listening port to the reported value, and update it if the lease changes. The project does **not** configure qBittorrent automatically. VPN-forwarded traffic reaches the shared namespace through the tunnel; publishing a Docker host port is not a substitute for the Proton forwarded port.
 
@@ -256,6 +262,8 @@ Apply the printed port in qBittorrent's connection settings. This example reads 
 
 WebUI login lockout is per client IP: five failed attempts in 60 seconds lock that IP out for 60 seconds. Behind Docker Desktop, rootless Docker, or a reverse proxy, clients can share one observed IP; one person's failures can lock everyone out for that minute.
 
+The WebUI admits at most 32 simultaneous request handlers. Excess TCP connections are closed without an HTTP response; capacity returns when clients finish or the 30-second socket timeout expires. This contains resource use, not request rate: use the network allowlist and a rate-limiting HTTPS proxy when clients are untrusted.
+
 ## Health and troubleshooting
 
 Docker runs `healthcheck.sh` every 30 seconds, with a 10-second timeout, 60-second startup grace, and three retries. The container is healthy only when both of these hold:
@@ -264,6 +272,8 @@ Docker runs `healthcheck.sh` every 30 seconds, with a 10-second timeout, 60-seco
 2. A traffic check passed within the last 60 seconds: a WireGuard-bound IPv4 HTTPS request to `https://api.ipify.org` returned a public IPv4 address.
 
 The check runs every 30 seconds in a worker thread inside the supervisor. It uses `curl --interface if!proton0 --ipv4` with no proxy, so it fails rather than falling back to the host's route. It sends no credentials and verifies IPv4 HTTPS only; IPv6 tunnel traffic is not separately checked. A forwarded port does not affect health.
+
+A failed CLI state check resets traffic-chart continuity before the next connected reading, even if it recovers on the same tunnel. Samples are not combined across a period when the connection cannot be verified.
 
 The probe depends on a third-party service. If `api.ipify.org` is down, blocked, or answers with something other than a public IPv4 address, the check fails and the container reports unhealthy even though the tunnel works. A failed check never disconnects or reconnects the VPN, never changes the CLI's `connected` state, never clears the forwarded port, and never overwrites the CLI's last error. Automatic reconnection still follows only the CLI's own state: the supervisor checks every `RECONNECT_INTERVAL` seconds and retries failed connections with backoff up to 300 seconds. A WebUI disconnect pauses automatic reconnection until you connect again or restart the container.
 

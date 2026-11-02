@@ -147,9 +147,27 @@ firewall_routes() {
   done
 }
 
-# firewall_init: load both families before anything else touches the network; exit on any failure.
+# firewall_init: deny both families before validation or allow rules; exit on any failure.
 # iptables-restore without --noflush replaces only the filter table, so Docker's nat rules survive.
 firewall_init() {
+  # A failed atomic restore leaves the old table intact, including an initially unfiltered IPv6 table.
+  for cmd in iptables-restore ip6tables-restore; do
+    out=$(printf '%s\n' '*filter' ':INPUT DROP [0:0]' ':OUTPUT DROP [0:0]' ':FORWARD DROP [0:0]' COMMIT | "$cmd" 2>&1) || {
+      fw_log "$cmd deny baseline failed: $out"
+      # Without a working filter, stop external traffic in namespaces retained by attached apps.
+      links_failed=0
+      for link in /sys/class/net/*; do
+        [ "${link##*/}" = lo ] && continue
+        ip link set dev "${link##*/}" down || links_failed=1
+      done
+      if [ "$links_failed" -eq 0 ]; then
+        fw_log "non-loopback interfaces disabled; recreate the shared network namespace before retrying"
+      else
+        fw_log "WARNING: interface shutdown failed; cannot guarantee network containment"
+      fi
+      exit 1
+    }
+  done
   # Share the listener's parser: xtables/iproute accept hex and octal ports that Python would interpret differently.
   WEBUI_PORT=$(python3 -c '
 from protonvpn_container.__main__ import webui_port

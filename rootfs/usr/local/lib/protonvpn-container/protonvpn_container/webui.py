@@ -419,9 +419,33 @@ ROUTES = (
 ROUTE_INDEX = {(route.method, route.path): route for route in ROUTES}
 
 
+class BoundedHTTPServer(ThreadingHTTPServer):
+    """Reject excess connections before allocating a request thread."""
+
+    def __init__(self, server_address, handler):
+        self._capacity = threading.BoundedSemaphore(32)
+        super().__init__(server_address, handler)
+
+    def process_request(self, request, client_address):
+        if not self._capacity.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._capacity.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._capacity.release()
+
+
 def make_server(port: int, supervisor, store, signin_flow, password: str, api_key: str = "") -> ThreadingHTTPServer:
     """Bind the WebUI on all IPv4 interfaces; the caller runs `serve_forever()`."""
-    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    server = BoundedHTTPServer(("0.0.0.0", port), Handler)
     server.ui = Ui(supervisor, store, signin_flow, password, api_key)
     if not password:
         print(OPEN_WARNING, flush=True)

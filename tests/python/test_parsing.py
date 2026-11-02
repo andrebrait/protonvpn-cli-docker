@@ -4,7 +4,7 @@ from protonvpn_container.parsing import (
     Status,
     parse_account,
     parse_exit_ip,
-    parse_natpmp_port,
+    parse_natpmp_mapping,
     parse_status,
     parse_wg_transfer,
 )
@@ -38,20 +38,28 @@ class ParseExitIpTest(unittest.TestCase):
         self.assertEqual(parse_exit_ip("Connecting...\n"), "")
 
 
-class ParseNatpmpPortTest(unittest.TestCase):
+class ParseNatpmpMappingTest(unittest.TestCase):
     def test_mapped(self):
         out = "Mapped public port 41404 protocol TCP to local port 0 lifetime 60\n"
-        self.assertEqual(parse_natpmp_port(out), 41404)
+        self.assertEqual(parse_natpmp_mapping(out), (41404, 60))
 
     def test_failure(self):
         out = "readnatpmpresponseorretry() failed : the gateway does not support nat-pmp\n"
-        self.assertIsNone(parse_natpmp_port(out))
+        self.assertIsNone(parse_natpmp_mapping(out))
 
     def test_only_valid_port_numbers(self):
-        for number, expected in (("1", 1), ("65535", 65535), ("0", None), ("65536", None), ("99999999999", None)):
+        for number, expected in (("1", (1, 60)), ("65535", (65535, 60)), ("0", None), ("65536", None), ("99999999999", None)):
             with self.subTest(number=number):
                 out = f"Mapped public port {number} protocol TCP to local port 0 lifetime 60\n"
-                self.assertEqual(parse_natpmp_port(out), expected)
+                self.assertEqual(parse_natpmp_mapping(out), expected)
+
+    def test_requires_a_positive_bounded_granted_lifetime(self):
+        for lifetime, expected in (("1", (41404, 1)), ("4294967295", (41404, 4294967295)),
+                                   ("0", None), ("-1", None), ("4294967296", None), ("9" * 5000, None)):
+            with self.subTest(lifetime=lifetime[:20]):
+                out = f"Mapped public port 41404 protocol UDP to local port 0 lifetime {lifetime}\n"
+                self.assertEqual(parse_natpmp_mapping(out), expected)
+        self.assertIsNone(parse_natpmp_mapping("Mapped public port 41404 protocol UDP to local port 0\n"))
 
 
 class ParseWgTransferTest(unittest.TestCase):

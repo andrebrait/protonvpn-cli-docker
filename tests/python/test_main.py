@@ -3,11 +3,13 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
 import urllib.request
 from contextlib import redirect_stdout
+from unittest.mock import patch
 
 from protonvpn_container.__main__ import (
     DAEMON_PID_FILES,
@@ -18,6 +20,28 @@ from protonvpn_container.__main__ import (
     webui_port,
 )
 from protonvpn_container.config import SettingsStore
+
+
+def named_child(test, name, ignore_sigterm=False):
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import ctypes, signal, sys; "
+            "assert ctypes.CDLL(None).prctl(15, sys.argv[1].encode(), 0, 0, 0) == 0; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN if sys.argv[2] == '1' else signal.SIG_DFL); "
+            "print('ready', flush=True); signal.pause()",
+            name,
+            str(int(ignore_sigterm)),
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    test.addCleanup(child.stdout.close)
+    test.addCleanup(child.wait)
+    test.addCleanup(child.kill)
+    test.assertEqual(child.stdout.readline(), "ready\n")
+    return child
 
 
 class TerminateTest(unittest.TestCase):
@@ -31,37 +55,59 @@ class TerminateTest(unittest.TestCase):
             f.write(f"{pid}\n")
 
     def test_stops_and_reaps_a_child(self):
-        child = subprocess.Popen(["sleep", "30"])
-        self.addCleanup(child.kill)
+        child = named_child(self, "dbus-daemon")
         self.write_pid(child.pid)
         start = time.monotonic()
-        terminate(self.pid_file)
+        terminate(self.pid_file, "dbus-daemon")
         self.assertLess(time.monotonic() - start, 2)
         with self.assertRaises(ProcessLookupError):  # reaped, not a zombie
             os.kill(child.pid, 0)
 
     def test_kills_a_child_that_ignores_sigterm(self):
-        child = subprocess.Popen(["sh", "-c", "trap '' TERM; while :; do sleep 1; done"])
-        self.addCleanup(child.kill)
-        time.sleep(0.3)  # let the trap install
+        child = named_child(self, "dbus-daemon", ignore_sigterm=True)
         self.write_pid(child.pid)
-        terminate(self.pid_file, timeout=0.5)
+        terminate(self.pid_file, "dbus-daemon", timeout=0.5)
         with self.assertRaises(ProcessLookupError):
             os.kill(child.pid, 0)
 
+    def test_stale_pid_file_does_not_signal_an_unrelated_live_child(self):
+        child = named_child(self, "unrelated")
+        self.write_pid(child.pid)
+        terminate(self.pid_file, "dbus-daemon", timeout=0.1)
+        self.assertIsNone(child.poll())
+
+    def test_exited_pidfd_cannot_signal_a_live_numeric_pid_replacement(self):
+        retired = named_child(self, "dbus-daemon")
+        replacement = named_child(self, "dbus-daemon")
+        self.write_pid(replacement.pid)
+        pidfd_open = os.pidfd_open
+
+        def retired_target(pid, flags=0):
+            self.assertEqual(pid, replacement.pid)
+            fd = pidfd_open(retired.pid, flags)
+            retired.kill()
+            retired.wait(timeout=2)
+            return fd
+
+        # Inject PID reuse at acquisition: procfs sees a live replacement, but the
+        # real pidfd still refers to the exited original process.
+        with patch("protonvpn_container.__main__.os.pidfd_open", side_effect=retired_target):
+            terminate(self.pid_file, "dbus-daemon", timeout=0.1)
+        self.assertIsNone(replacement.poll())
+
     def test_missing_dead_or_bogus_pid_is_ignored(self):
-        terminate(self.pid_file)
+        terminate(self.pid_file, "dbus-daemon")
         self.write_pid("not-a-pid")
-        terminate(self.pid_file)
+        terminate(self.pid_file, "dbus-daemon")
         dead = subprocess.Popen(["true"])
         dead.wait()
         self.write_pid(dead.pid)
-        terminate(self.pid_file)
+        terminate(self.pid_file, "dbus-daemon")
 
     def test_refuses_pid_1_and_below(self):
         for pid in (0, 1, -1):
             self.write_pid(pid)
-            terminate(self.pid_file)  # would kill the test run (or everything) if it signalled
+            terminate(self.pid_file, "dbus-daemon")  # would kill the test run (or everything) if signalled
 
 
 class ReconnectIntervalTest(unittest.TestCase):
@@ -91,13 +137,11 @@ class ShutdownTest(unittest.TestCase):
 
     def stubborn_daemons(self):
         children = []
-        for name in DAEMON_PID_FILES:
-            child = subprocess.Popen(["sh", "-c", "trap '' TERM; while :; do sleep 1; done"])
-            self.addCleanup(child.kill)
+        for name, command in DAEMON_PID_FILES.items():
+            child = named_child(self, command, ignore_sigterm=True)
             children.append(child)
             with open(os.path.join(self.dir, name), "w") as f:
                 f.write(f"{child.pid}\n")
-        time.sleep(0.3)  # let the traps install
         return children
 
     def test_whole_shutdown_fits_the_budget_when_everything_hangs(self):
@@ -112,6 +156,20 @@ class ShutdownTest(unittest.TestCase):
         for child in children:  # SIGKILLed and reaped
             with self.assertRaises(ProcessLookupError):
                 os.kill(child.pid, 0)
+
+    def test_stale_daemon_pid_files_leave_unrelated_children_running(self):
+        class QuickSupervisor:
+            def stop(self, timeout):
+                pass
+
+        children = []
+        for name in DAEMON_PID_FILES:
+            child = named_child(self, "unrelated")
+            children.append(child)
+            with open(os.path.join(self.dir, name), "w") as f:
+                f.write(f"{child.pid}\n")
+        shutdown(QuickSupervisor(), self.dir, budget=0.5)
+        self.assertTrue(all(child.poll() is None for child in children))
 
     def test_supervisor_gets_two_thirds_and_daemons_the_rest(self):
         given = []

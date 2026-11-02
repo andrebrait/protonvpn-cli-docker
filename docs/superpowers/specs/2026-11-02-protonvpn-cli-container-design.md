@@ -262,6 +262,10 @@ rules apply to them too.
     (path `/system.slice/docker-<id>.scope`).
   - cgroup v2 is required. If `/proc/self/cgroup` has no `0::` line, or the rule cannot be
     installed, the container logs the reason and exits with the firewall still closed.
+  - Deny-only filter baselines for both families precede configuration validation and allow rules.
+    If baseline installation is unavailable, disable non-loopback interfaces and exit; shared
+    namespace users must be recreated before retrying. Failure of that fallback explicitly logs
+    that containment cannot be guaranteed rather than claiming a successful kill switch.
   - Verified 2026-11-02 on Docker 29.9 / kernel 6.12: the owning container reached the internet
     with `OUTPUT DROP` plus `-m cgroup --path / -j ACCEPT`, an attached container was blocked.
   - `docker exec` sessions join the container's cgroup, so console commands get the same
@@ -303,18 +307,23 @@ A thread in the Python service, every `RECONNECT_INTERVAL` seconds:
    reconnecting until the user connects again or the container restarts.
 4. Connected and effective port forwarding on → every 45 s run
    `natpmpc -a 1 0 udp 60 -g 10.2.0.1` and `natpmpc -a 1 0 tcp 60 -g 10.2.0.1`, parse
-   `Mapped public port N` (exit code 0 and 1..65535 required), and publish N in `/config/forwarded_port`
-   and the API only when both protocols return the same N; log when N changes. Otherwise log why and
-   empty the file. The mapping is a 60 s lease: renewals run before state checks, and a timer
-   empties the port if its lease runs out unrenewed, even during a blocked CLI call. Normal CLI
-   timeouts do not shrink with lease age. Signout, disconnect
+   `Mapped public port N ... lifetime L` (exit code 0, 1..65535 port and positive lifetime required),
+   and publish N in `/config/forwarded_port` and the API only when both protocols return the same N;
+   log when N changes. The deadline is the first request's start plus the lesser of 60 seconds and
+   both granted lifetimes. Renewals run before state checks; a timer withdraws an unrenewed mapping,
+   even during a blocked CLI call. A short grant can expire before the next 45-second renewal.
+   Failed file clearing attempts unlink; storage that prevents both can retain a stale disk number,
+   so the API is authoritative during storage errors. Normal CLI timeouts do not shrink with lease age.
+   Signout, disconnect
    and reconnect immediately invalidate connection-specific state. Duplicate completion of an
    already-observed sign-in does not reapply settings or drop a healthy connection. Failed state
    checks show an error instead of silently presenting the last success as current.
 5. Every 5 s while connected: read `wg show proton0 transfer`, keep the last 15 minutes of
-   samples in memory (180 points), reset on a new connection.
-6. On `SIGTERM`: `protonvpn disconnect`, stop the WebUI, NM and D-Bus, exit 0. The firewall stays
-   closed until the namespace is gone.
+   samples in memory (180 points), reset on a new connection or failed state check.
+6. On `SIGTERM`: disconnect, stop the WebUI, NM and D-Bus, exit 0 within the shutdown budget.
+   A connect already in flight must disconnect again if it finishes during shutdown. Daemon
+   shutdown verifies the expected process name and signals a Linux pidfd, not a reusable PID.
+   The firewall stays closed until the namespace is gone.
 
 All output goes to stdout with `[protonvpn]`, `[natpmp]`, `[firewall]`, `[webui]` prefixes, so
 `docker logs` shows the CLI's own messages unaltered.
@@ -324,6 +333,8 @@ All output goes to stdout with `[protonvpn]`, `[natpmp]`, `[firewall]`, `[webui]
 - One page, plain HTML/CSS/JS shipped as static files in the package; no build step, no external
   CDN (it must work while the tunnel is down). JSON API under `/api/v1/`; the page polls
   `/api/v1/state` every 5 s.
+- At most 32 request-handler threads run simultaneously; excess TCP sockets are closed without
+  creating a handler or blocking admission. Every completion/start-failure path releases capacity.
 - Shows: connection state; server, city and country, load, protocol (from `protonvpn status`);
   exit IPv4 address (from connect output, or the independent traffic check when missing;
   probe failure does not change CLI connection state); forwarded port with a copy
@@ -338,6 +349,8 @@ All output goes to stdout with `[protonvpn]`, `[natpmp]`, `[firewall]`, `[webui]
   is open, `[webui] WARNING: WEBUI_PASSWORD is not set; the WebUI is open to anyone who can reach
   it` is logged at start, and the page shows a banner whose dismissal is stored in
   `settings.json` (private `_banner_dismissed` key), so it stays dismissed across browsers and restarts.
+  Failed dismissal keeps the banner and a persistent inline error visible. HTTPS proxies add
+  `Secure` to the session cookie and redirect HTTP; the direct LAN HTTP backend does not.
 - State-changing requests are `POST` with a JSON body and require the `X-Requested-With` header
   (blocks cross-site form posts).
 - Account takeover is out of reach by design: the WebUI never displays tokens, the password, or

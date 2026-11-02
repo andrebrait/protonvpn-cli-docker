@@ -23,7 +23,7 @@ from .parsing import (
     Status,
     parse_account,
     parse_exit_ip,
-    parse_natpmp_port,
+    parse_natpmp_mapping,
     parse_status,
     parse_wg_transfer,
 )
@@ -125,7 +125,7 @@ class Supervisor:
         """Disconnect and stop the loop and the health worker, within `timeout` seconds in total."""
         end = time.monotonic() + timeout
         self._stop.set()
-        self._reset_health()  # not healthy while shutting down; a probe still running is dropped
+        self._drop_connection()  # revoke status, health and port before a blocked connect can return
         say(self._run("disconnect", timeout=min(STOP_DISCONNECT_TIMEOUT, timeout)).out)
         for thread in (self._thread, self._health_thread):
             if thread is not None:
@@ -166,9 +166,10 @@ class Supervisor:
 
     def request_connect(self) -> None:
         with self._lock:
-            self._user_disconnected = False
+            self._user_disconnected = self._disconnect_pending = False
             self._failures = 0
         self._next_check = 0.0
+        self._next_natpmp = 0.0
 
     def request_disconnect(self) -> None:
         with self._lock:
@@ -251,6 +252,8 @@ class Supervisor:
 
     def tick(self) -> None:
         with self._cli_lock:
+            if self._stop.is_set():
+                return
             self._forward_port()  # first: a slow state check must not make the lease run out
             now = self._clock()
             if now >= self._next_check:
@@ -265,29 +268,40 @@ class Supervisor:
     def _check(self, now: float) -> None:
         self._next_check = now + self._interval
         info, status = self._run("info"), self._run("status")
+        if self._stop.is_set():
+            self._drop_connection()
+            return
         if info.rc != 0 or status.rc != 0:
             failed = info if info.rc != 0 else status
             message = f"state check failed (rc {failed.rc}): {failed.out.strip()}"
             log(f"[protonvpn] {message}")
             # The last good status and port must not pass for current ones. The signin state stays: one failed call says nothing about it.
             self._drop_connection(ended=False)
+            self._was_connected = False
             with self._lock:
+                self._traffic.clear()  # continuity is unknown: a replacement tunnel may have larger counters
                 self._check_error = message
             self._next_natpmp = 0.0  # the port is requested again at the first good check
             return
         account, st = parse_account(info.out), parse_status(status.out)
         with self._lock:
+            if self._stop.is_set():
+                return
             self._signed_in, self._account, self._st, self._check_error = bool(account), account, st, ""
-            disconnect, self._disconnect_pending = self._disconnect_pending, False
-            user_disconnected = self._user_disconnected
+            disconnect = self._disconnect_pending and self._user_disconnected
+        disconnect_failed = False
         if disconnect and account and st.connected:
-            say(self._run("disconnect").out)
+            result = self._run("disconnect")
+            say(result.out)
+            disconnect_failed = result.rc != 0
             st = self._read_status()
+        with self._lock:
+            if not st.connected and not disconnect_failed:
+                self._disconnect_pending = False
         if not st.connected:
             self._drop_connection()
-        action = decide(bool(account), st.connected, user_disconnected)
         pending: list[str] = []
-        if action == "wait_signin":
+        if not account:
             self._new_session()
             if now >= self._next_hint:
                 self._next_hint = now + HINT_EVERY
@@ -298,6 +312,8 @@ class Supervisor:
                 self._unapplied_checks += 1
             elif all(key in self._applied for key, _ in self._wanted()):
                 self._unapplied_checks = 0  # not while a kill-switch is only deferred: that is not a success
+        with self._lock:
+            action = decide(bool(account), st.connected, self._user_disconnected)  # read intent after the CLI calls
         hold = bool(pending) and self._unapplied_checks < SETTINGS_RETRIES
         if action == "connect" and hold:
             log(
@@ -328,14 +344,23 @@ class Supervisor:
     def _read_status(self) -> Status:
         st = parse_status(self._run("status").out)
         with self._lock:
+            if self._stop.is_set():
+                st = Status()
             self._st = st
         return st
 
     def _connect(self) -> bool:
+        if self._stop.is_set():
+            return False
         res = self._run("connect", *connect_args(self._store))
         say(res.out)
+        if self._stop.is_set():  # stop's disconnect may have run before this late connect completed
+            say(self._run("disconnect", timeout=STOP_DISCONNECT_TIMEOUT).out)
+            self._drop_connection()
+            return False
         ok = res.rc == 0 and self._read_status().connected
         with self._lock:
+            ok = ok and not self._stop.is_set()
             self._last_error = "" if ok else (res.out.strip() or f"connect failed (exit code {res.rc})")
             if ok:
                 self._exit_ip, self._check_error = parse_exit_ip(res.out), ""
@@ -479,7 +504,7 @@ class Supervisor:
         """Request or renew the forwarded port when due, ahead of CLI calls that can be slow."""
         with self._lock:
             connected, leaving = self._st.connected, self._disconnect_pending
-        if not connected or leaving:
+        if not connected or leaving or self._stop.is_set():
             return
         if not is_true(self._store.effective("PORT_FORWARDING")):
             self._set_port(None)
@@ -501,20 +526,21 @@ class Supervisor:
     def _refresh_port(self) -> None:
         start = self._clock()  # the lease runs from the first request at the latest
         self._next_natpmp = start + NATPMP_EVERY
-        ports = []
+        mappings = []
         for proto in ("udp", "tcp"):
             res = self._tool("natpmpc", "-a", "1", "0", proto, str(NATPMP_LEASE), "-g", GATEWAY)
-            port = parse_natpmp_port(res.out) if res.rc == 0 else None
-            if port is None:  # a silent gateway makes natpmpc wait minutes: do not try tcp as well
+            mapping = parse_natpmp_mapping(res.out) if res.rc == 0 else None
+            if mapping is None:  # a silent gateway makes natpmpc wait minutes: do not try tcp as well
                 log(f"[natpmp] refresh failed (rc {res.rc}): {(res.out.strip().splitlines() or [''])[-1]}")
                 self._set_port(None)
                 return
-            ports.append(port)
-        if ports[0] != ports[1]:  # one number must serve both protocols
-            log(f"[natpmp] the gateway mapped udp to {ports[0]} but tcp to {ports[1]}; no port published")
+            mappings.append(mapping)
+        (udp_port, udp_lifetime), (tcp_port, tcp_lifetime) = mappings
+        if udp_port != tcp_port:  # one number must serve both protocols
+            log(f"[natpmp] the gateway mapped udp to {udp_port} but tcp to {tcp_port}; no port published")
             self._set_port(None)
             return
-        self._set_port(ports[0], start + NATPMP_LEASE)
+        self._set_port(udp_port, start + min(NATPMP_LEASE, udp_lifetime, tcp_lifetime))
 
     def _set_port(self, port: int | None, lease_end: float = 0.0) -> None:
         """Publish `port` (None: no port) until `lease_end`, when a timer clears it unless a renewal replaced the lease."""
@@ -523,7 +549,7 @@ class Supervisor:
                 self._lease_timer.cancel()
                 self._lease_timer = None
             with self._lock:
-                if self._disconnect_pending:  # requested while this lease was being won
+                if self._disconnect_pending or self._stop.is_set() or lease_end <= self._clock():
                     port = None
             self._lease_end = None if port is None else lease_end
             if port is not None:
@@ -540,6 +566,13 @@ class Supervisor:
                 if self._port_synced is not None:  # log once per failure streak; the tick may retry every second
                     log(f"[natpmp] cannot write {self._port_file}: {exc}")
                 self._port_synced = None
+                if port is None:
+                    try:
+                        os.unlink(self._port_file)  # a failed atomic replacement must not leave a usable old number
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass  # read-only storage cannot be revoked; the API remains authoritative until a clear succeeds
                 return
             self._port_synced = True
             if port is not None:

@@ -2,11 +2,12 @@ import http.client
 import io
 import json
 import os
+import queue
 import socket
 import tempfile
 import threading
 import unittest
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -139,6 +140,92 @@ class WebuiCase(unittest.TestCase):
         status, _, resp = self.post("/api/v1/login", {"password": password})
         self.assertEqual(status, 200)
         return resp.getheader("Set-Cookie").split(";")[0]
+
+
+class CapacityTest(WebuiCase):
+    @contextmanager
+    def stalled_posts(self, count=32):
+        entered = queue.Queue()
+        original_body = webui.Handler._body
+        clients, workers = [], []
+
+        def read_body(handler):
+            entered.put(threading.current_thread())
+            return original_body(handler)
+
+        with mock.patch.object(webui.Handler, "_body", read_body):
+            try:
+                for _ in range(count):
+                    client = socket.create_connection(("127.0.0.1", self.port), timeout=5)
+                    clients.append(client)
+                    client.sendall(
+                        b"POST /api/v1/connect HTTP/1.1\r\nHost: localhost\r\n"
+                        b"X-Requested-With: protonvpn-webui\r\n"
+                        b"Content-Type: application/json\r\nContent-Length: 2\r\n\r\n{"
+                    )
+                    workers.append(entered.get(timeout=5))
+                yield workers
+            finally:
+                for client in clients:
+                    client.close()
+                for worker in workers:
+                    worker.join(5)
+                    self.assertFalse(worker.is_alive(), "closed client kept its handler alive")
+
+    def assert_connection_closed(self):
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as client:
+            try:
+                self.assertEqual(client.recv(1), b"")
+            except ConnectionResetError:
+                pass
+            except TimeoutError:
+                self.fail("excess TCP connection was not closed")
+
+    def assert_capacity_and_recovery(self):
+        with self.stalled_posts() as workers:
+            self.assertTrue(all(worker.is_alive() for worker in workers))
+            for _ in range(3):
+                self.assert_connection_closed()
+        self.assertEqual(self.get_json("/api/v1/state")[0], 200)
+        self.assertEqual(self.post("/api/v1/connect")[0], 200)
+        self.assertEqual(self.sup.calls, [("connect",)])
+
+    def test_stalled_posts_are_bounded_and_clients_closing_restore_api(self):
+        self.assert_capacity_and_recovery()
+
+    def test_thread_start_failure_does_not_lose_capacity(self):
+        with mock.patch.object(threading.Thread, "start", side_effect=RuntimeError("cannot start")), \
+                mock.patch.object(self.server, "handle_error"):
+            self.assert_connection_closed()
+        self.assert_capacity_and_recovery()
+
+    def test_handler_thread_failure_does_not_lose_capacity(self):
+        failed = queue.Queue()
+
+        def fail_request(*args):
+            failed.put(threading.current_thread())
+            raise RuntimeError("handler failed")
+
+        with mock.patch.object(self.server, "finish_request", fail_request), \
+                mock.patch.object(self.server, "handle_error"):
+            self.assert_connection_closed()
+            worker = failed.get(timeout=5)
+            worker.join(5)
+            self.assertFalse(worker.is_alive())
+        self.assert_capacity_and_recovery()
+
+    def test_shutdown_does_not_wait_for_stalled_daemon_handlers(self):
+        with self.stalled_posts(1) as workers:
+            def close_server():
+                self.server.shutdown()
+                self.server.server_close()
+
+            closer = threading.Thread(target=close_server, daemon=True)
+            closer.start()
+            closer.join(5)
+            self.assertFalse(closer.is_alive(), "shutdown waited for a stalled handler")
+            self.assertTrue(workers[0].is_alive())
+            self.assertTrue(workers[0].daemon)
 
 
 class OpenModeTest(WebuiCase):

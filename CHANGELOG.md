@@ -19,6 +19,10 @@
 - Rejection of ambiguous HTTP port values before firewall setup, preventing hexadecimal/octal interpretation from protecting a different port than the listener.
 - Duplicate sign-in completion reapplying settings and interrupting an established connection.
 - Stale forwarded ports after disconnects, failed checks or lease expiration.
+- Startup deny filters for both IP families, identity-safe daemon shutdown and bounded HTTP request handlers.
+- Gateway-granted forwarding lifetimes, queued/failed connection controls, shutdown/connect races and port-file clear failures.
+- Settings errors hidden behind save messages, edits lost during pending saves and unsuccessful warning dismissal.
+- LAN-bound quick-start examples, HTTPS proxy cookie guidance and JavaScript syntax checks in CI.
 
 ### Limitations
 

@@ -5,7 +5,10 @@ from dataclasses import dataclass
 
 _ACCOUNT = re.compile(r"^Account: '(.*)'\s*$", re.M)
 _EXIT_IP = re.compile(r"Your new IP address is (\S+?)\.?\s*$", re.M)
-_NATPMP_PORT = re.compile(r"Mapped public port (\d+)")
+_NATPMP_MAPPING = re.compile(
+    r"^Mapped public port ([0-9]{1,5}) protocol (?:UDP|TCP) to local port [0-9]{1,5} lifetime ([0-9]{1,10})[ \t]*$",
+    re.M,
+)
 
 
 @dataclass
@@ -38,10 +41,12 @@ def parse_exit_ip(connect_out: str) -> str:
     return match.group(1) if match else ""
 
 
-def parse_natpmp_port(out: str) -> int | None:
-    match = _NATPMP_PORT.search(out)
-    port = int(match.group(1)) if match else 0
-    return port if 1 <= port <= 65535 else None
+def parse_natpmp_mapping(out: str) -> tuple[int, int] | None:
+    match = _NATPMP_MAPPING.search(out)
+    if match is None:
+        return None
+    port, lifetime = map(int, match.groups())
+    return (port, lifetime) if 1 <= port <= 65535 and 1 <= lifetime <= 4294967295 else None
 
 
 def parse_wg_transfer(out: str) -> tuple[int, int] | None:

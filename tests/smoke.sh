@@ -427,6 +427,93 @@ proton0_drop_only() {
   [ "$open" -eq 0 ] && blocked_from "$2" 10.77.0.1 8788 && blocked_from "$2" fd77::1 8788
 }
 
+# A live attached app holds the namespace after the product exits during firewall installation.
+# Both directions exchange payloads first, so a missing listener or broken IPv6 route cannot look like containment.
+failure_listener() {
+  docker exec -d "$1" python3 -c '
+import selectors, socket
+sel = selectors.DefaultSelector()
+for family, addr in ((socket.AF_INET, "0.0.0.0"), (socket.AF_INET6, "::")):
+    s = socket.socket(family)
+    if family == socket.AF_INET6:
+        s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+    s.bind((addr, 4444)); s.listen()
+    sel.register(s, selectors.EVENT_READ)
+while True:
+    for key, _ in sel.select():
+        conn, _ = key.fileobj.accept()
+        with conn:
+            conn.settimeout(3)
+            conn.sendall(conn.recv(5, socket.MSG_WAITALL))
+'
+}
+# failure_exchange <open|drop|down> <client> <address>: only timeouts prove a filter drop.
+# With disabled interfaces, explicit network/host-unreachable errors are also valid; refusals and exec errors never are.
+failure_exchange() {
+  docker exec "$2" python3 -c '
+import errno, socket, sys
+mode, addr = sys.argv[1:]
+try:
+    with socket.socket(socket.AF_INET6 if ":" in addr else socket.AF_INET) as s:
+        s.settimeout(3)
+        s.connect((addr, 4444))
+        s.sendall(b"probe")
+        assert s.recv(5, socket.MSG_WAITALL) == b"probe"
+except TimeoutError:
+    assert mode in ("drop", "down")
+except OSError as err:
+    assert mode == "down" and err.errno in (errno.ENETDOWN, errno.ENETUNREACH, errno.EHOSTUNREACH), err
+else:
+    assert mode == "open", "application payload escaped the failed firewall install"
+' "$1" "$3"
+}
+# restore_failure <4|6> <full|baseline> <peer> <network>: inject only at the chosen restore boundary.
+restore_failure() {
+  rf_family=$1 rf_stage=$2 rf_peer=$3 rf_net=$4
+  rf_hold=t5b-$$-failure-$1-$2-hold rf_app=t5b-$$-failure-$1-$2-app rf_product=t5b-$$-failure-$1-$2
+  rf_bin=$TMP/failure-$1-$2
+  mkdir -p "$rf_bin"
+  rf_cmd=iptables-restore
+  [ "$rf_family" = 6 ] && rf_cmd=ip6tables-restore
+  cat > "$rf_bin/$rf_cmd" <<'EOF'
+#!/bin/sh
+rules=$(cat)
+if [ "$FAIL_RESTORE_STAGE" = baseline ] || printf '%s\n' "$rules" | grep -q '^:WEBUI_HTTP '; then
+  echo "injected $FAIL_RESTORE_STAGE restore failure" >&2
+  exit 1
+fi
+printf '%s\n' "$rules" | "/usr/sbin/${0##*/}"
+EOF
+  chmod 755 "$rf_bin/$rf_cmd"
+  CONTAINERS="$CONTAINERS $rf_hold $rf_product"
+  docker run -d --name "$rf_hold" --network "$rf_net" --cap-add NET_ADMIN --entrypoint sleep "$IMAGE" infinity >/dev/null || return 1
+  attach "$rf_app" "$rf_hold" && failure_listener "$rf_app" || return 1
+  rf_hold4=$(ip_of "$rf_hold" "$rf_net") rf_hold6=$(ip6_of "$rf_hold" "$rf_net")
+  rf_peer4=$(ip_of "$rf_peer" "$rf_net") rf_peer6=$(ip6_of "$rf_peer" "$rf_net")
+  eventually 10 failure_exchange open "$rf_app" "$rf_peer4" &&
+    eventually 10 failure_exchange open "$rf_app" "$rf_peer6" &&
+    eventually 10 failure_exchange open "$rf_peer" "$rf_hold4" &&
+    eventually 10 failure_exchange open "$rf_peer" "$rf_hold6" || return 1
+  # No test firewall or entrypoint replaces the product: only its selected restore executable is wrapped.
+  docker run -d --name "$rf_product" --network "container:$rf_hold" --cap-add NET_ADMIN --device /dev/net/tun \
+    -v "$TMP:/config" -v "$rf_bin:/test-firewall-bin:ro" -e FAIL_RESTORE_STAGE="$rf_stage" \
+    -e PATH=/test-firewall-bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin "$IMAGE" >/dev/null || return 1
+  timeout 20 docker wait "$rf_product" >/dev/null || return 1
+  [ "$(docker inspect -f '{{.State.ExitCode}}' "$rf_product")" -ne 0 ] &&
+    logged "$rf_product" "injected $rf_stage restore failure" &&
+    is_running "$rf_hold" && is_running "$rf_app" || return 1
+  rf_expect=drop
+  if [ "$rf_stage" = baseline ]; then
+    rf_expect=down
+    logged "$rf_product" 'non-loopback interfaces disabled' || return 1
+    docker exec "$rf_hold" sh -c '[ -z "$(ip -o link show up | grep -v " lo:")" ]' || return 1
+  fi
+  failure_exchange "$rf_expect" "$rf_app" "$rf_peer4" &&
+    failure_exchange "$rf_expect" "$rf_app" "$rf_peer6" &&
+    failure_exchange "$rf_expect" "$rf_peer" "$rf_hold4" &&
+    failure_exchange "$rf_expect" "$rf_peer" "$rf_hold6"
+}
+
 C=t5b-$$-smoke
 mkdir -p "$TMP/Proton"
 echo '{}' > "$TMP/Proton/stale.json"
@@ -501,6 +588,13 @@ assert "bad LAN fails closed" fails_closed "t5b-$$-bad" LAN_NETWORKS=192.0.2.0/3
 for port in 0 0x2328 02324; do
   assert "ambiguous WEBUI_PORT '$port' fails closed" fails_closed "t5b-$$-badport$port" "WEBUI_PORT=$port" WEBUI_PORT
 done
+
+# Full rules may fail on matches unavailable in the kernel even though the deny-only baseline is supported.
+# An unavailable IPv6 filter has a different, disruptive fallback: every non-loopback interface is disabled.
+failure_listener "t5b-$$-v6peer" || { echo "FAIL firewall failure peer listener"; exit 1; }
+assert "IPv4 full-restore failure contains a surviving attached app in both families" restore_failure 4 full "t5b-$$-v6peer" "t5b-$$-v6"
+assert "IPv6 full-restore failure contains a surviving attached app in both families" restore_failure 6 full "t5b-$$-v6peer" "t5b-$$-v6"
+assert "IPv6 baseline failure disables shared interfaces rather than leaving IPv6 open" restore_failure 6 baseline "t5b-$$-v6peer" "t5b-$$-v6"
 
 # WEBUI_ALLOWED_NETWORKS, judged on real TCP between containers: a client's address is the one the WebUI container sees.
 # The list is the container's environment, so each case is its own container.

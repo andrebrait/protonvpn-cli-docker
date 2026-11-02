@@ -1,5 +1,5 @@
 #!/bin/sh
-# Unit tests for firewall.sh (pure functions only; nothing is loaded into the kernel).
+# Unit tests for firewall.sh (nothing is loaded into the kernel; failed initialization uses stubbed network tools).
 # shellcheck disable=SC2329  # helpers are invoked indirectly through check
 cd "$(dirname "$0")/.." || exit 1
 FAILED=0
@@ -134,6 +134,25 @@ check "first boot saves Docker's resolver" eq "$(kdr 'nameserver 127.0.0.11' - -
 check "restart with the tunnel DNS left in place restores Docker's" eq "$(kdr 'nameserver 10.2.0.1' 'nameserver 10.2.0.1' 'nameserver 127.0.0.11')" 'nameserver 127.0.0.11|nameserver 127.0.0.11|removed'
 check "restart keeps a regenerated Docker resolver and drops NM's stale file" eq "$(kdr 'nameserver 192.168.1.1' 'nameserver 10.2.0.1' 'nameserver 127.0.0.11')" 'nameserver 192.168.1.1|nameserver 192.168.1.1|removed'
 check "no saved original: the file is saved as it is" eq "$(kdr 'nameserver 10.2.0.1' 'nameserver 10.2.0.1' -)" 'nameserver 10.2.0.1|nameserver 10.2.0.1|removed'
+
+# A namespace cannot be promised closed when neither the filter nor the interface fallback can be enforced.
+mkdir -p "$TMP/no-filter"
+cat > "$TMP/no-filter/iptables-restore" <<'EOF'
+#!/bin/sh
+echo 'filter unsupported' >&2
+exit 1
+EOF
+cp "$TMP/no-filter/iptables-restore" "$TMP/no-filter/ip6tables-restore"
+cp "$TMP/no-filter/iptables-restore" "$TMP/no-filter/ip"
+chmod 755 "$TMP/no-filter/"*
+uncontained_init_fails() {
+  ( PATH="$TMP/no-filter:$PATH"; firewall_init ) > "$TMP/init.log" 2>&1
+  rc=$?
+  [ "$rc" -ne 0 ] &&
+    grep -q 'cannot guarantee network containment' "$TMP/init.log" &&
+    ! grep -q 'kill switch loaded' "$TMP/init.log"
+}
+check "unsupported filter and failed interface fallback explicitly report unavailable containment" uncontained_init_fails
 
 [ "$FAILED" -eq 0 ] && echo "all ok"
 exit "$FAILED"

@@ -205,7 +205,7 @@ git add -A && git commit -m "feat: bootable Proton VPN CLI image"
     load: str, protocol: str` from lines `Status: …`, `Server: <name> in <location>`, `Load: …`,
     `Protocol: …` (spike output below); missing fields `""`.
   - `parse_exit_ip(connect_out: str) -> str` from `Your new IP address is X.` → `X` or `""`.
-  - `parse_natpmp_port(out: str) -> int | None` from `Mapped public port N`.
+  - `parse_natpmp_mapping(out: str) -> tuple[int, int] | None` from the mapped port and positive gateway-granted lifetime.
   - `parse_wg_transfer(out: str) -> tuple[int, int] | None` from `wg show proton0 transfer`
     (`<peer-key>\t<rx>\t<tx>`; sum over peers) → `(rx, tx)`.
 
@@ -329,7 +329,7 @@ git add -A && git commit -m "feat: fail-closed cgroup-scoped kill switch"
 
 **Interfaces:**
 - Consumes: `SettingsStore`, `connect_args`, `settings_pairs`, `is_true` (config); `run`
-  (cli); `parse_status`, `parse_exit_ip`, `parse_natpmp_port`, `parse_wg_transfer` (parsing).
+  (cli); `parse_status`, `parse_exit_ip`, `parse_natpmp_mapping`, `parse_wg_transfer` (parsing).
 - Produces, `supervisor.py`:
   - `decide(signed_in: bool, connected: bool, user_disconnected: bool) -> str` — pure:
     `"wait_signin"` | `"connected"` | `"idle"` (user disconnected) | `"connect"`.

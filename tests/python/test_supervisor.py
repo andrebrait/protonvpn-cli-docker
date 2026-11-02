@@ -27,8 +27,8 @@ BIND_FAILED = Result(45, "curl: (45) Couldn't bind to interface 'proton0' with e
 TIMED_OUT = Result(28, "curl: (28) Connection timed out after 5001 milliseconds\n")
 
 
-def mapped(port):
-    return Result(0, f"Mapped public port {port} protocol UDP to local port 0 lifetime 60\n")
+def mapped(port, lifetime=60):
+    return Result(0, f"Mapped public port {port} protocol UDP to local port 0 lifetime {lifetime}\n")
 
 
 NATPMP_FAILED = Result(1, "readnatpmpresponseorretry() failed : the gateway does not support nat-pmp\n")
@@ -384,6 +384,87 @@ class ConnectTest(SupervisorCase):
         self.cli.connected = True  # user runs `protonvpn connect` by hand
         self.tick(30)
         self.assertEqual(len(self.cli.argvs("disconnect")), 1)
+
+    def test_connect_supersedes_a_queued_disconnect_and_restores_the_port(self):
+        self.tool.responses[UDP] = self.tool.responses[TCP] = mapped(41404)
+        self.make(environ={"PORT_FORWARDING": "on"})
+        self.tick()
+        self.sup.request_disconnect()
+        self.sup.request_connect()
+        self.tick(1)
+        snap = self.sup.snapshot()
+        self.assertEqual((snap["connected"], snap["user_disconnected"], snap["forwarded_port"]),
+                         (True, False, 41404))
+        self.assertEqual(self.read_port_file(), "41404\n")
+        self.assertEqual(self.cli.argvs("disconnect"), [])
+        self.assertEqual(len(self.cli.argvs("connect")), 1)  # adopt the still-live tunnel
+
+    def test_connect_during_a_state_check_supersedes_the_old_disconnect_intent(self):
+        self.make()
+        self.tick()
+        self.sup.request_disconnect()
+        self.cli.during[("status",)] = self.sup.request_connect
+        self.tick(1)
+        self.assertTrue(self.sup.snapshot()["connected"])
+        self.assertFalse(self.sup.snapshot()["user_disconnected"])
+        self.assertEqual(self.cli.argvs("disconnect"), [])
+
+    def test_failed_disconnect_retries_without_readvertising_the_port(self):
+        self.tool.responses[UDP] = self.tool.responses[TCP] = mapped(41404)
+        self.make(environ={"PORT_FORWARDING": "on"})
+        self.tick()
+        self.cli.responses[("disconnect",)] = Result(1, "Error: temporary agent failure\n")
+        self.sup.request_disconnect()
+        self.tick(1)
+        snap = self.sup.snapshot()
+        self.assertEqual((snap["connected"], snap["user_disconnected"], snap["forwarded_port"]),
+                         (True, True, None))  # truthful native status, but no usable port while leaving
+        self.assertEqual(self.read_port_file(), "")
+        del self.cli.responses[("disconnect",)]
+        self.tick(30)
+        self.assertEqual(len(self.cli.argvs("disconnect")), 2)
+        self.assertFalse(self.cli.connected)
+        self.assertFalse(self.sup.snapshot()["connected"])
+        self.assertEqual(len(self.cli.argvs("connect")), 1)
+
+    def test_failed_disconnect_with_an_unreadable_followup_status_remains_pending(self):
+        self.make()
+        self.tick()
+        self.cli.responses[("disconnect",)] = Result(1, "Error: temporary agent failure\n")
+        self.cli.responses[("status",)] = [Result(0, STATUS_UP), Result(1, "status unavailable\n")]
+        self.sup.request_disconnect()
+        self.tick(1)
+        self.assertTrue(self.cli.connected)
+        del self.cli.responses[("disconnect",)]
+        del self.cli.responses[("status",)]
+        self.tick(30)
+        self.assertFalse(self.cli.connected)
+        self.assertFalse(self.sup.snapshot()["connected"])
+        self.assertEqual(len(self.cli.argvs("disconnect")), 2)
+
+    def test_connect_during_a_failed_disconnect_cancels_the_retry(self):
+        self.tool.responses[UDP] = self.tool.responses[TCP] = mapped(41404)
+        self.make(environ={"PORT_FORWARDING": "on"})
+        self.tick()
+        self.cli.responses[("disconnect",)] = Result(1, "Error: temporary agent failure\n")
+        self.cli.during[("disconnect",)] = self.sup.request_connect
+        self.sup.request_disconnect()
+        self.tick(1)
+        self.tick(30)
+        snap = self.sup.snapshot()
+        self.assertEqual((snap["connected"], snap["user_disconnected"], snap["forwarded_port"]),
+                         (True, False, 41404))
+        self.assertEqual(len(self.cli.argvs("disconnect")), 1)
+
+    def test_connect_during_a_successful_disconnect_reconnects_without_another_request(self):
+        self.make()
+        self.tick()
+        self.cli.during[("disconnect",)] = self.sup.request_connect
+        self.sup.request_disconnect()
+        self.tick(1)
+        self.assertTrue(self.sup.snapshot()["connected"])
+        self.assertFalse(self.sup.snapshot()["user_disconnected"])
+        self.assertEqual(len(self.cli.argvs("connect")), 2)
 
 
 class SignoutTest(SupervisorCase):
@@ -864,6 +945,28 @@ class NatpmpTest(SupervisorCase):
         self.assertEqual(self.read_port_file(), "")
         self.assertIsNone(self.sup.snapshot()["forwarded_port"])
 
+    def test_failed_clear_unlinks_the_old_port_and_retries_the_write(self):
+        self.make(environ={"PORT_FORWARDING": "on"})
+        self.tick()
+        with redirect_stdout(self.out), mock.patch(f"{SUPERVISOR}.os.replace", side_effect=OSError("replace denied")):
+            self.sup.request_disconnect()
+        self.assertIsNone(self.sup.snapshot()["forwarded_port"])
+        self.assertFalse(os.path.exists(self.port_file))
+        self.assertIn("[natpmp] cannot write", self.out.getvalue())
+        self.tick(1)
+        self.assertEqual(self.read_port_file(), "")  # a later check retries the failed clear
+
+    def test_failed_clear_when_unlink_is_denied_still_revokes_the_api_and_retries(self):
+        self.make(environ={"PORT_FORWARDING": "on"})
+        self.tick()
+        with mock.patch(f"{SUPERVISOR}.os.replace", side_effect=OSError("read only")), \
+                mock.patch(f"{SUPERVISOR}.os.unlink", side_effect=OSError("read only")):
+            self.sup.request_disconnect()
+        self.assertIsNone(self.sup.snapshot()["forwarded_port"])
+        self.assertEqual(self.read_port_file(), "41404\n")  # no writable-storage guarantee is possible
+        self.tick(1)
+        self.assertEqual(self.read_port_file(), "")
+
 
 class LeaseTest(SupervisorCase):
     """A forwarded port is advertised only while its 60 s mapping lease can still be alive."""
@@ -936,6 +1039,42 @@ class LeaseTest(SupervisorCase):
         self.tick()
         self.assertEqual(self.timers.created[-1].interval, 60)  # counted from the request at 1040
         self.assertEqual(self.sup.snapshot()["traffic"], [[1040.0, 100, 10]])
+
+    def test_the_shortest_granted_lifetime_expires_for_both_consumers(self):
+        for udp, tcp, duration in ((10, 60, 10), (60, 12, 12), (120, 120, 60)):
+            with self.subTest(udp=udp, tcp=tcp):
+                self.tool.responses[UDP], self.tool.responses[TCP] = mapped(41404, udp), mapped(41404, tcp)
+                self.make(environ={"PORT_FORWARDING": "on"})
+                self.tick()
+                self.assertEqual(self.consumer(), (41404, "41404\n"))
+                timer = self.timers.created[-1]
+                self.assertEqual(timer.interval, duration)
+                self.clock.now += duration
+                timer.fire()  # the main loop remains blocked until after this observation
+                self.assertEqual(self.consumer(), (None, ""))
+
+    def test_missing_or_zero_granted_lifetime_revokes_an_existing_port(self):
+        for response in (Result(0, "Mapped public port 41404 protocol UDP to local port 0\n"), mapped(41404, 0)):
+            for failing in (UDP, TCP):
+                with self.subTest(output=response.out, protocol=failing[4]):
+                    self.tool.responses[UDP] = self.tool.responses[TCP] = mapped(41404)
+                    self.make(environ={"PORT_FORWARDING": "on"})
+                    self.tick()
+                    self.tool.responses[failing] = response
+                    self.tick(45)
+                    self.assertEqual(self.consumer(), (None, ""))
+
+    def test_a_mapping_already_expired_before_tcp_returns_is_never_published(self):
+        self.tool.responses[UDP] = mapped(41404, 1)
+
+        def slow_tcp(n):
+            self.clock.now += 2
+            return mapped(41404)
+
+        self.tool.responses[TCP] = slow_tcp
+        self.tick()
+        self.assertEqual(self.consumer(), (None, ""))
+        self.assertNotIn("[natpmp] forwarded port", self.out.getvalue())
 
 
 class HealthCase(SupervisorCase):
@@ -1242,6 +1381,19 @@ class TrafficTest(SupervisorCase):
         self.tick()
         self.assertEqual(self.sup.snapshot()["traffic"], [])
 
+    def test_failed_check_breaks_traffic_continuity_even_if_the_replacement_counters_are_larger(self):
+        self.make()
+        self.tool.responses[WG] = [Result(0, "OLD\t100\t10\n"), Result(0, "NEW\t10000\t1000\n")]
+        self.tick()
+        self.assertEqual(self.sup.snapshot()["traffic"], [[1000.0, 100, 10]])
+        self.cli.responses[("status",)] = Result(1, "agent unavailable\n")
+        self.tick(30)
+        self.assertEqual(self.sup.snapshot()["traffic"], [])
+        self.assertEqual(self.sup.snapshot()["account"], "me@proton.me")
+        del self.cli.responses[("status",)]
+        self.tick(30)
+        self.assertEqual(self.sup.snapshot()["traffic"], [[1060.0, 10000, 1000]])
+
 
 class StopTest(SupervisorCase):
     def test_stop_disconnects_and_joins(self):
@@ -1260,6 +1412,37 @@ class StopTest(SupervisorCase):
         self.assertEqual(self.cli.timeouts[-1], (("disconnect",), 2))
         self.sup.stop()
         self.assertEqual(self.cli.timeouts[-1], (("disconnect",), 5))
+
+    def test_stop_during_connect_is_bounded_and_a_late_success_is_disconnected(self):
+        self.enterContext(redirect_stdout(self.out))
+        self.tool.responses[UDP] = self.tool.responses[TCP] = mapped(41404)
+        self.make(environ={"PORT_FORWARDING": "on"})
+        started, release = threading.Event(), threading.Event()
+
+        def hold_connect():
+            started.set()
+            release.wait(10)
+
+        self.cli.during[("connect",)] = hold_connect
+        worker = threading.Thread(target=self.sup.tick)
+        self.sup._thread = worker
+        self.addCleanup(worker.join, 5)
+        self.addCleanup(release.set)
+        worker.start()
+        self.assertTrue(started.wait(5))
+        begin = time.monotonic()
+        self.sup.stop(timeout=0.1)
+        self.assertLess(time.monotonic() - begin, 1)
+        self.assertTrue(worker.is_alive())  # stop did not wait for the CLI mutation lock
+        release.set()
+        worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(self.cli.connected)  # the late connect must not outlive shutdown
+        snap = self.sup.snapshot()
+        self.assertEqual((snap["connected"], snap["tunnel_healthy"], snap["forwarded_port"]), (False, False, None))
+        self.assertEqual(self.read_port_file(), "")
+        self.assertEqual(self.tool.calls.count(UDP), 0)
+        self.assertEqual(len(self.cli.argvs("disconnect")), 2)
 
 
 class HealthStopTest(HealthCase):

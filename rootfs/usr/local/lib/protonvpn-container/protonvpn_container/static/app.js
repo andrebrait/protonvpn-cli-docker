@@ -368,14 +368,14 @@
     const err = last && last.settings_errors && last.settings_errors[f.setting.env];
     if (f.setting.locked) {
       text = "Set by container config";
+    } else if (err && (!f.result || f.result.ok)) {
+      [text, cls] = [err, "note error"];
     } else if (f.result) {
       [text, cls] = [f.result.text, f.result.ok ? "note ok" : "note error"];
-      f.note.setAttribute("role", f.result.ok ? "status" : "alert");
-    } else if (err) {
-      [text, cls] = [err, "note error"];
     }
+    f.note.setAttribute("role", cls === "note error" ? "alert" : "status");
     f.note.className = cls;
-    f.note.textContent = text;
+    if (f.note.textContent !== text) f.note.textContent = text;
   }
 
   function renderSettings(s) {
@@ -399,10 +399,11 @@
     $("save").disabled = true;
     let failed = 0;
     for (const f of pending) {
-      const { data } = await api("/api/v1/settings", { env: f.setting.env, value: valueOf(f) });
+      const value = valueOf(f);
+      const { data } = await api("/api/v1/settings", { env: f.setting.env, value });
       f.result = { ok: Boolean(data.ok), text: data.error || data.message || (data.ok ? "Saved" : "Not saved") };
-      if (data.ok) f.dirty = false;
-      else failed += 1;
+      if (!data.ok) failed += 1;
+      else f.dirty = valueOf(f) !== value;
       renderNote(f);
     }
     $("save-status").textContent = failed ? `${failed} of ${pending.length} not saved. See the messages above.` : `Saved ${pending.length} ${pending.length === 1 ? "setting" : "settings"}.`;
@@ -522,8 +523,10 @@
   $("copy").addEventListener("click", copyPort);
   $("banner-dismiss").addEventListener("click", (e) =>
     run(e.currentTarget, async () => {
-      await api("/api/v1/banner/dismiss", {});
-      $("banner").hidden = true;
+      message("banner-msg", "");
+      const { status, data } = await api("/api/v1/banner/dismiss", {});
+      if (status === 200) $("banner").hidden = true;
+      else message("banner-msg", data.error || "Could not save the dismissal. Try again.", "error");
     }),
   );
   $("signout").addEventListener("click", (e) =>

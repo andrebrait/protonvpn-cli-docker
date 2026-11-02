@@ -2,6 +2,7 @@
 
 import math
 import os
+import select
 import signal
 import sys
 import threading
@@ -15,15 +16,19 @@ from .webui import make_server
 DEFAULT_WEBUI_PORT = 8788
 PID_DIR = "/run/protonvpn-container"
 # NetworkManager first: it needs the system bus until it has exited.
-DAEMON_PID_FILES = ("nm.pid", "dbus-session.pid", "dbus-system.pid")
+DAEMON_PID_FILES = {
+    "nm.pid": "NetworkManager",
+    "dbus-session.pid": "dbus-daemon",
+    "dbus-system.pid": "dbus-daemon",
+}
 SHUTDOWN_BUDGET = 9.0  # `docker stop` sends SIGKILL after 10 s
 SUPERVISOR_SHARE = 2 / 3  # of the budget; the daemons get the rest
 
 
-def terminate(pid_file: str, timeout: float = 3.0) -> None:
-    """SIGTERM the process in pid_file; SIGKILL when it is still there after 80% of `timeout`.
+def terminate(pid_file: str, expected_daemon: str, timeout: float = 3.0) -> None:
+    """Stop only the named daemon; pin its identity with a pidfd before checking procfs.
 
-    Returns within `timeout` (plus polling granularity).
+    SIGKILL after 80% of `timeout`; reserve the rest for exit and child reaping.
     """
     try:
         with open(pid_file, encoding="utf-8") as f:
@@ -32,28 +37,31 @@ def terminate(pid_file: str, timeout: float = 3.0) -> None:
         return
     if pid <= 1:  # 0 and -1 would signal whole process groups, 1 is tini
         return
-    for sig, patience in ((signal.SIGTERM, 0.8 * timeout), (signal.SIGKILL, 0.2 * timeout)):
+    try:
+        pidfd = os.pidfd_open(pid)
+    except OSError:
+        return
+    try:
         try:
-            os.kill(pid, sig)
-        except ProcessLookupError:
+            with open(f"/proc/{pid}/comm", encoding="utf-8") as f:
+                if f.read().rstrip("\n") != expected_daemon:
+                    return
+        except OSError:
             return
-        deadline = time.monotonic() + max(patience, 0.0)
-        while time.monotonic() < deadline:
-            if _gone(pid):
+        # If the PID was reused during the name check, the fd still targets the old process.
+        for sig, patience in ((signal.SIGTERM, 0.8 * timeout), (signal.SIGKILL, 0.2 * timeout)):
+            try:
+                signal.pidfd_send_signal(pidfd, sig)
+            except ProcessLookupError:
+                pass
+            if select.select([pidfd], [], [], max(patience, 0.0))[0]:
+                try:
+                    os.waitpid(pid, os.WNOHANG)  # reap our own children, not just their pidfds
+                except ChildProcessError:
+                    pass
                 return
-            time.sleep(0.05)
-
-
-def _gone(pid: int) -> bool:
-    try:
-        return os.waitpid(pid, os.WNOHANG)[0] == pid  # our own child: reap it, or it lingers as a zombie
-    except ChildProcessError:
-        pass
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return True
-    return False
+    finally:
+        os.close(pidfd)
 
 
 def webui_port(environ=os.environ) -> int:
@@ -101,8 +109,8 @@ def shutdown(supervisor, pid_dir: str = PID_DIR, budget: float = SHUTDOWN_BUDGET
         webui.shutdown()  # returns within a poll interval; requests in flight are daemon threads
         webui.server_close()
     supervisor.stop(timeout=budget * SUPERVISOR_SHARE)
-    for left, name in zip(range(len(DAEMON_PID_FILES), 0, -1), DAEMON_PID_FILES):
-        terminate(os.path.join(pid_dir, name), timeout=(end - time.monotonic()) / left)
+    for left, (name, command) in zip(range(len(DAEMON_PID_FILES), 0, -1), DAEMON_PID_FILES.items()):
+        terminate(os.path.join(pid_dir, name), command, timeout=(end - time.monotonic()) / left)
 
 
 def main() -> None:
