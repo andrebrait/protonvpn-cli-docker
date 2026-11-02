@@ -1224,14 +1224,14 @@
             }
           },
           "401": {
-            "description": "Authentication required or wrong password",
+            "description": "Wrong WebUI password",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Error"
                 },
                 "example": {
-                  "error": "login required"
+                  "error": "wrong password"
                 }
               }
             }

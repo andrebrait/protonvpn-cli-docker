@@ -154,3 +154,56 @@ The first browser-extraction harness selected the request example `{}` instead o
 - Failed Proton sign-in now returns HTTP 400 rather than a 200 `state:error`, intentionally completing the requested error cutover. Existing WebUI consumers were migrated.
 - API transport remains the existing HTTP listener; use a trusted reverse proxy for TLS outside a trusted network. API_KEY does not make open mode private.
 - No separate mutation-testing run, external dependency audit, or production deployment was performed. No product dependencies were added.
+
+## Fix round 1 — review findings
+
+Addressed all four findings:
+
+1. Added nonempty error fallbacks at the real Supervisor CLI boundary for silent/whitespace-only failed `signout` and `config set`. Messages identify the operation and exit code; existing CLI output is preserved when present. OpenAPI's nonempty Error constraint was not relaxed. Added HTTP tests using the real Supervisor with the existing controlled CLI/tool collaborators, covering both empty and whitespace-only failures, 500/422 responses, retained sign-in state, and an unsaved rejected setting.
+2. Added a complete password-only cookie flow to `/api`: login saving a private cookie jar, authenticated status read, JSON/header-bearing disconnect, and logout clearing the jar. Every protected operation now has a `-b cookies.txt` alternative alongside the existing bearer example; cookie POST examples retain JSON and X-Requested-With headers.
+3. Corrected login's 401 example to `{"error":"wrong password"}` and added a test comparing the served document example to the actual HTTP login failure.
+4. Deleted the old source-scanning/file-size asset test without adding replacement source assertions.
+
+No checks were run mid-flight. After all changes were complete:
+
+```sh
+docker build -t protonvpn-cli:test . &&
+docker run --rm --name t5b-fix-python-$$ -v "$PWD:/src" -w /src \
+  -e PYTHONPATH=/src/rootfs/usr/local/lib/protonvpn-container \
+  --entrypoint python3 protonvpn-cli:test -m unittest discover -s tests/python -t . &&
+docker run --rm --name t5b-fix-openapi-$$ -v "$PWD:/src" -w /src python:3-slim sh -c \
+  'pip install -q openapi-spec-validator && openapi-spec-validator rootfs/usr/local/lib/protonvpn-container/protonvpn_container/openapi.json'
+```
+
+Actual result (exit 0):
+
+```text
+#10 naming to docker.io/library/protonvpn-cli:test done
+#10 unpacking to docker.io/library/protonvpn-cli:test 0.2s done
+Ran 173 tests in 23.096s
+OK
+rootfs/usr/local/lib/protonvpn-container/protonvpn_container/openapi.json: OK
+```
+
+The validator's disposable tooling container again emitted pip's standard root-user warning. No dependencies were installed into a product container.
+
+Started real built-image container `t5b-cookie-9d4edfc9` with `WEBUI_PASSWORD=your-webui-password`, **empty API_KEY**, and a loopback ephemeral publication at `127.0.0.1:32769`. Loaded `/api` in Chromium using the browser global: four flow commands and thirteen protected-operation cookie alternatives rendered, with no browser errors. Extracted the four actual rendered commands and executed them unmodified via `sh -c` in one temporary working directory, without a bearer header. Actual output:
+
+```text
+Cookie flow step 1: curl exit 0, HTTP 200
+Cookie jar mode: 600
+Cookie flow step 2: curl exit 0, HTTP 200
+Cookie write without X-Requested-With: HTTP 403
+Cookie flow step 3: curl exit 0, HTTP 200
+Cookie flow step 4: curl exit 0, HTTP 200
+Cookie read after logout: HTTP 401
+Product logs: test password absent
+t5b-cookie-9d4edfc9: removed
+Released managed tab "t5b-cookie"
+```
+
+The deliberate missing-header probe removed only X-Requested-With from the rendered disconnect command and checked the 403 error body. After executing the rendered logout command, replaying the rendered status command returned 401 with `{"error":"login required"}`. The temporary cookie jar was deleted with its temporary directory.
+
+Additional screenshots: [cookie flow, light](../../../screens/task-5b-cookie-light.png), [cookie flow, dark](../../../screens/task-5b-cookie-dark.png). Verified the dark screenshot visually.
+
+No credentialed VPN checks were performed. Shell unit/full network smoke suites were not rerun in this round: shell/firewall code was unchanged; the original round passed both, and this round exercised the requested complete Python suite, OpenAPI validation, rebuilt image, browser rendering and real cookie curl smoke.

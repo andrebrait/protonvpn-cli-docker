@@ -152,7 +152,7 @@ class Supervisor:
             res = self._run("signout", timeout=SIGNOUT_TIMEOUT)
             say(res.out)
             if res.rc != 0:
-                return False, res.out.strip()
+                return False, res.out.strip() or f"signout failed (exit code {res.rc})"
             self._new_session()  # Proton resets its settings on signout: all are applied again at the next signin
             with self._lock:
                 self._signed_in, self._account = False, ""
@@ -178,7 +178,7 @@ class Supervisor:
             if words:
                 res = self._run("config", "set", setting.cli_key, *words)
                 if res.rc != 0:
-                    return False, res.out.strip()
+                    return False, res.out.strip() or f"config set {setting.cli_key} failed (exit code {res.rc})"
                 message = res.out.strip()
             self._store.save(env, value)
             self._applied.add(setting.cli_key)

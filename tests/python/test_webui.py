@@ -374,14 +374,6 @@ class StaticTest(WebuiCase):
         self.assertEqual(self.get("/webui.py")[0], 404)
         self.assertEqual(self.get("/static/__init__.py")[0], 404)
 
-    def test_static_payload_is_small_and_loads_nothing_from_outside(self):
-        static = Path(webui.__file__).parent / "static"
-        code = [p for p in static.iterdir() if p.suffix in (".html", ".js", ".css")]
-        self.assertLess(sum(p.stat().st_size for p in code), 60 * 1024)  # images excluded
-        for path in code:
-            text = path.read_text(encoding="utf-8")
-            for needle in ("http://", "https://", "@import"):
-                self.assertNotIn(needle, text, f"{path.name}: {needle}")
 
 
 class SettingsTest(WebuiCase):

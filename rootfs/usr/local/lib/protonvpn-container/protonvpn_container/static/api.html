@@ -28,6 +28,11 @@
     <p>An empty <code>API_KEY</code> disables bearer authentication. It does not close an open WebUI: when <code>WEBUI_PASSWORD</code> is empty, anyone who can reach this port can control the VPN. With a password set, use a valid session cookie or bearer key.</p>
     <p>Every POST needs a JSON object. Cookie and open-mode writes also need <code>X-Requested-With: protonvpn-webui</code>; only a valid bearer key skips that header. Errors use <code>{"error": "message"}</code> with a non-success HTTP status. No key or password is shown here.</p>
   </section>
+  <section id="cookie-flow" class="card" aria-labelledby="h-cookie">
+    <h2 id="h-cookie">Password-only cookie flow</h2>
+    <p>With <code>WEBUI_PASSWORD</code> set and <code>API_KEY</code> empty, no bearer key is needed. Replace <code>your-webui-password</code> in the login JSON below. Run these commands in the same directory: log in, read status, request disconnect, then log out. Every protected endpoint also has a cookie example below.</p>
+    <p>Keep <code>cookies.txt</code> private: it grants access until logout or session expiry. The commands set restrictive file permissions. Cookie writes require both the JSON body and <code>X-Requested-With</code> header.</p>
+  </section>
   <nav class="card" aria-label="Endpoints"><h2>Endpoints</h2><ul id="endpoint-links"></ul></nav>
   <p id="docs-status" role="status">Loading API contract…</p>
   <div id="endpoints" class="stack"></div>

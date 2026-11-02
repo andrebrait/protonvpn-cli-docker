@@ -19,6 +19,11 @@
     if (!response.ok) throw new Error("Cannot load contract");
     const doc = await response.json();
     const resolve = (schema) => schema.$ref ? doc.components.schemas[schema.$ref.split("/").pop()] : schema;
+    const cookieFlow = document.getElementById("cookie-flow");
+    example(cookieFlow, "1. Log in and save the session", `umask 077\ncurl --fail-with-body -c cookies.txt -H "Content-Type: application/json" -H "X-Requested-With: protonvpn-webui" -d '{"password":"your-webui-password"}' ${quote(location.origin + "/api/v1/login")}`);
+    example(cookieFlow, "2. Read status", `curl --fail-with-body -b cookies.txt ${quote(location.origin + "/api/v1/status")}`);
+    example(cookieFlow, "3. Request disconnect", `curl --fail-with-body -b cookies.txt -X POST -H "Content-Type: application/json" -H "X-Requested-With: protonvpn-webui" -d '{}' ${quote(location.origin + "/api/v1/disconnect")}`);
+    example(cookieFlow, "4. Log out and clear the cookie jar", `curl --fail-with-body -b cookies.txt -c cookies.txt -X POST -H "Content-Type: application/json" -H "X-Requested-With: protonvpn-webui" -d '{}' ${quote(location.origin + "/api/v1/logout")}`);
     for (const [path, methods] of Object.entries(doc.paths)) {
       for (const [method, op] of Object.entries(methods)) {
         const fullPath = doc.servers[0].url + path;
@@ -52,6 +57,10 @@
         if (path === "/login") curl += " -c cookies.txt";
         curl += ` ${quote(location.origin + fullPath)}`;
         example(card, "Run in your terminal", curl);
+        if (path !== "/login" && op.security?.length !== 0) {
+          const cookieCurl = curl.replace('-H "Authorization: Bearer $API_KEY"', path === "/logout" ? "-b cookies.txt -c cookies.txt" : "-b cookies.txt");
+          example(card, "Cookie alternative (log in first)", cookieCurl);
+        }
         if (path === "/port") example(card, "Plain-text port", `curl --fail-with-body -H "Authorization: Bearer $API_KEY" ${quote(location.origin + fullPath + "?format=text")}`);
         for (const [code, result] of Object.entries(op.responses)) {
           const details = el("details");

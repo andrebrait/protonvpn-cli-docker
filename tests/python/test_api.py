@@ -3,6 +3,9 @@ import json
 from unittest import mock
 
 from protonvpn_container import __main__ as main, webui
+from protonvpn_container.cli import Result
+from protonvpn_container.supervisor import Supervisor
+from tests.python.test_supervisor import Clock, FakeCli, FakeTool
 from tests.python.test_webui import CSRF, WebuiCase
 
 
@@ -115,6 +118,35 @@ class ApiTest(WebuiCase):
         resp, data = self.api("POST", "/api/v1/connect", {}, token="wrong")
         self.assertEqual(resp.status, 403)
         self.assertEqual(set(data), {"error"})
+
+    def test_silent_cli_failures_return_nonempty_http_errors(self):
+        for output in ("", " \n"):
+            with self.subTest(output=output):
+                clock = Clock()
+                cli = FakeCli(clock)
+                supervisor = Supervisor(
+                    self.store, run=cli, tool=FakeTool(), clock=clock,
+                    port_file=self.settings_path + ".port",
+                )
+                supervisor.tick()
+                self.server.ui.supervisor = supervisor
+                cli.responses[("signout",)] = Result(7, output)
+                cli.responses[("config", "set", "netshield", "off")] = Result(9, output)
+                resp, data = self.api("POST", "/api/v1/signout", {})
+                self.assertEqual(resp.status, 500)
+                self.assertEqual(data, {"error": "signout failed (exit code 7)"})
+                self.assertTrue(supervisor.snapshot()["signed_in"])
+                resp, data = self.api("POST", "/api/v1/settings", {"env": "NETSHIELD", "value": "off"})
+                self.assertEqual(resp.status, 422)
+                self.assertEqual(data, {"error": "config set netshield failed (exit code 9)"})
+                self.assertEqual(self.store.effective("NETSHIELD"), "")
+
+    def test_documented_login_error_matches_http_response(self):
+        _, document = self.get_json("/api/v1/openapi.json")
+        status, data, _ = self.post("/api/v1/login", {"password": "wrong"})
+        self.assertEqual(status, 401)
+        example = document["paths"]["/login"]["post"]["responses"]["401"]["content"]["application/json"]["example"]
+        self.assertEqual(data, example)
 
     def test_public_docs_and_document(self):
         for path in ("/api", "/api/v1/openapi.json", "/static/api.js"):
