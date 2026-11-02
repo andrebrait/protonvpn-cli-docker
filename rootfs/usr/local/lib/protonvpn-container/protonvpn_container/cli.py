@@ -34,6 +34,8 @@ def _exec(argv: list[str], timeout: float) -> Result:
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
             check=False,
         )

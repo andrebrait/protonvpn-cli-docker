@@ -32,7 +32,8 @@ def probe(tool, url: str = PROBE_URL) -> str:
         "--show-error", url, timeout=PROBE_TIMEOUT,
     )
     if res.rc != 0:
-        raise ProbeError((res.out.strip().splitlines() or [""])[-1][:REASON_MAX] or f"curl exited with code {res.rc}")
+        reason = (res.out.strip().splitlines() or [""])[-1].partition(" after ")[0]
+        raise ProbeError(reason[:REASON_MAX] or f"curl exited with code {res.rc}")
     try:
         ip = ipaddress.IPv4Address(res.out.strip())
     except ValueError:

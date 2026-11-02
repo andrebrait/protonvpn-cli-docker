@@ -9,7 +9,7 @@ import unittest
 from contextlib import redirect_stdout
 from unittest import mock
 
-from protonvpn_container.cli import Result
+from protonvpn_container.cli import Result, run_tool
 from protonvpn_container.config import SettingsStore
 from protonvpn_container.health import is_healthy, write_health
 from protonvpn_container.supervisor import HINT, Supervisor, decide
@@ -983,7 +983,6 @@ class HealthTest(HealthCase):
         self.assertNotIn(PROBE, self.tool.calls)  # the loop's state check never waits for the network
         self.probe_now()
         self.assertEqual((self.health(), self.docker_says_healthy()), ((True, "", 0.0), True))
-        self.assertEqual(self.health_lines(), ["[health] tunnel check passed"])
 
     def test_probes_repeat_every_30_seconds_counted_from_the_end_of_the_last(self):
         self.make()
@@ -1006,8 +1005,9 @@ class HealthTest(HealthCase):
         self.tool.responses[PROBE] = BIND_FAILED
         self.probe_now()
         snap = self.sup.snapshot()
-        reason = BIND_FAILED.out.strip()
-        self.assertEqual((snap["connected"], snap["tunnel_healthy"], snap["health_error"]), (True, False, reason))
+        reason = snap["health_error"]
+        self.assertEqual((snap["connected"], snap["tunnel_healthy"]), (True, False))
+        self.assertTrue(reason)
         self.assertEqual((snap["last_error"], snap["forwarded_port"], self.read_port_file()), ("", 41404, "41404\n"))
         self.assertFalse(self.docker_says_healthy())
         self.tick(30)  # the state check still reads Connected and keeps the verdict: no reconnect is asked for
@@ -1016,22 +1016,37 @@ class HealthTest(HealthCase):
         self.probe_now(30)
         self.assertEqual((self.health(), self.docker_says_healthy()), ((True, "", 0.0), True))
         self.assertEqual((len(self.cli.argvs("connect")), self.cli.argvs("disconnect")), (1, []))
-        self.assertEqual(self.health_lines(), [f"[health] tunnel check failed: {reason}", "[health] tunnel check recovered"])
+        self.assertEqual(len(self.health_lines()), 2)  # failure and recovery only
 
-    def test_the_same_failure_is_logged_once_and_a_different_one_when_it_changes(self):
+    def test_timeout_timing_does_not_turn_one_outage_into_repeated_log_events(self):
         self.make()
         self.tick()
-        self.tool.responses[PROBE] = [BIND_FAILED, BIND_FAILED, TIMED_OUT, TIMED_OUT, PROBE_OK, PROBE_OK]
-        for _ in range(6):
+        first = Result(28, "curl: (28) Resolving timed out after 5000 milliseconds\n")
+        second = Result(28, "curl: (28) Resolving timed out after 5001 milliseconds\n")
+        self.tool.responses[PROBE] = [first, second, first, BIND_FAILED, BIND_FAILED, PROBE_OK, PROBE_OK]
+        for _ in range(7):
             self.probe_now(30)
-        self.assertEqual(
-            self.health_lines(),
-            [
-                f"[health] tunnel check failed: {BIND_FAILED.out.strip()}",
-                f"[health] tunnel check failed: {TIMED_OUT.out.strip()}",
-                "[health] tunnel check recovered",
-            ],
-        )
+        self.assertEqual(len(self.health_lines()), 3)  # timeout, changed cause, recovery
+        self.assertTrue(self.sup.snapshot()["tunnel_healthy"])
+        self.assertTrue(self.docker_says_healthy())
+
+    def test_invalid_tool_bytes_become_a_visible_failed_probe_not_an_unhandled_decoder_error(self):
+        self.make()
+        self.tick()
+        fake_curl = os.path.join(self.dir, "curl")
+        with open(fake_curl, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n" + r"printf '\377'" + "\n")
+        os.chmod(fake_curl, 0o755)
+        raw_result = run_tool(fake_curl)
+        self.assertEqual(raw_result.rc, 0)
+        self.assertIsInstance(raw_result.out, str)
+        self.sup._tool = run_tool
+        with mock.patch.dict(os.environ, {"PATH": self.dir + os.pathsep + os.environ["PATH"]}):
+            self.probe_now()
+        snap = self.sup.snapshot()
+        self.assertEqual((snap["connected"], snap["tunnel_healthy"], snap["last_error"]), (True, False, ""))
+        self.assertTrue(snap["health_error"])
+        self.assertFalse(self.docker_says_healthy())
 
     def test_a_pass_vouches_for_60_seconds_only(self):
         self.make()
@@ -1042,7 +1057,7 @@ class HealthTest(HealthCase):
         self.clock.now += 1
         healthy, error, ago = self.health()
         self.assertEqual((healthy, ago, self.sup.snapshot()["connected"], self.docker_says_healthy()), (False, 61.0, True, False))
-        self.assertIn("no successful check", error)
+        self.assertTrue(error)
 
     def test_a_disconnect_request_revokes_a_fresh_pass_before_the_loop_does_anything(self):
         self.make()

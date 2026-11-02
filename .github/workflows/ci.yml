@@ -47,7 +47,7 @@ jobs:
           "$RUNNER_TEMP/openapi-venv/bin/pip" install openapi-spec-validator
           "$RUNNER_TEMP/openapi-venv/bin/openapi-spec-validator" rootfs/usr/local/lib/protonvpn-container/protonvpn_container/openapi.json
           PYTHONPATH=rootfs/usr/local/lib/protonvpn-container "$RUNNER_TEMP/openapi-venv/bin/python" -m unittest \
-            tests.python.test_api.ApiTest.test_documented_operations_return_their_actual_contract
+            tests.python.test_api
       - name: Load WireGuard kernel module
         run: sudo modprobe wireguard
       - name: Container smoke tests

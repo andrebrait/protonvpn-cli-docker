@@ -241,7 +241,7 @@ Docker runs `healthcheck.sh` every 30 seconds, with a 10-second timeout, 60-seco
 1. The CLI reports `Status: Connected`.
 2. A traffic check passed within the last 60 seconds: a WireGuard-bound IPv4 HTTPS request to `https://api.ipify.org` returned a public IPv4 address.
 
-The check runs every 30 seconds in a worker thread inside the supervisor. It uses `curl --interface proton0 --ipv4` with no proxy, so it fails rather than falling back to the host's route. It sends no credentials and verifies IPv4 HTTPS only; IPv6 tunnel traffic is not separately checked. A forwarded port does not affect health.
+The check runs every 30 seconds in a worker thread inside the supervisor. It uses `curl --interface if!proton0 --ipv4` with no proxy, so it fails rather than falling back to the host's route. It sends no credentials and verifies IPv4 HTTPS only; IPv6 tunnel traffic is not separately checked. A forwarded port does not affect health.
 
 The probe depends on a third-party service. If `api.ipify.org` is down, blocked, or answers with something other than a public IPv4 address, the check fails and the container reports unhealthy even though the tunnel works. A failed check never disconnects or reconnects the VPN, never changes the CLI's `connected` state, never clears the forwarded port, and never overwrites the CLI's last error. Automatic reconnection still follows only the CLI's own state: the supervisor checks every `RECONNECT_INTERVAL` seconds and retries failed connections with backoff up to 300 seconds. A WebUI disconnect pauses automatic reconnection until you connect again or restart the container.
 
