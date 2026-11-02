@@ -212,7 +212,7 @@ Enable port forwarding in the WebUI (or set `PORT_FORWARDING=on`) and select an 
 
 Switching forwarding **Off** immediately withdraws the advertised port, then makes one best-effort NAT-PMP deletion attempt per locally known live protocol before disabling the native preference. Each attempt has a two-second timeout; native Off can close the gateway endpoint, so cleanup must precede it. The tunnel stays connected. Proton uses internal port zero, so deletion covers all mappings for that tunnel's source identity and protocol, including attached applications sharing it; it cannot distinguish processes. Other Proton clients are outside that scope. Gateways may reject deletion, and mappings left by an earlier process or an unreceived response cannot be tracked. In those cases, remote access can persist until the granted lease expires; withdrawing the advertised port is not proof of immediate remote revocation.
 
-Changing a connected server target, or a Disconnect that fails and leaves the tunnel up, uses the same bounded cleanup while the old tunnel's source identity is still available.
+Changing a connected server target or processing a user Disconnect uses the same bounded cleanup before the native disconnect, while the old tunnel's source identity is still available. A failed disconnect does not renew or repeatedly delete those mappings while the request remains pending.
 
 The forwarded-port file is empty when no mapping is valid. If publishing or clearing it fails, the supervisor tries to remove the old file and retries later. Fully read-only or failed storage can prevent both operations and leave a stale number on disk: treat `/api/v1/port` as authoritative during storage errors and repair `/config` before trusting the file again.
 

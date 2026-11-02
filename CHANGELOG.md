@@ -23,8 +23,8 @@
 - Gateway-granted forwarding lifetimes, queued/failed connection controls, canceled connects, shutdown/connect races and failed port-file replacements.
 - Settings errors hidden behind save messages, rejected save batches, edits lost during pending saves and unsuccessful warning dismissal.
 - LAN-bound quick-start examples, HTTPS proxy cookie guidance and JavaScript syntax checks in CI.
-- Bounded best-effort NAT-PMP deletion before disabling forwarding, disconnecting for a target change, or after a failed Disconnect leaves the tunnel up, without claiming immediate remote revocation if the gateway rejects it.
-- Older saved Proton state could select OpenVPN; every connect now saves WireGuard first, and a non-WireGuard tunnel is disconnected instead of being reported as connected.
+- Bounded best-effort NAT-PMP deletion before disabling forwarding, changing a server target or processing a user Disconnect, without claiming immediate remote revocation if the gateway rejects it.
+- Older saved Proton state could select OpenVPN; every connect now saves WireGuard first, and a non-WireGuard tunnel is disconnected instead of being reported as connected. Protocol rejection replaces stale check errors and respects cancellation without restoring an old server target.
 
 ### Limitations
 

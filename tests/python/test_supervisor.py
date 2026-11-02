@@ -1179,6 +1179,25 @@ class NatpmpTest(SupervisorCase):
                 self.assertEqual(remote["other"], {"udp": 50000, "tcp": 50000})
                 self.assertEqual(self.read_port_file(), "")
 
+    def test_successful_disconnect_deletes_leases_before_the_gateway_disappears(self):
+        self.make(file={"PORT_FORWARDING": "on"})
+        state = self.native_natpmp()
+        self.tick()
+
+        def disconnect():
+            with open(os.path.join(self.dir, "natpmpc.disabled"), "w"):
+                pass
+
+        self.cli.during[("disconnect",)] = disconnect
+        self.sup.request_disconnect()
+        self.tick(1)
+        with open(state) as f:
+            remote = json.load(f)
+        self.assertEqual((remote["own"], remote["deletes"]), ({}, ["udp", "tcp"]))
+        self.assertEqual(remote["other"], {"udp": 50000, "tcp": 50000})
+        self.assertFalse(self.cli.connected)
+        self.assertEqual((self.sup.snapshot()["connected"], self.read_port_file()), (False, ""))
+
     def test_failed_disconnect_deletes_the_mappings_of_the_tunnel_left_up(self):
         self.make(file={"PORT_FORWARDING": "on"})
         state = self.native_natpmp()
@@ -1977,6 +1996,47 @@ class ProtocolTest(SupervisorCase):
                 self.assertEqual(self.cli.argvs("connect"), [])
                 with open(self.native_settings, "rb") as f:
                     self.assertEqual(f.read(), original)
+
+    def test_protocol_rejection_replaces_the_previous_check_failure(self):
+        self.make()
+        self.tick()
+        self.cli.responses[("status",)] = Result(124, "state query timed out")
+        self.tick(30)
+        self.assertIn("state query timed out", self.sup.snapshot()["last_error"])
+        del self.cli.responses[("status",)]
+        self.cli.protocol = "openvpn-tcp"
+        self.tick(30)
+        self.assertIn("openvpn-tcp", self.sup.snapshot()["last_error"])
+        self.assertFalse(self.sup.snapshot()["connected"])
+
+    def test_cancellation_during_protocol_verification_keeps_the_selected_target(self):
+        for phase in ("status", "rejection"):
+            with self.subTest(cancel_during=phase):
+                self.cli.responses.clear()
+                self.cli.during.clear()
+                self.cli.connected = False
+                self.make(file={"COUNTRY": "NL"})
+                self.tick()
+                self.cli.responses[("status",)] = Result(0, STATUS_UP.replace("wireguard", "openvpn-tcp"))
+
+                def status():
+                    if phase == "status":
+                        self.sup.request_disconnect()
+                    else:
+                        self.cli.during[("disconnect",)] = self.sup.request_disconnect
+
+                self.cli.during[("status",)] = status
+                ok, _ = self.apply("COUNTRY", "CH")
+                self.assertTrue(ok)
+                self.assertEqual(self.store.effective("COUNTRY"), "CH")
+                self.assertFalse(self.sup.snapshot()["connected"])
+                self.assertIsNone(self.sup.snapshot()["forwarded_port"])
+                self.cli.responses.clear()
+                self.cli.during.clear()
+                self.sup.request_connect()
+                self.tick(1)
+                self.assertEqual(self.cli.argvs("connect")[-1], ("connect", "--country", "CH"))
+                self.assertTrue(self.sup.snapshot()["connected"])
 
 
 

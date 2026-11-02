@@ -325,7 +325,7 @@ class Supervisor:
         account, st = parse_account(info.out), parse_status(status.out)
         if self._reject_protocol(st):
             with self._lock:
-                self._signed_in, self._account = bool(account), account
+                self._signed_in, self._account, self._check_error = bool(account), account, ""
             return
         with self._lock:
             if self._stop.is_set():
@@ -334,6 +334,7 @@ class Supervisor:
             disconnect = self._disconnect_pending and self._user_disconnected
         disconnect_failed = False
         if disconnect and account and st.connected:
+            self._withdraw_forwarding()  # delete while the old tunnel still reaches the gateway
             result = self._run("disconnect")
             say(result.out)
             disconnect_failed = result.rc != 0
@@ -433,18 +434,20 @@ class Supervisor:
         with self._lock:
             canceled = self._stop.is_set() or self._user_disconnected
         st = Status() if canceled or res.rc != 0 else parse_status(self._run("status").out)
-        if self._reject_protocol(st):
-            return False
+        rejected = self._reject_protocol(st)
         with self._lock:
             canceled = canceled or self._stop.is_set() or self._user_disconnected
             if not canceled:
+                if rejected:
+                    return False
                 self._st = st
                 ok = res.rc == 0 and st.connected
                 self._last_error = "" if ok else (res.out.strip() or f"connect failed (exit code {res.rc})")
                 if ok:
                     self._exit_ip, self._check_error = parse_exit_ip(res.out), ""
         if canceled:  # stop or the user's disconnect may have preceded this late connect
-            say(self._run("disconnect", timeout=STOP_DISCONNECT_TIMEOUT).out)
+            if not rejected:  # protocol rejection already made the bounded disconnect attempt
+                say(self._run("disconnect", timeout=STOP_DISCONNECT_TIMEOUT).out)
             self._drop_connection()
             self._next_check = 0.0  # a newer Connect during compensation must not wait for the old check interval
             return True
@@ -604,10 +607,7 @@ class Supervisor:
             return
         with self._lock:
             connected, leaving = self._st.connected, self._disconnect_pending
-        if not connected or self._stop.is_set():
-            return
-        if leaving:  # a failed Disconnect can leave the tunnel up: delete its mappings while it still can
-            self._withdraw_forwarding()
+        if not connected or leaving or self._stop.is_set():
             return
         if self._clock() >= self._next_natpmp:
             self._refresh_port()
