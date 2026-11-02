@@ -3,6 +3,7 @@ import json
 import os
 import stat
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 
@@ -44,10 +45,17 @@ class FakeCli:
         self.connected = False
         self.connect_rc = 0
         self.connect_duration = 0
+        self.hung = set()  # argv that block for their whole timeout, as a CLI that never answers does
+        self.during = {}  # argv -> fn(), run while that call is blocked: time passes, timers fire
 
     def __call__(self, *args, timeout=120):
         self.calls.append((self.clock.now, args))
         self.timeouts.append((args, timeout))
+        if args in self.hung:
+            self.clock.now += timeout
+            return Result(124, f"protonvpn timed out after {timeout}s\n")
+        if args in self.during:
+            self.during[args]()
         reply = self.responses.get(args)
         if isinstance(reply, list):
             reply = reply.pop(0) if len(reply) > 1 else reply[0]
@@ -98,6 +106,37 @@ class FakeTool:
         return reply
 
 
+class FakeTimers:
+    """threading.Timer stand-in: nothing fires by itself; a test fires the callbacks the real clock would have."""
+
+    class Timer:
+        def __init__(self, interval, function, args):
+            self.interval, self.function, self.args = interval, function, args
+            self.daemon = self.started = self.cancelled = self.fired = False
+
+        def start(self):
+            self.started = True
+
+        def cancel(self):
+            self.cancelled = True
+
+        def fire(self):
+            self.fired = True
+            self.function(*self.args)
+
+    def __init__(self):
+        self.created = []
+
+    def __call__(self, interval, function, args):
+        self.created.append(self.Timer(interval, function, args))
+        return self.created[-1]
+
+    def fire_live(self):
+        for timer in self.created:
+            if timer.started and not (timer.cancelled or timer.fired):
+                timer.fire()
+
+
 class SupervisorCase(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -109,6 +148,7 @@ class SupervisorCase(unittest.TestCase):
         self.tool = FakeTool()
         self.exits = []
         self.out = io.StringIO()
+        self.timers = FakeTimers()
 
     def make(self, environ=None, file=None):
         path = os.path.join(self.dir, "settings.json")
@@ -124,6 +164,7 @@ class SupervisorCase(unittest.TestCase):
             interval=30,
             port_file=self.port_file,
             exit_fn=self.exits.append,
+            timer=self.timers,
         )
         return self.sup
 
@@ -293,21 +334,30 @@ class ConnectTest(SupervisorCase):
 
 
 class SignoutTest(SupervisorCase):
-    def test_signout_holds_the_cli_lock(self):
+    def test_signout_excludes_a_setting_change_while_it_runs(self):
+        self.enterContext(redirect_stdout(self.out))  # two threads print: one redirect for the whole test
         self.make()
-        seen = []
-        inner = self.sup._run
-
-        def run(*args, **kwargs):
-            if args == ("signout",):
-                seen.append(self.sup._cli_lock.locked())  # a connect or `config set` cannot overlap it
-            return inner(*args, **kwargs)
-
-        self.sup._run = run
         self.tick()
-        self.assertEqual(self.sup.sign_out(), (True, "You have been successfully signed out."))
-        self.assertEqual(seen, [True])
-        self.assertFalse(self.sup._cli_lock.locked())
+        started, release, results = threading.Event(), threading.Event(), {}
+
+        def slow_signout():
+            started.set()
+            release.wait(5)
+
+        self.cli.during[("signout",)] = slow_signout
+        signout = threading.Thread(target=lambda: results.update(signout=self.sup.sign_out()))
+        change = threading.Thread(target=lambda: results.update(change=self.sup.apply_setting("NETSHIELD", "malware-only")))
+        signout.start()
+        self.assertTrue(started.wait(5))
+        change.start()
+        change.join(0.3)
+        self.assertTrue(change.is_alive())  # it waits for the signout instead of running `config set` beside it
+        release.set()
+        signout.join(5)
+        change.join(5)
+        self.assertEqual(results["signout"], (True, "You have been successfully signed out."))
+        self.assertEqual(results["change"], (True, "saved; applied at sign in"))  # signed out by then: saved only
+        self.assertEqual([a for a in self.cli.argvs("config") if a[2] == "netshield"], [])
 
     def test_signout_resets_the_session_state_at_once(self):
         self.make(file={"NETSHIELD": "bogus"})
@@ -338,6 +388,68 @@ class SignoutTest(SupervisorCase):
         self.assertEqual(self.sup.sign_out(), (False, "Error: boom"))
         snap = self.sup.snapshot()
         self.assertEqual((snap["signed_in"], snap["account"]), (True, "me@proton.me"))
+
+
+class ConnectionStateTest(SupervisorCase):
+    """What the WebUI and the port file show is never a connection that is ending or that the CLI cannot vouch for."""
+
+    def setUp(self):
+        super().setUp()
+        self.tool.responses[UDP] = self.tool.responses[TCP] = mapped(41404)
+        self.make(environ={"PORT_FORWARDING": "on"})
+        self.tick()
+        self.assertEqual(self.consumer(), (True, 41404, "41404\n"))
+
+    def consumer(self):
+        snap = self.sup.snapshot()
+        return snap["connected"], snap["forwarded_port"], self.read_port_file()
+
+    def fail_next_check(self):
+        self.cli.responses[("info",)] = Result(124, "protonvpn timed out after 120s\n")
+
+    def test_successful_signout(self):
+        self.assertTrue(self.sup.sign_out()[0])
+        self.assertEqual(self.consumer(), (False, None, ""))
+        self.assertEqual(self.sup.snapshot()["exit_ip"], "")
+        self.fail_next_check()
+        self.tick(1)
+        self.assertEqual(self.consumer(), (False, None, ""))
+
+    def test_disconnect_request(self):
+        self.sup.request_disconnect()
+        self.assertEqual(self.consumer(), (False, None, ""))  # before the loop did anything
+        self.fail_next_check()
+        self.tick(1)
+        self.assertEqual(self.consumer(), (False, None, ""))
+
+    def test_new_session(self):
+        self.sup.notify_signed_in()
+        self.assertEqual(self.consumer(), (False, None, ""))
+        self.fail_next_check()
+        self.tick(1)
+        self.assertEqual(self.consumer(), (False, None, ""))
+
+    def test_reconnect_for_a_new_target(self):
+        seen = []
+        self.cli.during[("connect", "--country", "CH")] = lambda: seen.append(self.consumer())
+        self.assertEqual(self.apply("COUNTRY", "CH"), (True, "reconnected"))
+        self.assertEqual(seen, [(False, None, "")])  # while the new connection was being made
+        self.assertEqual(self.consumer(), (True, None, ""))  # the new connection's port is requested by the next tick
+        self.tick(1)
+        self.assertEqual(self.consumer(), (True, 41404, "41404\n"))
+
+    def test_failed_state_check_is_visible_and_recovers(self):
+        self.cli.responses[("status",)] = Result(124, "protonvpn timed out after 120s\n")
+        self.tick(30)
+        snap = self.sup.snapshot()
+        self.assertEqual(self.consumer(), (False, None, ""))
+        self.assertIn("state check failed (rc 124)", snap["last_error"])
+        self.assertEqual((snap["signed_in"], snap["account"]), (True, "me@proton.me"))  # one error is not a signout
+        self.assertEqual(snap["exit_ip"], "205.147.16.78")
+        del self.cli.responses[("status",)]
+        self.tick(30)
+        self.assertEqual(self.consumer(), (True, 41404, "41404\n"))
+        self.assertEqual(self.sup.snapshot()["last_error"], "")
 
 
 class ApplySettingsTest(SupervisorCase):
@@ -468,6 +580,32 @@ class ApplySettingsTest(SupervisorCase):
         self.assertEqual(self.store.effective("COUNTRY"), "NL")
         self.assertEqual(self.cli.calls, [])
 
+    def test_save_racing_a_signin_check_still_reaches_the_cli(self):
+        self.enterContext(redirect_stdout(self.out))
+        self.make(file={"NETSHIELD": "off"})
+        paused, resume, saved, original = threading.Event(), threading.Event(), [], self.store.save
+
+        def slow_save(env, value):
+            paused.set()
+            resume.wait(5)
+            original(env, value)
+
+        self.store.save = slow_save
+        change = threading.Thread(target=lambda: saved.append(self.sup.apply_setting("NETSHIELD", "malware-only")))
+        change.start()
+        self.assertTrue(paused.wait(5))  # mid-save, while the supervisor still believes it is signed out
+        tick = threading.Thread(target=self.sup.tick)
+        tick.start()
+        tick.join(0.3)
+        self.assertTrue(tick.is_alive())  # the tick signs in only once the save is done
+        resume.set()
+        change.join(5)
+        tick.join(5)
+        self.assertEqual(saved, [(True, "saved; applied at sign in")])
+        self.assertEqual(
+            [a for a in self.cli.argvs("config") if a[2] == "netshield"], [("config", "set", "netshield", "malware-only")]
+        )
+
     def test_apply_setting_signed_in_saves_on_success(self):
         self.make()
         self.tick()
@@ -555,6 +693,30 @@ class NatpmpTest(SupervisorCase):
         self.assertNotIn(TCP, self.tool.calls)
         self.assertEqual(self.read_port_file(), "")
 
+    def test_mismatched_udp_and_tcp_ports_publish_nothing(self):
+        self.tool.responses[UDP] = [mapped(41404), mapped(41404)]
+        self.tool.responses[TCP] = [mapped(41404), mapped(50000)]
+        self.make(environ={"PORT_FORWARDING": "on"})
+        self.tick()
+        self.assertEqual(self.read_port_file(), "41404\n")
+        self.tick(45)  # the renewal maps tcp elsewhere
+        self.assertEqual(self.read_port_file(), "")
+        self.assertIsNone(self.sup.snapshot()["forwarded_port"])
+        self.assertIn("mapped udp to 41404 but tcp to 50000", self.out.getvalue())
+
+    def test_a_failed_natpmpc_call_publishes_nothing_even_with_a_mapping_line(self):
+        line = "Mapped public port 41404 protocol UDP to local port 0 lifetime 60\n"
+        for failing, other in ((UDP, TCP), (TCP, UDP)):
+            with self.subTest(failing=failing[4]):
+                self.tool.responses[failing] = Result(1, line)
+                self.tool.responses[other] = mapped(41404)
+                self.make(environ={"PORT_FORWARDING": "on"})
+                self.tick()
+                self.assertIsNone(self.sup.snapshot()["forwarded_port"])
+                self.assertEqual(self.read_port_file(), "")
+                self.assertIn("[natpmp] refresh failed (rc 1)", self.out.getvalue())
+                self.tool.calls.clear()
+
     def test_port_forwarding_switched_off_clears_file_at_once(self):
         self.make(file={"PORT_FORWARDING": "on"})
         self.tick()
@@ -586,6 +748,74 @@ class NatpmpTest(SupervisorCase):
         self.tick(1)
         self.assertEqual(self.read_port_file(), "")
         self.assertIsNone(self.sup.snapshot()["forwarded_port"])
+
+
+class LeaseTest(SupervisorCase):
+    """A forwarded port is advertised only while its 60 s mapping lease can still be alive."""
+
+    def setUp(self):
+        super().setUp()
+        self.tool.responses[UDP] = self.tool.responses[TCP] = mapped(41404)
+        self.tool.responses[WG] = Result(0, "KEY\t100\t10\n")
+        self.make(environ={"PORT_FORWARDING": "on"})
+
+    def consumer(self):
+        return self.sup.snapshot()["forwarded_port"], self.read_port_file()
+
+    def test_a_blocked_cli_does_not_keep_an_expired_lease_advertised(self):
+        self.tick()  # the lease runs 1000 to 1060
+        self.assertEqual(self.consumer(), (41404, "41404\n"))
+        self.assertEqual(self.timers.created[-1].interval, 60)
+        seen = []
+
+        def blocked_for_two_minutes():  # a CLI call that ignores the limit it was given
+            self.clock.now += 120
+            self.timers.fire_live()  # the timer thread, at 1060
+            seen.append(self.consumer())
+
+        self.cli.during[("info",)] = blocked_for_two_minutes
+        self.tick(30)
+        self.assertEqual(seen, [(None, "")])
+        self.assertIn("lease ran out", self.out.getvalue())
+        self.assertEqual(self.consumer(), (41404, "41404\n"))  # renewed once the loop came back
+        self.assertEqual(self.timers.created[-1].interval, 60)
+
+    def test_cli_calls_leave_time_to_renew(self):
+        self.tick()
+        self.tick(30)  # the lease ends at 1060 and the renewal needs 20 s
+        info = [timeout for argv, timeout in self.cli.timeouts if argv == ("info",)]
+        self.assertEqual(info, [120, 10])  # no lease yet, then the time left minus the renewal
+
+    def test_a_hung_cli_returns_before_the_lease_ends(self):
+        self.tick()
+        self.cli.hung.add(("info",))
+        self.tick(30)
+        self.assertLess(self.clock.now, 1060)
+        self.assertEqual(self.consumer(), (None, ""))  # the failed check is shown, not the old port
+
+    def test_a_renewal_comes_before_a_due_state_check(self):
+        self.tick()
+        self.sup.request_connect()  # makes a check due as well
+        renewals = []
+        self.cli.during[("info",)] = lambda: renewals.append(self.tool.calls.count(UDP))
+        self.tick(46)
+        self.assertEqual(renewals, [2])  # the second udp request had already been made when the check began
+
+    def test_the_old_lease_timer_cannot_clear_a_renewed_lease(self):
+        self.tick()
+        old = self.timers.created[-1]
+        self.tick(46)
+        self.assertTrue(old.cancelled)
+        old.fire()  # it was already running when the renewal cancelled it
+        self.assertEqual(self.consumer(), (41404, "41404\n"))
+        self.timers.created[-1].fire()  # the current lease runs out without another renewal
+        self.assertEqual(self.consumer(), (None, ""))
+
+    def test_time_is_read_again_after_a_slow_connect(self):
+        self.cli.connect_duration = 40
+        self.tick()
+        self.assertEqual(self.timers.created[-1].interval, 60)  # counted from the request at 1040
+        self.assertEqual(self.sup.snapshot()["traffic"], [[1040.0, 100, 10]])
 
 
 class TrafficTest(SupervisorCase):

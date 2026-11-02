@@ -1,0 +1,5 @@
+# The image needs rootfs/ and nothing else: no secrets, VCS history, review artifacts or bytecode in the build context.
+*
+!rootfs
+**/__pycache__
+**/*.pyc

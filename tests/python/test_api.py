@@ -1,12 +1,18 @@
 """HTTP contracts: authorization, focused reads, errors, and the shipped document."""
 import json
+import unittest
 from unittest import mock
 
 from protonvpn_container import __main__ as main, webui
 from protonvpn_container.cli import Result
 from protonvpn_container.supervisor import Supervisor
-from tests.python.test_supervisor import Clock, FakeCli, FakeTool
+from tests.python.test_supervisor import TCP, UDP, Clock, FakeCli, FakeTimers, FakeTool, mapped
 from tests.python.test_webui import CSRF, WebuiCase
+
+try:
+    from jsonschema import Draft202012Validator
+except ImportError:  # the image has no jsonschema; CI runs the contract check where it is installed
+    Draft202012Validator = None
 
 
 class ApiTest(WebuiCase):
@@ -140,6 +146,11 @@ class ApiTest(WebuiCase):
                 self.assertEqual(resp.status, 422)
                 self.assertEqual(data, {"error": "config set netshield failed (exit code 9)"})
                 self.assertEqual(self.store.effective("NETSHIELD"), "")
+                cli.responses[("connect", "--country", "XX")] = Result(7, output)  # a target change that reconnects silently
+                resp, data = self.api("POST", "/api/v1/settings", {"env": "COUNTRY", "value": "XX"})
+                self.assertEqual(resp.status, 422)
+                self.assertEqual(data, {"error": "connect failed (exit code 7)"})
+                self.assertEqual(self.store.effective("COUNTRY"), "")
 
     def test_documented_login_error_matches_http_response(self):
         _, document = self.get_json("/api/v1/openapi.json")
@@ -158,20 +169,7 @@ class ApiTest(WebuiCase):
         self.assertEqual(schemes["bearerAuth"], {"type": "http", "scheme": "bearer"})
         self.assertEqual(schemes["cookieAuth"], {"type": "apiKey", "in": "cookie", "name": "session"})
 
-    def check_required(self, data, schema, document):
-        if "$ref" in schema:
-            schema = document["components"]["schemas"][schema["$ref"].rsplit("/", 1)[1]]
-        for part in schema.get("allOf", []):
-            self.check_required(data, part, document)
-        if isinstance(data, dict):
-            self.assertTrue(set(schema.get("required", [])) <= set(data), (data, schema))
-            for key, item in data.items():
-                if key in schema.get("properties", {}):
-                    self.check_required(item, schema["properties"][key], document)
-        if isinstance(data, list) and "items" in schema:
-            for item in data:
-                self.check_required(item, schema["items"], document)
-
+    @unittest.skipIf(Draft202012Validator is None, "needs jsonschema: runs in CI, outside the image")
     def test_documented_operations_return_their_actual_contract(self):
         _, document = self.get_json("/api/v1/openapi.json")
         operation_ids = set()
@@ -186,8 +184,49 @@ class ApiTest(WebuiCase):
                     resp, data = self.api(method.upper(), "/api/v1" + path, body)
                     self.assertEqual(resp.status, 200, data)
                     content = operation["responses"]["200"]["content"]["application/json"]
-                    self.check_required(data, content["schema"], document)
+                    # The components travel with the schema so that its #/components/... references resolve.
+                    schema = {**content["schema"], "components": document["components"]}
+                    self.assertEqual(list(Draft202012Validator(schema).iter_errors(data)), [])
         self.assertEqual(len(operation_ids), 15)
+
+    def live_supervisor(self):
+        """A real supervisor behind the server, with a connection and a forwarded port."""
+        self.environ["PORT_FORWARDING"] = "on"
+        self.clock = Clock()
+        self.cli, tool = FakeCli(self.clock), FakeTool()
+        tool.responses[UDP] = tool.responses[TCP] = mapped(41404)
+        self.port_file = self.settings_path + ".port"
+        supervisor = Supervisor(
+            self.store, run=self.cli, tool=tool, clock=self.clock, port_file=self.port_file, timer=FakeTimers()
+        )
+        self.server.ui.supervisor = supervisor
+        supervisor.tick()
+        return supervisor
+
+    def consumer_view(self):
+        _, status = self.api("GET", "/api/v1/status")
+        _, port = self.api("GET", "/api/v1/port")
+        with open(self.port_file) as f:
+            return status["signed_in"], status["connected"], status["forwarded_port"], port["port"], f.read()
+
+    def test_signout_leaves_no_connection_or_port_for_consumers(self):
+        supervisor = self.live_supervisor()
+        self.assertEqual(self.consumer_view(), (True, True, 41404, 41404, "41404\n"))
+        self.assertEqual(self.api("POST", "/api/v1/signout", {})[0].status, 200)
+        self.assertEqual(self.consumer_view(), (False, False, None, None, ""))
+        self.cli.responses[("info",)] = Result(124, "protonvpn timed out after 120s\n")  # the next check fails
+        self.clock.now += 1
+        supervisor.tick()
+        self.assertEqual(self.consumer_view(), (False, False, None, None, ""))
+
+    def test_failed_state_check_is_not_hidden_behind_the_last_good_state(self):
+        supervisor = self.live_supervisor()
+        self.cli.responses[("info",)] = Result(124, "protonvpn timed out after 120s\n")
+        self.clock.now += 30
+        supervisor.tick()
+        self.assertEqual(self.consumer_view(), (True, False, None, None, ""))  # one error is not a signout
+        self.assertEqual(self.api("GET", "/api/v1/port?format=text")[1], b"")
+        self.assertIn("state check failed (rc 124)", self.api("GET", "/api/v1/status")[1]["last_error"])
 
     def test_short_key_warning_only_at_start(self):
         for key, count in (("k" * 16, 1), ("k" * 64, 0), ("", 0)):

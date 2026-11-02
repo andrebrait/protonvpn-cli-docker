@@ -6,6 +6,8 @@ Run the official Proton VPN CLI in Docker, with a WebUI and a shared VPN network
 
 The image uses Debian 13 slim and includes the CLI, NetworkManager, WireGuard tools, firewall tools, and all runtime dependencies at build time. It does not install packages on startup. A supervisor manages connections and NAT-PMP port forwarding; the WebUI handles sign-in, settings, status, and traffic.
 
+Every build installs exactly one reviewed Proton release: **CLI 1.1.0** with **API core 6.1.1**, pinned in the [`Dockerfile`](Dockerfile) and printed in the build output. A new Proton release is adopted by changing those pins after it is tested, never by merely rebuilding. Published tags are `latest` and, for each release, `X.Y.Z` and `X.Y` (the first is `0.0.1`). The Debian 13 slim base is refreshed at every build.
+
 **Proton does not officially support headless use.** This project supplies the container integration; an upstream CLI change can break it. It is not affiliated with Proton AG. The icon is Proton AG's trademark, used to identify the Proton VPN service.
 
 ## Requirements and compatibility
@@ -33,7 +35,7 @@ docker run -d --name protonvpn-cli \
   -v protonvpn-config:/config \
   -e WEBUI_PASSWORD \
   -e LAN_NETWORKS=192.168.1.0/24 \
-  ghcr.io/andrebrait/protonvpn-cli:latest
+  ghcr.io/andrebrait/protonvpn-cli-docker:latest
 ```
 
 Open `http://YOUR_DOCKER_HOST:8788/`, unlock the WebUI, and sign in to Proton. Until signed in and connected, the container remains running but unhealthy. Keep the published port on a trusted network; the built-in server uses HTTP, not TLS. Use a trusted HTTPS reverse proxy for remote access, rather than exposing it directly to the internet.
@@ -41,7 +43,7 @@ Open `http://YOUR_DOCKER_HOST:8788/`, unlock the WebUI, and sign in to Proton. U
 To build locally instead of pulling a published image:
 
 ```bash
-docker build -t ghcr.io/andrebrait/protonvpn-cli:latest .
+docker build -t ghcr.io/andrebrait/protonvpn-cli-docker:latest .
 ```
 
 ### Docker Compose with an attached application
@@ -51,7 +53,7 @@ Save this as `compose.yaml`. Replace the LAN CIDR, set `WEBUI_PASSWORD` as above
 ```yaml
 services:
   protonvpn-cli:
-    image: ghcr.io/andrebrait/protonvpn-cli:latest
+    image: ghcr.io/andrebrait/protonvpn-cli-docker:latest
     container_name: protonvpn-cli
     restart: unless-stopped
     cap_add:
@@ -171,7 +173,7 @@ Only the VPN container's own cgroup, including `docker exec` sessions, can use d
 
 ## Port forwarding
 
-Enable port forwarding in the WebUI (or set `PORT_FORWARDING=on`) and select an eligible P2P server/account. The supervisor renews NAT-PMP leases about every 45 seconds and exposes the current port in the WebUI, `/config/forwarded_port`, and the API. The file is empty when no port is available; a failed refresh clears it and logs a warning. A lease failure alone does not make the container unhealthy.
+Enable port forwarding in the WebUI (or set `PORT_FORWARDING=on`) and select an eligible P2P server/account. The supervisor renews NAT-PMP leases about every 45 seconds (each lease lasts 60) and exposes the current port in the WebUI, `/config/forwarded_port`, and the API. A port is published only when the gateway maps the same number for both UDP and TCP. The file is empty when no valid port is available: a failed or mismatched refresh, a lease that runs out unrenewed, a disconnect, a sign-out, a reconnect for a new server, or a failed state check all clear it at once and log why. A lease failure alone does not make the container unhealthy.
 
 Configure your torrent client's listening port to the reported value, and update it if the lease changes. The project does **not** configure qBittorrent automatically. VPN-forwarded traffic reaches the shared namespace through the tunnel; publishing a Docker host port is not a substitute for the Proton forwarded port.
 

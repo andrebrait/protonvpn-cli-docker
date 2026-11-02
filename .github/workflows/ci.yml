@@ -39,11 +39,15 @@ jobs:
           -e PYTHONPATH=/src/rootfs/usr/local/lib/protonvpn-container
           --entrypoint python3 protonvpn-cli:test
           -m unittest discover -s tests/python -t .
-      - name: Validate OpenAPI 3.1 contract
+      - name: Installed Proton packages are the pinned versions
+        run: sh tests/versions.sh protonvpn-cli:test
+      - name: Validate the OpenAPI 3.1 document and the API's real responses against it
         run: |
           python3 -m venv "$RUNNER_TEMP/openapi-venv"
           "$RUNNER_TEMP/openapi-venv/bin/pip" install openapi-spec-validator
           "$RUNNER_TEMP/openapi-venv/bin/openapi-spec-validator" rootfs/usr/local/lib/protonvpn-container/protonvpn_container/openapi.json
+          PYTHONPATH=rootfs/usr/local/lib/protonvpn-container "$RUNNER_TEMP/openapi-venv/bin/python" -m unittest \
+            tests.python.test_api.ApiTest.test_documented_operations_return_their_actual_contract
       - name: Load WireGuard kernel module
         run: sudo modprobe wireguard
       - name: Container smoke tests
@@ -76,14 +80,17 @@ jobs:
       - uses: docker/metadata-action@v6
         id: meta
         with:
-          images: ghcr.io/andrebrait/protonvpn-cli
+          images: ghcr.io/andrebrait/protonvpn-cli-docker
           flavor: latest=false
           tags: |
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.event_name == 'schedule' }}
+            type=raw,value=latest
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-
+          labels: |
+            org.opencontainers.image.source=https://github.com/andrebrait/protonvpn-cli-docker
       - name: Publish both architectures with a fresh base
+        id: publish
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -92,3 +99,10 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+      - name: Published packages are the pinned versions on both architectures
+        env:
+          IMAGE: ghcr.io/andrebrait/protonvpn-cli-docker@${{ steps.publish.outputs.digest }}
+        run: |
+          for platform in linux/amd64 linux/arm64; do
+            sh tests/versions.sh "$IMAGE" "$platform"
+          done

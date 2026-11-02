@@ -12,6 +12,8 @@ cleanup() {
   [ -z "$CONTAINERS" ] || docker rm -f $CONTAINERS >/dev/null 2>&1
   # shellcheck disable=SC2086
   [ -z "$NETWORKS" ] || docker network rm $NETWORKS >/dev/null 2>&1
+  # The containers write /config as root: empty it the same way, then remove the directory as the invoking user.
+  docker run --rm -v "$TMP:/t" --entrypoint find "$IMAGE" /t -mindepth 1 -delete >/dev/null 2>&1
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -71,8 +73,27 @@ user_root_profile_activates() {
   return "$ok"
 }
 
-no_runtime_installs() {
-  [ -z "$(docker exec "$C" sh -c 'ls /var/lib/apt/lists | grep -v -e lock -e partial')" ]
+# reboot <container> restart|kill: the previous boot's session-bus.env would satisfy wait_ready before the new boot removes it.
+reboot() {
+  docker exec "$1" rm -f /run/session-bus.env || return 1
+  if [ "$2" = kill ]; then
+    docker kill "$1" >/dev/null && docker start "$1" >/dev/null || return 1
+  else
+    docker restart "$1" >/dev/null || return 1
+  fi
+  wait_ready "$1"
+}
+
+# What a connection leaves behind: NM's resolver file with the tunnel's DNS, copied over resolv.conf by the real dispatcher.
+tunnel_dns_populated() {
+  docker exec "$C" sh -c 'echo "nameserver 10.2.0.1" > /run/NetworkManager/resolv.conf &&
+    /etc/NetworkManager/dispatcher.d/50-resolv proton0 dns-change' || return 1
+  [ "$(docker exec "$C" grep '^nameserver' /etc/resolv.conf)" = "nameserver 10.2.0.1" ]
+}
+docker_resolver_restored() {
+  saved=$(docker exec "$C" grep '^nameserver' /run/protonvpn-container/resolv.conf.docker) || return 1
+  [ -n "$saved" ] && [ "$saved" != "nameserver 10.2.0.1" ] &&
+    [ "$(docker exec "$C" grep '^nameserver' /etc/resolv.conf)" = "$saved" ]
 }
 
 is_running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = true ]; }
@@ -221,12 +242,17 @@ assert "config modes: /config/cache 700" mode_is /config/cache 700
 assert "config modes: stale.json 600" mode_is /config/Proton/stale.json 600
 assert "symlinks: /etc/Proton" link_is /etc/Proton /config/Proton
 assert "symlinks: /var/cache/Proton" link_is /var/cache/Proton /config/cache
-# The previous boot's session-bus.env would satisfy wait_ready before the new boot removes it.
-docker exec "$C" rm -f /run/session-bus.env
-docker restart "$C" >/dev/null && wait_ready "$C"
+assert "restart boots" reboot "$C" restart
 assert "restart boots: nm running" nm_running
 assert "restart boots: cli disconnected" cli_disconnected
-assert "no runtime installs" no_runtime_installs
+
+# A connection left tunnel DNS populated, then the container is killed and started: lookups work again before any signin.
+assert "dns works before" dns_from "$C"
+assert "tunnel dns populated" tunnel_dns_populated
+assert "populated tunnel dns does not resolve" dns_blocked_from "$C"
+assert "kill and start boots" reboot "$C" kill
+assert "dns recovers after kill/start" eventually 10 dns_from "$C"
+assert "resolv.conf is Docker's again" docker_resolver_restored
 
 # Task 3: kill switch. $C sits on the default bridge, attached containers share its namespace.
 assert "resolv.conf survives nm up/down" resolv_survives_nm

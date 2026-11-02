@@ -34,7 +34,8 @@ history, security-key (FIDO2) signin from the WebUI.
 ## Project
 
 - Repository: `andrebrait/protonvpn-cli-docker` (local: `/root/git/protonvpn-cli-docker`).
-- Image: `ghcr.io/andrebrait/protonvpn-cli`, `linux/amd64` and `linux/arm64`.
+- Image: `ghcr.io/andrebrait/protonvpn-cli-docker` (the repository's name), `linux/amd64` and `linux/arm64`. Tags: `latest` on
+  every publication, and `X.Y.Z` / `X.Y` for release tags `vX.Y.Z` (first release `v0.0.1`).
 - License: GPL-3.0 (the image redistributes GPL-3.0 Proton packages).
 
 ## Feasibility evidence (spike, 2026-11-02)
@@ -58,7 +59,7 @@ Container workarounds the spike needed (all carried into the design):
 | Keyring needs a GUI prompt | Secret Service backend | `PROTON_LOADER_OVERRIDES=keyring=json` selects proton-core's JSON-file keyring |
 | State lost on recreate | As root, Proton hard-codes `/etc/Proton` and `/var/cache/Proton` | Symlink both into `/config` |
 | Connect times out after 10 s | Proton's NM profiles carry `permissions=user:root:;`; NM activates them only for a user with a logind session | Write the sd-login records NM reads: `/run/systemd/seats/` and `/run/systemd/users/0` (`STATE=active`, `SESSIONS=c1`, `ACTIVE_SESSIONS=c1`) before starting NM |
-| `/etc/resolv.conf` not updated | Docker bind-mounts it; NM's atomic rename fails with `EBUSY` | `rc-manager=unmanaged` plus an NM dispatcher hook that copies `/run/NetworkManager/resolv.conf` over `/etc/resolv.conf` in place |
+| `/etc/resolv.conf` not updated | Docker bind-mounts it; NM's atomic rename fails with `EBUSY` | `rc-manager=unmanaged` plus an NM dispatcher hook that copies `/run/NetworkManager/resolv.conf` over `/etc/resolv.conf` in place, and puts Docker's saved copy back when NM has no nameserver. `/run` survives a container restart, so before NM starts the firewall init discards the previous run's NM file and, if `/etc/resolv.conf` is that file's copy, restores the saved Docker one (never saving the tunnel's DNS as Docker's) |
 | NM picks systemd-resolved mode | Auto-detection | `dns=default`, `systemd-resolved=false` |
 | CLI cannot reach the session bus from `docker exec` | Bus address only known to the entrypoint | `/usr/local/bin/protonvpn` wrapper sources the bus address and execs `/usr/bin/protonvpn` |
 
@@ -99,10 +100,11 @@ Tests use `unittest`.
   base-image security updates.
 - Everything is installed and configured at build time, in Dockerfile layers. The entrypoint never
   runs `apt`, `dpkg`, `pip` or downloads; a fresh container from the image works as-is.
-- Proton apt repo via `protonvpn-stable-release_<ver>_all.deb` from `repo.protonvpn.com`, version
-  pinned by a build argument.
-- Packages, `--no-install-recommends`: `proton-vpn-cli`, `network-manager`, `dbus`,
-  `wireguard-tools`, `iproute2`, `iptables`, `natpmpc`, `tini`, `ca-certificates`.
+- Proton apt repo via `protonvpn-stable-release_<ver>_all.deb` from `repo.protonvpn.com`; version
+  and the sha256 Proton publishes for it are build arguments.
+- Packages, `--no-install-recommends`: `proton-vpn-cli` and `python3-proton-vpn-api-core` at the exact
+  versions of two build arguments, `network-manager`, `dbus`, `wireguard-tools`, `iproute2`,
+  `iptables`, `natpmpc`, `tini`, `ca-certificates`.
 - Placeholder `proton-vpn-daemon` package built with `dpkg-deb` in the Dockerfile.
 - Files: NM config (`conf.d/container.conf`), dispatcher hook (`dispatcher.d/50-resolv`),
   `protonvpn` wrapper, `entrypoint.sh`, `healthcheck.sh`.
@@ -131,7 +133,7 @@ Single volume `/config`:
 | `/config/Proton/` (← `/etc/Proton`) | CLI settings, JSON keyring (session tokens) | dir `700`, files `600` |
 | `/config/cache/` (← `/var/cache/Proton`) | Server list, CLI logs | dir `700` |
 | `/config/forwarded_port` | Current forwarded port, empty when none | `644` |
-| `/config/settings.json` | Settings saved from the WebUI, plus `webui_banner_dismissed` | `600` |
+| `/config/settings.json` | Settings saved from the WebUI, plus the private `_banner_dismissed` key | `600` |
 
 The entrypoint enforces the modes on every start (the JSON keyring writes files with the default
 umask, so it runs with `umask 077` and fixes existing files).
@@ -278,8 +280,12 @@ A thread in the Python service, every `RECONNECT_INTERVAL` seconds:
    reconnecting until the user connects again or the container restarts.
 4. Connected and effective port forwarding on → every 45 s run
    `natpmpc -a 1 0 udp 60 -g 10.2.0.1` and `natpmpc -a 1 0 tcp 60 -g 10.2.0.1`, parse
-   `Mapped public port N`, write N to `/config/forwarded_port`, log when N changes. On failure log
-   a warning and empty the file.
+   `Mapped public port N` (exit code 0 and 1..65535 required), and publish N in `/config/forwarded_port`
+   and the API only when both protocols return the same N; log when N changes. Otherwise log why and
+   empty the file. The mapping is a 60 s lease: renewals run before the state check, CLI calls
+   leave the time to renew, and a timer empties the port if the lease runs out unrenewed. The
+   published port, the connected state and the exit IP are dropped at once on signout, disconnect,
+   reconnect and new signin, and a failed state check shows as an error instead of the last good state.
 5. Every 5 s while connected: read `wg show proton0 transfer`, keep the last 15 minutes of
    samples in memory (180 points), reset on a new connection.
 6. On `SIGTERM`: `protonvpn disconnect`, stop the WebUI, NM and D-Bus, exit 0. The firewall stays
@@ -305,7 +311,7 @@ All output goes to stdout with `[protonvpn]`, `[natpmp]`, `[firewall]`, `[webui]
   time, 5 failed logins per minute per client address before a 60 s lockout. When unset, the WebUI
   is open, `[webui] WARNING: WEBUI_PASSWORD is not set; the WebUI is open to anyone who can reach
   it` is logged at start, and the page shows a banner whose dismissal is stored in
-  `settings.json` (`webui_banner_dismissed`), so it stays dismissed across browsers and restarts.
+  `settings.json` (private `_banner_dismissed` key), so it stays dismissed across browsers and restarts.
 - State-changing requests are `POST` with a JSON body and require the `X-Requested-With` header
   (blocks cross-site form posts).
 - Account takeover is out of reach by design: the WebUI never displays tokens, the password, or
@@ -363,7 +369,7 @@ health does not depend on the port (a failing NAT-PMP refresh is logged, not fat
 
 `unraid/protonvpn-cli.xml`:
 
-- Repository `ghcr.io/andrebrait/protonvpn-cli:latest`, network `bridge`.
+- Repository `ghcr.io/andrebrait/protonvpn-cli-docker:latest`, network `bridge`.
 - `ExtraParams`: `--cap-add=NET_ADMIN --device=/dev/net/tun --sysctl net.ipv4.conf.all.src_valid_mark=1`.
 - `WebUI`: `http://[IP]:[PORT:8788]/`; Port `8788` → `8788` (TCP).
 - Path: `/config` → `/mnt/user/appdata/protonvpn-cli`.
@@ -392,9 +398,13 @@ health does not depend on the port (a failing NAT-PMP refresh is logged, not fat
 
 ## Risks
 
-- Proton states headless use is unsupported; a CLI or api-core update can break a workaround. Pin
-  the Proton release package version and the CLI version through build arguments; CI smoke test
-  catches boot regressions, the manual checklist catches connect regressions.
+- Proton states headless use is unsupported; a CLI or api-core update can break a workaround. The
+  release package, its sha256 (as Proton publishes it), the CLI and the api-core versions are build
+  arguments whose Dockerfile defaults are the only source: tests and publication both build with
+  them, and the versions that ship are printed in the build output and checked by
+  `tests/versions.sh` (CLI 1.1.0, api-core 6.1.1 for the first release). A new Proton release is a
+  deliberate change of those defaults plus a test run. CI smoke test catches boot regressions, the
+  manual checklist catches connect regressions.
 - The fake sd-login records depend on NM's session-tracking implementation (sd-login reading
   `/run/systemd/users/<uid>`). An NM change could break it; the smoke test should assert NM
   activates a `permissions=user:root` profile (a dummy connection) to catch this without

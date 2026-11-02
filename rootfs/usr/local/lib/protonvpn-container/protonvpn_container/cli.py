@@ -13,7 +13,10 @@ class Result:
     out: str
 
 
-def run(*args: str, timeout: float = 120) -> Result:
+TIMEOUT = 120
+
+
+def run(*args: str, timeout: float = TIMEOUT) -> Result:
     if is_true(os.environ.get("DEBUG", "")):
         args = ("--verbose", *args)
     return _exec(["protonvpn", *args], timeout)

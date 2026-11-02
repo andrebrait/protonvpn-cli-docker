@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <Container version="2">
   <Name>protonvpn-cli</Name>
-  <Repository>ghcr.io/andrebrait/protonvpn-cli:latest</Repository>
-  <Registry>https://ghcr.io/andrebrait/protonvpn-cli</Registry>
+  <Repository>ghcr.io/andrebrait/protonvpn-cli-docker:latest</Repository>
+  <Registry>https://github.com/andrebrait/protonvpn-cli-docker/pkgs/container/protonvpn-cli-docker</Registry>
   <Network>bridge</Network>
   <Privileged>false</Privileged>
   <Support>https://github.com/andrebrait/protonvpn-cli-docker/issues</Support>

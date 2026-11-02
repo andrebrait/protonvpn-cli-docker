@@ -73,5 +73,19 @@ unset WEBUI_PORT
 RULES=$(firewall_rules 4 /)
 check "webui port defaults to 8788" has '-A INPUT -i eth0 -p tcp --dport 8788 -j ACCEPT'
 
+# Restart recovery: resolv.conf and NM's file as the previous run left them.
+kdr() { # kdr <resolv content> <nm content, or - for none> <saved content, or - for none>; prints resolv|saved|nm
+  rm -f "$TMP/resolv" "$TMP/nm" "$TMP/saved"
+  printf '%s\n' "$1" > "$TMP/resolv"
+  [ "$2" = - ] || printf '%s\n' "$2" > "$TMP/nm"
+  [ "$3" = - ] || printf '%s\n' "$3" > "$TMP/saved"
+  keep_docker_resolver "$TMP/resolv" "$TMP/nm" "$TMP/saved"
+  printf '%s|%s|%s' "$(cat "$TMP/resolv")" "$(cat "$TMP/saved")" "$([ -e "$TMP/nm" ] && echo kept || echo removed)"
+}
+check "first boot saves Docker's resolver" eq "$(kdr 'nameserver 127.0.0.11' - -)" 'nameserver 127.0.0.11|nameserver 127.0.0.11|removed'
+check "restart with the tunnel DNS left in place restores Docker's" eq "$(kdr 'nameserver 10.2.0.1' 'nameserver 10.2.0.1' 'nameserver 127.0.0.11')" 'nameserver 127.0.0.11|nameserver 127.0.0.11|removed'
+check "restart keeps a regenerated Docker resolver and drops NM's stale file" eq "$(kdr 'nameserver 192.168.1.1' 'nameserver 10.2.0.1' 'nameserver 127.0.0.11')" 'nameserver 192.168.1.1|nameserver 192.168.1.1|removed'
+check "no saved original: the file is saved as it is" eq "$(kdr 'nameserver 10.2.0.1' 'nameserver 10.2.0.1' -)" 'nameserver 10.2.0.1|nameserver 10.2.0.1|removed'
+
 [ "$FAILED" -eq 0 ] && echo "all ok"
 exit "$FAILED"

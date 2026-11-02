@@ -20,7 +20,7 @@
   <section class="card" aria-labelledby="h-start">
     <h2 id="h-start">Use the API</h2>
     <p>One API for the WebUI and scripts. <a href="/api/v1/openapi.json">Download OpenAPI 3.1 JSON</a>.</p>
-    <p>Generate a random key, set it as the container's <code>API_KEY</code> environment variable, and restart the container. Keep it separate from <code>WEBUI_PASSWORD</code>. Never put secrets in URLs. Use HTTPS outside a trusted local network.</p>
+    <p>Generate a random key, set it as the container's <code>API_KEY</code> environment variable, and recreate the container (a restart does not change a container's environment). Keep it separate from <code>WEBUI_PASSWORD</code>. Never put secrets in URLs. Use HTTPS outside a trusted local network.</p>
     <pre><code>openssl rand -hex 32</code></pre>
     <p class="note">Without OpenSSL:</p>
     <pre><code>docker run --rm python:3-alpine python -c "import secrets; print(secrets.token_urlsafe(32))"</code></pre>

@@ -10,6 +10,7 @@ This is a checklist, not a record of successful tests. Leave unexercised items u
 - [ ] Confirm cgroup v2, host `xt_cgroup` and `wireguard` support, `/dev/net/tun`, and the documented run flags. Check startup logs show the firewall loaded before NetworkManager starts.
 - [ ] Use a fresh test `/config` volume. Set `WEBUI_PASSWORD` and a distinct random `API_KEY` (for example, `openssl rand -hex 32`). Restrict published ports to a trusted network and configure the actual LAN CIDRs.
 - [ ] Start only the VPN container first. Confirm no runtime package installation, the signed-out hint in `docker logs protonvpn-cli`, an accessible WebUI, and unhealthy Docker status while signed out.
+- [ ] Record the installed Proton packages: `sh tests/versions.sh IMAGE` (from a checkout of the same revision) must pass and list CLI 1.1.0 / api-core 6.1.1 for the first release.
 - [ ] Record whether IPv6 internet and IPv6 LAN probes have a working baseline. Mark unavailable IPv6 checks as not exercised, not passed.
 
 ## Authentication and persistence
@@ -33,9 +34,12 @@ This is a checklist, not a record of successful tests. Leave unexercised items u
 - [ ] Change a setting while signed out, then sign in. Confirm it is applied; a rejected upstream value is visible rather than silently ignored.
 - [ ] Recreate with a non-empty setting environment variable. Confirm its value applies, the WebUI field is locked, and API writes to it return 409. Remove/empty the override and recreate; confirm the saved value or Python default returns and the field unlocks. `docker restart` alone cannot change container environment.
 - [ ] Confirm `/etc/resolv.conf` uses the VPN-provided DNS after connection (unless deliberately using custom DNS). Check DNS and the public exit IP from an attached application; compare the exit IP with VPN status rather than the host's normal route.
+- [ ] While connected (VPN DNS in `/etc/resolv.conf`), `docker kill` and `docker start` the VPN container. Before signing in or reconnecting, confirm `docker exec protonvpn-cli getent hosts example.com` works and `/etc/resolv.conf` is Docker's resolver again, not the VPN's `10.2.0.1`; then confirm the session reconnects and DNS follows the tunnel.
 - [ ] On an eligible P2P server/plan, enable port forwarding. Confirm a valid matching port in the WebUI, `/config/forwarded_port`, JSON `/api/v1/port`, and text `/api/v1/port?format=text`. Observe multiple renewals at roughly 45-second intervals.
 - [ ] Configure the torrent listener to that port and confirm inbound reachability using a suitable external peer/probe. This project does not automatically update qBittorrent. Do not mistake a Docker host port publication for VPN forwarding.
 - [ ] Exercise a NAT-PMP refresh failure. Confirm a warning and cleared forwarded port; a connected VPN remains healthy. Restore the path and confirm the port returns.
+- [ ] Confirm the published port is a single number that is reachable over both TCP and UDP. Then stop the gateway answering NAT-PMP (or block UDP 5351 to `10.2.0.1` from the container), and confirm the port clears from the WebUI, `/api/v1/port` and `/config/forwarded_port` within about a minute and returns after restoring the path. Freeze a running CLI call (`kill -STOP`) for over a minute while connected: an expired port must not stay advertised.
+- [ ] While forwarding, Sign out, Disconnect, and change `COUNTRY` in the WebUI. Confirm the connected state, exit IP and port disappear immediately, not at the next check. Make `protonvpn status` fail (for example `kill -STOP` it for its 120-second timeout) and confirm the WebUI shows a state-check error rather than the last good connection.
 - [ ] Generate traffic in the attached application. Confirm the traffic graph changes, API RX/TX totals increase, `/traffic` samples have newest relative time 0, and totals/samples reset on a new connection.
 
 ## Attached applications and namespace lifecycle
@@ -67,7 +71,7 @@ Perform **each row**, observing the three expectation groups below:
 | Signed out | Sign out through the WebUI, verify unhealthy state, then sign back in to recover. |
 
 - [ ] **For every row:** attached probe traffic to non-LAN addresses fails whenever the tunnel is down. Check public TCP 80 and 443, UDP and TCP DNS 53, and another port such as 853 against established baselines. Check direct DNS and Docker embedded DNS (`dig @127.0.0.11 example.com`, when present); neither may fall back outside the tunnel. Record any IPv6 coverage gaps explicitly.
-- [ ] **For every row:** the VPN container's own processes retain only the intended non-LAN direct exceptions: TCP 443 and UDP/TCP 53 to startup resolvers, not arbitrary DNS servers or other ports. Use `docker exec` probes (Python sockets or installed `wget`); attached-container sockets must not inherit these cgroup exceptions. Check IPv4 and available IPv6.
+- [ ] **For every row:** the VPN container's own processes retain only the intended non-LAN direct exceptions: TCP 443 and UDP/TCP 53 to startup resolvers, not arbitrary DNS servers or other ports. Use `docker exec` probes (Python sockets); attached-container sockets must not inherit these cgroup exceptions. Check IPv4 and available IPv6.
 - [ ] **For every row:** loopback and configured LAN access remain usable; no non-LAN bypass is observed. The firewall rules remain installed even when the CLI is absent or signed out.
 - [ ] Observe no continued direct `eth0` traffic from a pre-existing attached flow after the tunnel drops. Use packet capture on the test host/namespace if needed to distinguish encrypted WireGuard traffic from application leaks.
 

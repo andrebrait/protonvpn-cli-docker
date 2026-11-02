@@ -1,7 +1,10 @@
 import io
 import json
 import os
+import re
+import shutil
 import stat
+import subprocess
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -125,17 +128,32 @@ class SettingsStoreTest(unittest.TestCase):
             self.assertEqual(len(values), len(set(values)), env)
             self.assertTrue(all(v and v == v.strip() and " " not in v for v in values), env)
 
-    def test_choices_match_the_cli_help(self):  # `protonvpn config set <key> --help`, CLI 1.0.5
-        self.assertEqual(CHOICES["NETSHIELD"], ("off", "malware-only", "malware-ads-trackers"))
-        self.assertEqual(CHOICES["KILL_SWITCH"], ("off", "standard"))
-        for env in ("PORT_FORWARDING", "VPN_ACCELERATOR", "MODERATE_NAT", "IPV6", "ANONYMOUS_CRASH_REPORTS"):
-            self.assertEqual(CHOICES[env], ("off", "on"), env)
-
     def test_is_true_values(self):
         for value in ("true", "1", "yes", "on", "TRUE", "Yes"):
             self.assertTrue(is_true(value), value)
         for value in ("", "0", "false", "no", "off", "maybe"):
             self.assertFalse(is_true(value), value)
+
+
+class InstalledCliTest(unittest.TestCase):
+    CLI = "/usr/bin/protonvpn"
+
+    @unittest.skipUnless(shutil.which("dbus-run-session") and os.path.exists(CLI), "needs the Proton CLI: runs in the built image")
+    def test_choices_are_what_the_installed_cli_accepts(self):
+        for setting in (s for s in SETTINGS if s.kind == "choice"):
+            with self.subTest(setting=setting.env), tempfile.TemporaryDirectory() as home:
+                # The CLI wants a session bus even to print help.
+                argv = ["dbus-run-session", "--", self.CLI, "config", "set", setting.cli_key, "--help"]
+                run = subprocess.run(argv, env={**os.environ, "HOME": home}, capture_output=True, text=True, timeout=60)
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                lines = run.stdout.splitlines()
+                values = []
+                for line in lines[next(i for i, line in enumerate(lines) if line.strip() == "Values:") + 1 :]:
+                    row = re.match(r"\s+([a-z0-9-]+)\s{2,}\S", line)  # "    value   description"
+                    if row is None:
+                        break
+                    values.append(row.group(1))
+                self.assertEqual(tuple(values), CHOICES[setting.env])
 
 
 if __name__ == "__main__":

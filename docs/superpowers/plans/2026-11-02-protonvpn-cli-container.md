@@ -44,7 +44,7 @@ Reference implementation of every workaround (throwaway spike, read-only): `/tmp
   (`<name>` and `<username>` are printed literally; the code cannot know the container name).
 - Python: standard library only, no pip; package `protonvpn_container` under
   `/usr/local/lib/protonvpn-container` (`PYTHONPATH`).
-- Image `ghcr.io/andrebrait/protonvpn-cli`, platforms `linux/amd64,linux/arm64`. License GPL-3.0.
+- Image `ghcr.io/andrebrait/protonvpn-cli-docker`, platforms `linux/amd64,linux/arm64`. License GPL-3.0.
 - All shell scripts pass `shellcheck -s sh`.
 
 ## Review Focus
@@ -538,7 +538,7 @@ Jobs:
    `IMAGE=protonvpn-cli:test sh tests/smoke.sh`.
 3. `publish` (needs smoke; `push` to `main` and tags `v*`; also weekly `schedule` so base-image
    updates land): buildx + QEMU, `linux/amd64,linux/arm64`, push to
-   `ghcr.io/andrebrait/protonvpn-cli` with tags `latest` (main), `X.Y.Z` / `X.Y` (tags),
+   `ghcr.io/andrebrait/protonvpn-cli-docker` with tags `latest` (every publication), `X.Y.Z` / `X.Y` (tags),
    `sha-<short>`; `permissions: packages: write`.
 
 - [ ] **Step 1: Write the workflow**
@@ -561,7 +561,7 @@ git add -A && git commit -m "ci: lint, tests and multi-arch publish"
 - Consumes: every env var from Global Constraints and the spec's Configuration tables.
 
 - Template: `<Container version="2">`, `Name` `protonvpn-cli`, `Repository`
-  `ghcr.io/andrebrait/protonvpn-cli:latest`, `Network` `bridge`, `WebUI`
+  `ghcr.io/andrebrait/protonvpn-cli-docker:latest`, `Network` `bridge`, `WebUI`
   `http://[IP]:[PORT:8788]/`, `ExtraParams` = the required run flags, `Config` entries: Port
   `8788`→`8788` TCP; Path `/config` → `/mnt/user/appdata/protonvpn-cli`; one Variable per env
   var with description; setting variables empty by default (the WebUI configures them);

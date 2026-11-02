@@ -1,7 +1,13 @@
 ARG BASE_IMAGE=debian:13-slim
 FROM ${BASE_IMAGE}
 ARG DEBIAN_FRONTEND=noninteractive
+# Proton package versions of every build, tests and publication alike: the CLI's prompts and output are parsed, so a new release is
+# adopted by changing these defaults (and testing), not by rebuilding. The checksum is the one Proton publishes for the release package
+# (https://protonvpn.com/support/linux-vpn-debian-ubuntu); change it together with PROTON_RELEASE_VERSION.
 ARG PROTON_RELEASE_VERSION=1.0.10
+ARG PROTON_RELEASE_SHA256=c8a9fffb4ebdd63db08ce7f11c9b0ac394064ae6a210feb9ab63a0f7d8d060a7
+ARG PROTON_CLI_VERSION=1.1.0
+ARG PROTON_API_CORE_VERSION=6.1.1
 
 # proton-vpn-daemon only provides split tunneling (unsupported by the CLI) and pulls BCC/LLVM; satisfy it with an empty package.
 RUN mkdir -p /tmp/dummy/DEBIAN \
@@ -14,13 +20,18 @@ RUN mkdir -p /tmp/dummy/DEBIAN \
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates wget \
  && wget -q "https://repo.protonvpn.com/debian/dists/stable/main/binary-all/protonvpn-stable-release_${PROTON_RELEASE_VERSION}_all.deb" \
+ && echo "${PROTON_RELEASE_SHA256}  protonvpn-stable-release_${PROTON_RELEASE_VERSION}_all.deb" | sha256sum -c - \
  && apt-get install -y --no-install-recommends ./protonvpn-stable-release_*_all.deb \
  && rm -f ./*.deb \
+ && apt-get purge -y --auto-remove wget \
  && rm -rf /var/lib/apt/lists/*
 
+# The versions that ship are printed here, in the build output.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      proton-vpn-cli network-manager dbus wireguard-tools iproute2 iptables natpmpc tini ca-certificates procps tzdata \
+      "proton-vpn-cli=${PROTON_CLI_VERSION}" "python3-proton-vpn-api-core=${PROTON_API_CORE_VERSION}" \
+      network-manager dbus wireguard-tools iproute2 iptables natpmpc tini ca-certificates procps tzdata \
+ && dpkg-query -W proton-vpn-cli python3-proton-vpn-api-core \
  && rm -rf /var/lib/apt/lists/*
 
 COPY rootfs/ /

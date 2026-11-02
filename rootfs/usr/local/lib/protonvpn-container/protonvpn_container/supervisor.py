@@ -30,6 +30,9 @@ HINT = "Not signed in. Sign in from the WebUI or run: docker exec -it <name> pro
 HINT_EVERY = 60
 BACKOFF = (30, 60, 120, 300)
 NATPMP_EVERY = 45
+NATPMP_LEASE = 60  # seconds a mapping lives without a renewal
+# While a lease is held, CLI calls end this long before it does, leaving time for the renewal (two natpmpc calls of up to 10 s).
+RENEW_HEADROOM = 20
 TRAFFIC_EVERY = 5
 TRAFFIC_KEEP = 180  # 15 minutes
 # Cap for `protonvpn disconnect` during shutdown; the caller's total budget may be shorter.
@@ -68,17 +71,20 @@ class Supervisor:
         interval: float = 30,
         port_file: str = PORT_FILE,
         exit_fn=os._exit,
+        timer=threading.Timer,
     ):
         self._store, self._run, self._tool, self._clock = store, run, tool, clock
-        self._interval, self._port_file, self._exit = interval, port_file, exit_fn
+        self._interval, self._port_file, self._exit, self._timer = interval, port_file, exit_fn, timer
         self._thread = None
         self._stop = threading.Event()
         self._cli_lock = threading.Lock()  # one CLI mutation at a time: tick vs apply_setting
         self._lock = threading.Lock()  # guards the state read by snapshot() and the request flags
+        self._port_lock = threading.RLock()  # the published port, its lease and the file; taken before _lock
         self._signed_in, self._account = False, ""
         self._st = Status()
-        self._exit_ip, self._last_error = "", ""
+        self._exit_ip, self._last_error, self._check_error = "", "", ""
         self._port, self._port_synced = None, False
+        self._lease_end = self._lease_timer = None  # of the published port: the timer clears it unless a renewal replaced it
         self._traffic = collections.deque(maxlen=TRAFFIC_KEEP)
         self._settings_errors: dict[str, str] = {}
         self._user_disconnected = self._disconnect_pending = False
@@ -126,7 +132,7 @@ class Supervisor:
                 "exit_ip": self._exit_ip,
                 "forwarded_port": self._port,
                 "traffic": [list(sample) for sample in self._traffic],
-                "last_error": self._last_error,
+                "last_error": self._check_error or self._last_error,
                 "settings_errors": dict(self._settings_errors),
                 "user_disconnected": self._user_disconnected,
             }
@@ -140,9 +146,11 @@ class Supervisor:
     def request_disconnect(self) -> None:
         with self._lock:
             self._user_disconnected = self._disconnect_pending = True
+        self._drop_connection()  # the loop may be busy for a while: the status and port must not outlive the request
         self._next_check = 0.0
 
     def notify_signed_in(self) -> None:
+        self._drop_connection()  # a new session: nothing about the previous one is current
         self._reapply = True
         self._next_check = 0.0
 
@@ -154,6 +162,7 @@ class Supervisor:
             if res.rc != 0:
                 return False, res.out.strip() or f"signout failed (exit code {res.rc})"
             self._new_session()  # Proton resets its settings on signout: all are applied again at the next signin
+            self._drop_connection()  # signing out ends the connection too
             with self._lock:
                 self._signed_in, self._account = False, ""
             self._next_check = 0.0
@@ -165,18 +174,18 @@ class Supervisor:
             return False, f"unknown setting {env}"
         if self._store.locked(env):
             return False, f"{env} is set in the environment and cannot be changed"
-        with self._lock:
-            signed_in = self._signed_in
-        if not signed_in:
-            self._store.save(env, value)
-            return True, "saved; applied at sign in"
-        with self._cli_lock:
+        with self._cli_lock:  # before reading the signin state: a tick must not sign in between that and the save
+            with self._lock:
+                signed_in = self._signed_in
+            if not signed_in:
+                self._store.save(env, value)
+                return True, "saved; applied at sign in"
             if setting.cli_key is None:
                 return self._apply_target(setting, value)
             words = (value or DEFAULTS.get(env, "")).split()
             message = "saved; the CLI keeps its current value"
             if words:
-                res = self._run("config", "set", setting.cli_key, *words)
+                res = self._cli("config", "set", setting.cli_key, *words)
                 if res.rc != 0:
                     return False, res.out.strip() or f"config set {setting.cli_key} failed (exit code {res.rc})"
                 message = res.out.strip()
@@ -202,6 +211,7 @@ class Supervisor:
             self._failures = 0
             self._next_check = 0.0
             return True, "saved; connecting"
+        self._drop_connection()  # reconnecting: the old connection and its port are gone from here on
         say(self._run("disconnect").out)
         if self._connect():
             return True, "reconnected"
@@ -212,33 +222,37 @@ class Supervisor:
     # --- loop ---
 
     def tick(self) -> None:
-        now = self._clock()
         with self._cli_lock:
+            self._forward_port()  # first: a slow state check must not make the lease run out
+            now = self._clock()
             if now >= self._next_check:
                 self._check(now)
+                self._forward_port()  # a connection that came up in this check
+            now = self._clock()  # the check may have taken minutes
             with self._lock:
                 connected = self._st.connected
             if connected and now >= self._next_traffic:
                 self._sample(now)
-            if connected:
-                if not is_true(self._store.effective("PORT_FORWARDING")):
-                    self._set_port(None)
-                elif now >= self._next_natpmp:
-                    self._refresh_port(now)
 
     def _check(self, now: float) -> None:
         self._next_check = now + self._interval
-        info, status = self._run("info"), self._run("status")
+        info, status = self._cli("info"), self._cli("status")
         if info.rc != 0 or status.rc != 0:
             failed = info if info.rc != 0 else status
-            log(f"[protonvpn] state check failed (rc {failed.rc}): {failed.out.strip()}")
+            message = f"state check failed (rc {failed.rc}): {failed.out.strip()}"
+            log(f"[protonvpn] {message}")
+            # The last good status and port must not pass for current ones. The signin state stays: one failed call says nothing about it.
+            self._drop_connection(ended=False)
+            with self._lock:
+                self._check_error = message
+            self._next_natpmp = 0.0  # the port is requested again at the first good check
             return
         account, st = parse_account(info.out), parse_status(status.out)
         if self._reapply:
             self._reapply = False
             self._new_session()
         with self._lock:
-            self._signed_in, self._account, self._st = bool(account), account, st
+            self._signed_in, self._account, self._st, self._check_error = bool(account), account, st, ""
             disconnect, self._disconnect_pending = self._disconnect_pending, False
             user_disconnected = self._user_disconnected
         if disconnect and account and st.connected:
@@ -283,7 +297,7 @@ class Supervisor:
         self._was_connected = connected
 
     def _read_status(self) -> Status:
-        st = parse_status(self._run("status").out)
+        st = parse_status(self._cli("status").out)
         with self._lock:
             self._st = st
         return st
@@ -293,9 +307,9 @@ class Supervisor:
         say(res.out)
         ok = res.rc == 0 and self._read_status().connected
         with self._lock:
-            self._last_error = "" if ok else res.out.strip()
+            self._last_error = "" if ok else (res.out.strip() or f"connect failed (exit code {res.rc})")
             if ok:
-                self._exit_ip = parse_exit_ip(res.out)
+                self._exit_ip, self._check_error = parse_exit_ip(res.out), ""
         if ok:
             self._new_connection()
         return ok
@@ -323,7 +337,7 @@ class Supervisor:
             if key in self._applied or (connected and key == KILL_SWITCH_KEY):
                 continue
             env = env_of[key]
-            res = self._run("config", "set", key, *words)
+            res = self._cli("config", "set", key, *words)
             message = res.out.strip()
             if res.rc == 0:
                 say(res.out)
@@ -350,34 +364,88 @@ class Supervisor:
             with self._lock:
                 self._traffic.append([now, *transfer])
 
-    def _refresh_port(self, now: float) -> None:
-        self._next_natpmp = now + NATPMP_EVERY
+    def _forward_port(self) -> None:
+        """Request or renew the forwarded port when due, ahead of CLI calls that can be slow."""
+        with self._lock:
+            connected, leaving = self._st.connected, self._disconnect_pending
+        if not connected or leaving:
+            return
+        if not is_true(self._store.effective("PORT_FORWARDING")):
+            self._set_port(None)
+        elif self._clock() >= self._next_natpmp:
+            self._refresh_port()
+
+    def _cli(self, *args: str) -> cli.Result:
+        """`protonvpn`, cut short to leave time to renew the lease while a port is published."""
+        end = self._lease_end
+        if end is None:
+            return self._run(*args)
+        return self._run(*args, timeout=max(1.0, min(cli.TIMEOUT, end - self._clock() - RENEW_HEADROOM)))
+
+    def _drop_connection(self, ended: bool = True) -> None:
+        """Forget the status and forwarded port of a connection that is going away or can no longer be vouched for.
+
+        `ended`: it really is going away, so its exit IP is forgotten too.
+        """
+        with self._lock:
+            self._st = Status()
+            if ended:
+                self._exit_ip = ""
+        self._set_port(None)
+
+    def _refresh_port(self) -> None:
+        start = self._clock()  # the lease runs from the first request at the latest
+        self._next_natpmp = start + NATPMP_EVERY
         ports = []
         for proto in ("udp", "tcp"):
-            res = self._tool("natpmpc", "-a", "1", "0", proto, "60", "-g", GATEWAY)
-            port = parse_natpmp_port(res.out)
+            res = self._tool("natpmpc", "-a", "1", "0", proto, str(NATPMP_LEASE), "-g", GATEWAY)
+            port = parse_natpmp_port(res.out) if res.rc == 0 else None
             if port is None:  # a silent gateway makes natpmpc wait minutes: do not try tcp as well
-                log(f"[natpmp] refresh failed: {(res.out.strip().splitlines() or [''])[-1]}")
+                log(f"[natpmp] refresh failed (rc {res.rc}): {(res.out.strip().splitlines() or [''])[-1]}")
                 self._set_port(None)
                 return
             ports.append(port)
-        self._set_port(ports[0])
+        if ports[0] != ports[1]:  # one number must serve both protocols
+            log(f"[natpmp] the gateway mapped udp to {ports[0]} but tcp to {ports[1]}; no port published")
+            self._set_port(None)
+            return
+        self._set_port(ports[0], start + NATPMP_LEASE)
 
-    def _set_port(self, port: int | None) -> None:
-        if port == self._port and self._port_synced:
-            return
-        with self._lock:
-            self._port = port
-        try:
-            self._write_port_file("" if port is None else f"{port}\n")
-        except OSError as exc:
-            if self._port_synced is not None:  # log once per failure streak; the tick may retry every second
-                log(f"[natpmp] cannot write {self._port_file}: {exc}")
-            self._port_synced = None
-            return
-        self._port_synced = True
-        if port is not None:
-            log(f"[natpmp] forwarded port {port}")
+    def _set_port(self, port: int | None, lease_end: float = 0.0) -> None:
+        """Publish `port` (None: no port) until `lease_end`, when a timer clears it unless a renewal replaced the lease."""
+        with self._port_lock:
+            if self._lease_timer is not None:
+                self._lease_timer.cancel()
+                self._lease_timer = None
+            with self._lock:
+                if self._disconnect_pending:  # requested while this lease was being won
+                    port = None
+            self._lease_end = None if port is None else lease_end
+            if port is not None:
+                self._lease_timer = self._timer(max(0.0, lease_end - self._clock()), self._expire, (lease_end,))
+                self._lease_timer.daemon = True
+                self._lease_timer.start()
+            if port == self._port and self._port_synced:
+                return
+            with self._lock:
+                self._port = port
+            try:
+                self._write_port_file("" if port is None else f"{port}\n")
+            except OSError as exc:
+                if self._port_synced is not None:  # log once per failure streak; the tick may retry every second
+                    log(f"[natpmp] cannot write {self._port_file}: {exc}")
+                self._port_synced = None
+                return
+            self._port_synced = True
+            if port is not None:
+                log(f"[natpmp] forwarded port {port}")
+
+    def _expire(self, lease_end: float) -> None:
+        """Timer thread: the lease ran out unrenewed (the loop is stuck or renewals fail), so stop advertising its port."""
+        with self._port_lock:
+            if self._lease_end == lease_end:  # not renewed or cleared meanwhile
+                log("[natpmp] the forwarded port's lease ran out without a renewal")
+                self._set_port(None)
 
     def _write_port_file(self, text: str) -> None:
         tmp = f"{self._port_file}.tmp"

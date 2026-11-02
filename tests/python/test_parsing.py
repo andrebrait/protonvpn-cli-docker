@@ -47,6 +47,12 @@ class ParseNatpmpPortTest(unittest.TestCase):
         out = "readnatpmpresponseorretry() failed : the gateway does not support nat-pmp\n"
         self.assertIsNone(parse_natpmp_port(out))
 
+    def test_only_valid_port_numbers(self):
+        for number, expected in (("1", 1), ("65535", 65535), ("0", None), ("65536", None), ("99999999999", None)):
+            with self.subTest(number=number):
+                out = f"Mapped public port {number} protocol TCP to local port 0 lifetime 60\n"
+                self.assertEqual(parse_natpmp_port(out), expected)
+
 
 class ParseWgTransferTest(unittest.TestCase):
     def test_one_peer(self):

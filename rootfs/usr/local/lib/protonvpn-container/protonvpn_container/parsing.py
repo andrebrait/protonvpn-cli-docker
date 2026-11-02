@@ -40,7 +40,8 @@ def parse_exit_ip(connect_out: str) -> str:
 
 def parse_natpmp_port(out: str) -> int | None:
     match = _NATPMP_PORT.search(out)
-    return int(match.group(1)) if match else None
+    port = int(match.group(1)) if match else 0
+    return port if 1 <= port <= 65535 else None
 
 
 def parse_wg_transfer(out: str) -> tuple[int, int] | None:

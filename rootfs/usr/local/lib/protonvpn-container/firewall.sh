@@ -65,15 +65,27 @@ firewall_rules() {
   set +f
 }
 
+# keep_docker_resolver <resolv.conf> <NM resolv.conf> <saved>: keep Docker's resolv.conf at <saved> for the NM dispatcher.
+# /run and /etc/resolv.conf can outlive a container restart. Nothing runs yet, so NM's file is the previous run's, and a
+# resolv.conf identical to it is the tunnel DNS the dispatcher left behind, not Docker's: put the saved one back and
+# never overwrite the saved one with it. NM's stale file goes before NM starts.
+keep_docker_resolver() {
+  if [ -s "$3" ] && [ -s "$2" ] && cmp -s "$1" "$2"; then
+    cat "$3" > "$1"  # in place: it is a bind mount
+  else
+    cp "$1" "$3"
+  fi
+  chmod 644 "$3"
+  rm -f "$2"
+}
+
 # firewall_init: load both families before anything else touches the network; exit on any failure.
 # iptables-restore without --noflush replaces only the filter table, so Docker's nat rules survive.
 firewall_init() {
   [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = cgroup2fs ] || { fw_log "cgroup v2 required: /sys/fs/cgroup is not cgroup2fs"; exit 1; }
   cg=$(own_cgroup) || { fw_log "cgroup v2 required: no 0:: line in /proc/self/cgroup"; exit 1; }
-  # Keep Docker's resolv.conf: the NM dispatcher restores it when NM has no nameserver to offer.
   mkdir -p /run/protonvpn-container
-  cp /etc/resolv.conf /run/protonvpn-container/resolv.conf.docker
-  chmod 644 /run/protonvpn-container/resolv.conf.docker
+  keep_docker_resolver /etc/resolv.conf /run/NetworkManager/resolv.conf /run/protonvpn-container/resolv.conf.docker
   resolvers=$(sed -n 's/^nameserver[[:space:]]\{1,\}\([^[:space:]]*\).*/\1/p' /etc/resolv.conf)
   set -f
   for fam in 4 6; do
