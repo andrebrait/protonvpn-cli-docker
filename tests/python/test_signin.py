@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from protonvpn_container import signin
 from protonvpn_container.signin import SigninFlow, Step
 
 FAKE_CLI = str(Path(__file__).resolve().parent / "fakebin" / "protonvpn")
@@ -56,6 +57,46 @@ class SigninFlowTest(SigninCase):
         self.assertIn("Invalid 2FA code", step.message)
         self.assertNotIn("654321", step.message)
 
+    def test_wrong_code_asks_again_with_the_cli_message(self):
+        flow = self.flow("2fa-retry")
+        flow.start("me@proton.me", "pw-secret")
+        step = flow.submit_code("654321")
+        self.assertEqual(step.state, "need_code")
+        self.assertIn("Invalid 2FA code", step.message)
+        self.assertNotIn("654321", step.message)  # redacted
+        self.assertNotIn("2FA Token", step.message)  # prompts are stripped
+        self.assertEqual(flow.start("other@proton.me", "pw").state, "error")  # the flow is still the one in progress
+        self.assertEqual(flow.submit_code("123456"), Step("done", "Signed in as me@proton.me"))
+
+    def test_wrong_code_restarts_the_idle_timer(self):
+        flow = self.flow("2fa-retry", timeout=1.5)
+        flow.start("me@proton.me", "pw-secret")  # timer armed: expires at about 1.8 s
+        time.sleep(1.0)
+        self.assertEqual(flow.submit_code("654321").state, "need_code")  # rearmed: expires at about 2.8 s
+        pid = self.pid()
+        time.sleep(0.9)  # past the first deadline
+        os.kill(pid, 0)  # still there
+        self.assertEqual(flow.submit_code("123456").state, "done")
+
+    def test_abandoned_after_a_wrong_code_is_still_killed(self):
+        flow = self.flow("2fa-retry", timeout=1)
+        flow.start("me@proton.me", "pw-secret")
+        flow.submit_code("654321")
+        pid = self.pid()
+        time.sleep(1.6)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        self.assertEqual(flow.start("me@proton.me", "pw-secret").state, "need_code")
+
+    def test_code_with_inner_spaces_is_squeezed(self):
+        flow = self.flow("2fa")
+        flow.start("me@proton.me", "pw-secret")
+        self.assertEqual(flow.submit_code(" 123 456\t").state, "done")
+
+    def test_cli_exit_at_the_prompt_leaves_no_prompt_in_the_message(self):
+        step = self.flow("quit").start("me@proton.me", "pw-secret")
+        self.assertEqual(step, Step("error", "sign-in failed (exit code 1)"))
+
     def test_signin_bad_password_error_message(self):
         step = self.flow("bad").start("me@proton.me", "pw-secret")
         self.assertEqual(step.state, "error")
@@ -88,6 +129,37 @@ class SigninFlowTest(SigninCase):
         flow = self.flow("ok")
         flow.start("me@proton.me", "pw-secret")  # done: nothing waits for a code
         self.assertEqual(flow.submit_code("123456").state, "error")
+
+
+class SigninFailureTest(SigninCase):
+    def test_exception_after_the_password_prompt_kills_the_child_and_frees_the_slot(self):
+        flow = self.flow("2fa")
+        with mock.patch.object(signin._Run, "send", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                flow.start("me@proton.me", "pw-secret")
+        with self.assertRaises(ProcessLookupError):
+            os.kill(self.pid(), 0)  # killed and reaped
+        self.assertEqual(flow.start("me@proton.me", "pw-secret").state, "need_code")  # slot free again
+
+    def test_exception_while_sending_a_code_kills_the_child_and_frees_the_slot(self):
+        flow = self.flow("2fa")
+        self.assertEqual(flow.start("me@proton.me", "pw-secret").state, "need_code")
+        pid = self.pid()
+        with mock.patch.object(signin._Run, "send", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                flow.submit_code("123456")
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        self.assertEqual(flow.submit_code("123456").state, "error")  # nothing is waiting any more
+        self.assertEqual(flow.start("me@proton.me", "pw-secret").state, "need_code")
+
+    def test_lone_surrogate_in_the_password_does_not_wedge_the_flow(self):
+        flow = self.flow("2fa")
+        with self.assertRaises(UnicodeEncodeError):  # the web layer rejects it first; the flow must still clean up
+            flow.start("me@proton.me", "a\ud800")
+        with self.assertRaises(ProcessLookupError):
+            os.kill(self.pid(), 0)
+        self.assertEqual(flow.start("me@proton.me", "pw-secret").state, "need_code")
 
 
 class SigninInputTest(SigninCase):

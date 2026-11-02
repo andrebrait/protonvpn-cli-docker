@@ -68,6 +68,9 @@ class FakeCli:
         if args == ("disconnect",):
             self.connected = False
             return Result(0, "Disconnected.\n")
+        if args == ("signout",):  # signing out ends the connection too
+            self.signed_in = self.connected = False
+            return Result(0, "You have been successfully signed out.\n")
         return Result(0, "")
 
     def times(self, verb):
@@ -287,6 +290,54 @@ class ConnectTest(SupervisorCase):
         self.cli.connected = True  # user runs `protonvpn connect` by hand
         self.tick(30)
         self.assertEqual(len(self.cli.argvs("disconnect")), 1)
+
+
+class SignoutTest(SupervisorCase):
+    def test_signout_holds_the_cli_lock(self):
+        self.make()
+        seen = []
+        inner = self.sup._run
+
+        def run(*args, **kwargs):
+            if args == ("signout",):
+                seen.append(self.sup._cli_lock.locked())  # a connect or `config set` cannot overlap it
+            return inner(*args, **kwargs)
+
+        self.sup._run = run
+        self.tick()
+        self.assertEqual(self.sup.sign_out(), (True, "You have been successfully signed out."))
+        self.assertEqual(seen, [True])
+        self.assertFalse(self.sup._cli_lock.locked())
+
+    def test_signout_resets_the_session_state_at_once(self):
+        self.make(file={"NETSHIELD": "bogus"})
+        self.cli.responses[("config", "set", "netshield", "bogus")] = Result(2, "Error: invalid choice\n")
+        self.tick()
+        self.assertEqual(self.sup.snapshot()["settings_errors"], {"NETSHIELD": "Error: invalid choice"})
+        self.assertTrue(self.sup.sign_out()[0])
+        snap = self.sup.snapshot()  # before any tick
+        self.assertEqual((snap["signed_in"], snap["account"], snap["settings_errors"]), (False, "", {}))
+
+    def test_signout_forces_a_state_check_and_settings_apply_again_at_the_next_signin(self):
+        self.make()
+        self.tick()
+        count = len(self.cli.argvs("config"))
+        infos = len(self.cli.argvs("info"))
+        self.assertTrue(self.sup.sign_out()[0])
+        self.tick(1)  # far sooner than the 30 s check interval
+        self.assertEqual(len(self.cli.argvs("info")), infos + 1)
+        self.assertEqual(len(self.cli.argvs("connect")), 1)  # signed out: nothing reconnects
+        self.cli.signed_in = True  # signs in again from the console
+        self.tick(30)
+        self.assertEqual(len(self.cli.argvs("config")), 2 * count)
+
+    def test_failed_signout_changes_nothing(self):
+        self.make()
+        self.tick()
+        self.cli.responses[("signout",)] = Result(1, "Error: boom\n")
+        self.assertEqual(self.sup.sign_out(), (False, "Error: boom"))
+        snap = self.sup.snapshot()
+        self.assertEqual((snap["signed_in"], snap["account"]), (True, "me@proton.me"))
 
 
 class ApplySettingsTest(SupervisorCase):

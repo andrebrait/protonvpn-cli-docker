@@ -2,6 +2,7 @@ import http.client
 import io
 import json
 import os
+import socket
 import tempfile
 import threading
 import unittest
@@ -10,12 +11,12 @@ from pathlib import Path
 from unittest import mock
 
 from protonvpn_container import webui
-from protonvpn_container.cli import Result
 from protonvpn_container.config import SettingsStore
-from protonvpn_container.signin import Step
+from protonvpn_container.signin import SigninFlow, Step
 
 WARNING = "[webui] WARNING: WEBUI_PASSWORD is not set; the WebUI is open to anyone who can reach it"
 CSRF = {"X-Requested-With": "protonvpn-webui"}
+FAKE_CLI = str(Path(__file__).resolve().parent / "fakebin" / "protonvpn")
 
 
 class StubSupervisor:
@@ -23,6 +24,7 @@ class StubSupervisor:
         self.calls = []
         self.apply_result = (True, "saved")
         self.apply_error = None
+        self.signout_result = (True, "You have been successfully signed out.")
 
     def snapshot(self):
         return {
@@ -50,6 +52,10 @@ class StubSupervisor:
     def notify_signed_in(self):
         self.calls.append(("notify_signed_in",))
 
+    def sign_out(self):
+        self.calls.append(("sign_out",))
+        return self.signout_result
+
     def apply_setting(self, env, value):
         self.calls.append(("apply", env, value))
         if self.apply_error:
@@ -75,6 +81,9 @@ class StubSignin:
 class WebuiCase(unittest.TestCase):
     PASSWORD = ""
 
+    def make_signin(self):
+        return StubSignin()
+
     def setUp(self):
         self.out = io.StringIO()
         self.enterContext(redirect_stdout(self.out))  # the server threads print through sys.stdout
@@ -83,7 +92,7 @@ class WebuiCase(unittest.TestCase):
         self.settings_path = os.path.join(tmp.name, "settings.json")
         self.environ = {}
         self.store = SettingsStore(self.settings_path, environ=self.environ)
-        self.sup, self.signin = StubSupervisor(), StubSignin()
+        self.sup, self.signin = StubSupervisor(), self.make_signin()
         self.server = webui.make_server(0, self.sup, self.store, self.signin, self.PASSWORD)
         self.port = self.server.server_address[1]
         thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
@@ -431,6 +440,34 @@ class SettingsTest(WebuiCase):
             self.assertTrue(reply["message"], body)
         self.assertEqual(self.sup.calls, [])
 
+    def test_custom_dns_must_be_the_cli_syntax(self):
+        bad = (
+            "--help",
+            "-h",
+            "on --help",
+            "off --help",
+            "on --dns",
+            "on --dns --help",
+            "on --dns 1.1.1.1 --help",
+            "off --dns 1.1.1.1",
+            "on 1.1.1.1",
+            "1.1.1.1",
+            "on --dns notanip",
+            "on --dns 1.1.1.1,",
+            "on --dns 1.1.1.1, 8.8.8.8",
+            "on --dns=1.1.1.1",
+            "ON",
+        )
+        for value in bad:
+            status, reply, _ = self.post("/api/v1/settings", {"env": "CUSTOM_DNS", "value": value})
+            self.assertEqual(status, 400, value)
+            self.assertIn("--dns", reply["message"], value)
+        self.assertEqual(self.sup.calls, [])
+
+    def test_custom_dns_accepts_off_on_and_a_server_list(self):
+        for value in ("", "off", "on", "on --dns 1.1.1.1", "on --dns 1.1.1.1,8.8.8.8", "on  --dns  2606:4700:4700::1111"):
+            self.assertEqual(self.post("/api/v1/settings", {"env": "CUSTOM_DNS", "value": value})[0], 200, value)
+
     def test_valid_values_pass(self):
         for env, value in (
             ("SERVER", "NL#914"),
@@ -481,17 +518,80 @@ class SigninRouteTest(WebuiCase):
         self.assertNotIn("pw-never-logged", logged)
         self.assertNotIn("987654", logged)
 
-    def test_signout_runs_the_cli_and_forces_a_state_check(self):
-        with mock.patch.object(webui.cli, "run", return_value=Result(0, "Signed out.\n")) as run:
-            status, body, _ = self.post("/api/v1/signout")
-        run.assert_called_once_with("signout")
-        self.assertEqual((status, body), (200, {"ok": True, "message": "Signed out."}))
-        self.assertEqual(self.sup.calls, [("notify_signed_in",)])
+    def test_signout_goes_through_the_supervisor(self):
+        self.sup.signout_result = (True, "You have been successfully signed out.")
+        status, body, _ = self.post("/api/v1/signout")
+        self.assertEqual((status, body), (200, {"ok": True, "message": "You have been successfully signed out."}))
+        self.assertEqual(self.sup.calls, [("sign_out",)])
 
     def test_failed_signout_reports_the_cli_message(self):
-        with mock.patch.object(webui.cli, "run", return_value=Result(1, "Error: not signed in\n")):
-            status, body, _ = self.post("/api/v1/signout")
+        self.sup.signout_result = (False, "Error: not signed in")
+        status, body, _ = self.post("/api/v1/signout")
         self.assertEqual((status, body), (500, {"ok": False, "message": "Error: not signed in"}))
+
+
+class LoneSurrogateTest(WebuiCase):
+    PASSWORD = "hunter2"
+
+    def test_every_post_route_refuses_a_lone_surrogate_anywhere_in_the_body(self):
+        cookie = self.login()
+        bodies = (
+            '{"password": "a\\ud800"}',
+            '{"value": ["x", {"k": "\\udc00"}]}',
+            '{"\\ud800": 1}',
+        )
+        for route in (r for r in webui.ROUTES if r.method == "POST"):
+            for raw in bodies:
+                status, reply, _ = self.post(route.path, cookie=cookie, raw=raw)
+                self.assertEqual(status, 400, (route.path, raw))
+                self.assertFalse(reply["ok"])
+        self.assertEqual((self.sup.calls, self.signin.calls), ([], []))
+
+    def test_a_surrogate_pair_is_one_valid_character(self):
+        cookie = self.login()
+        body = {"username": "me@proton.me", "password": "pw\U0001f600"}  # json.dumps escapes it as a pair
+        self.assertEqual(self.post("/api/v1/signin", body, cookie=cookie)[0], 200)
+        self.assertEqual(self.signin.calls, [("start", "me@proton.me", "pw\U0001f600")])
+
+    def test_a_poisonous_setting_is_not_saved(self):
+        cookie = self.login()
+        status, _, _ = self.post("/api/v1/settings", raw='{"env": "SERVER", "value": "\\ud800x"}', cookie=cookie)
+        self.assertEqual(status, 400)
+        self.assertEqual(self.sup.calls, [])
+
+
+class RealSigninFlowTest(WebuiCase):
+    """The real SigninFlow behind the real server, with the fake CLI on the pty."""
+
+    def make_signin(self):
+        patcher = mock.patch.dict(os.environ, {"FAKE_SIGNIN": "2fa"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        flow = SigninFlow(argv_prefix=(FAKE_CLI,), timeout=3)
+        self.addCleanup(lambda: flow._run and flow._run.close())
+        return flow
+
+    def test_lone_surrogate_password_is_400_and_a_later_signin_still_works(self):
+        raw = '{"username": "me@proton.me", "password": "a\\ud800"}'
+        self.assertEqual(self.post("/api/v1/signin", raw=raw)[0], 400)
+        status, body, _ = self.post("/api/v1/signin", {"username": "me@proton.me", "password": "pw"})
+        self.assertEqual((status, body["state"]), (200, "need_code"))  # not "sign-in already in progress"
+        status, body, _ = self.post("/api/v1/signin/code", {"code": "123456"})
+        self.assertEqual((status, body["state"]), (200, "done"))
+        self.assertEqual(self.sup.calls, [("notify_signed_in",)])
+
+
+class LogHygieneTest(WebuiCase):
+    def test_control_characters_in_the_request_line_are_escaped_in_the_log(self):
+        with socket.create_connection(("127.0.0.1", self.port), timeout=5) as conn:
+            conn.sendall(b"GET /\x1b[2K\x1b[1G[webui]fake\x9b\x07 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            while conn.recv(4096):
+                pass
+        logged = self.out.getvalue()
+        for char in ("\x1b", "\x9b", "\x07"):
+            self.assertNotIn(char, logged)
+        self.assertIn(r'"GET /\x1b[2K\x1b[1G[webui]fake\x9b\x07 HTTP/1.1" 404', logged)
+        self.assertTrue(all(line.startswith("[webui] ") for line in logged.splitlines()))
 
 
 if __name__ == "__main__":

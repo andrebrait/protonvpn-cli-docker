@@ -7,6 +7,7 @@ the request line and status only: never bodies, passwords or 2FA codes.
 """
 
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -21,7 +22,6 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from urllib.parse import urlsplit
 
-from . import cli
 from .config import CHOICES, SETTINGS
 
 OPEN_WARNING = "[webui] WARNING: WEBUI_PASSWORD is not set; the WebUI is open to anyone who can reach it"
@@ -45,6 +45,24 @@ CSP = (
     "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 )
 SETTINGS_BY_ENV = {s.env: s for s in SETTINGS}
+# Client-controlled text in log lines is escaped like the stdlib does: no forged lines, no terminal control codes.
+LOG_ESCAPES = {c: f"\\x{c:02x}" for c in (*range(0x20), *range(0x7F, 0xA0))} | {ord("\\"): "\\\\"}
+CUSTOM_DNS_SYNTAX = "must be off, on, or on --dns <comma-separated IPv4/IPv6 addresses>, e.g. on --dns 1.1.1.1,8.8.8.8"
+
+
+def custom_dns_ok(value: str) -> bool:
+    """The CLI's `config set custom-dns {off|on} [--dns LIST]`; nothing else may reach its command line."""
+    words = value.split()
+    if words in (["off"], ["on"]):
+        return True
+    if len(words) != 3 or words[:2] != ["on", "--dns"]:
+        return False
+    try:
+        for address in words[2].split(","):
+            ipaddress.ip_address(address)
+    except ValueError:
+        return False
+    return True
 
 
 def invalid_value(env: str, value: str) -> str:
@@ -58,6 +76,8 @@ def invalid_value(env: str, value: str) -> str:
         return "must be true or false"
     if env in OPTION_RISK and value.lstrip().startswith("-"):
         return "must not start with '-'"
+    if env == "CUSTOM_DNS" and value and not custom_dns_ok(value):
+        return CUSTOM_DNS_SYNTAX
     return ""
 
 
@@ -135,7 +155,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.server.ui
 
     def log_message(self, format, *args):
-        print(f"[webui] {self.client_address[0]} {format % args}", flush=True)
+        print(f"[webui] {self.client_address[0]} {(format % args).translate(LOG_ESCAPES)}", flush=True)
 
     def log_request(self, code="-", size="-"):
         if self.command == "GET" and urlsplit(self.path).path == "/api/v1/state" and str(code) == "200":
@@ -237,10 +257,14 @@ class Handler(BaseHTTPRequestHandler):
             return None
         try:
             data = json.loads(self.rfile.read(length)) if length > 0 else None
-        except ValueError:
+            if isinstance(data, dict):
+                # A lone surrogate ("\ud800") is valid JSON but cannot be encoded: it would fail later, in the pty
+                # write or in the CLI call, after the value was accepted. Reject it here, for every route.
+                json.dumps(data, ensure_ascii=False).encode("utf-8")
+        except ValueError:  # not JSON, or a lone surrogate (UnicodeEncodeError)
             data = None
         if not isinstance(data, dict):
-            self._json(400, {"ok": False, "message": "a JSON object body is required"})
+            self._json(400, {"ok": False, "message": "a JSON object body of valid text is required"})
             return None
         return data
 
@@ -310,9 +334,8 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, asdict(step))
 
     def post_signout(self, body: dict) -> None:
-        result = cli.run("signout")
-        self.ui.supervisor.notify_signed_in()  # the supervisor has no sign-out hook; this forces a state check now
-        self._json(200 if result.rc == 0 else 500, {"ok": result.rc == 0, "message": result.out.strip()})
+        ok, message = self.ui.supervisor.sign_out()
+        self._json(200 if ok else 500, {"ok": ok, "message": message})
 
     def post_banner_dismiss(self, body: dict) -> None:
         try:

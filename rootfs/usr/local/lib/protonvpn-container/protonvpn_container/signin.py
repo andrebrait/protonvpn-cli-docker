@@ -63,6 +63,7 @@ class _Run:
         self.lines: list[str] = []  # finished output lines
         self.partial = ""  # the unfinished last line: the prompt we wait at
         self.secrets: list[str] = []
+        self.sent_at = 0  # index in `lines` where the output after the last answer starts
         self.busy = True  # a request thread is working on this run
         self.awaiting_code = False
         self._close_lock = threading.Lock()
@@ -93,11 +94,17 @@ class _Run:
     def send(self, secret: str) -> None:
         self.secrets.append(secret)
         self.partial = ""  # the prompt it answers
-        os.write(self.master, f"{secret}\n".encode())
+        self.sent_at = len(self.lines)  # what the CLI prints from now on is its answer
+        with contextlib.suppress(OSError):  # the CLI already left (EIO); the next read reports how it ended
+            os.write(self.master, f"{secret}\n".encode())
 
     def output(self, *, unfinished: bool) -> str:
-        """What the CLI printed, redacted; the unfinished last line only when it is not a prompt."""
-        text = "\n".join([*self.lines, self.partial] if unfinished else self.lines)
+        """What the CLI printed since the last answer was sent, redacted, without prompts.
+
+        The unfinished last line is included only when `unfinished` and it is not a prompt.
+        """
+        tail = [self.partial] if unfinished and not ANY_PROMPT.search(self.partial) else []
+        text = "\n".join([*self.lines[self.sent_at :], *tail])
         for secret in self.secrets:
             text = text.replace(secret, "***")
         return "\n".join(line.strip() for line in text.split("\n") if line.strip())
@@ -139,23 +146,23 @@ class SigninFlow:
             except OSError as exc:
                 return Step("error", f"cannot run {self._argv[0]}: {exc.strerror or exc}")
             self._run = run
-        ended = self._until_prompt(run, PASSWORD_PROMPT)
-        if ended:
-            return ended
-        run.send(password)
-        ended = self._until_prompt(run, ANY_PROMPT)
-        if ended:
-            return ended
-        if not CODE_PROMPT.search(run.partial):
-            return self._end(run, "the CLI asked for the password again, so it was not accepted")
-        with self._mu:
-            run.busy, run.awaiting_code = False, True
-            self._timer = threading.Timer(self._timeout, self._expire, (run,))
-            self._timer.daemon = True
-            self._timer.start()
-        return Step("need_code")
+        try:  # whatever goes wrong from here on must not leave the child running or the slot taken
+            ended = self._until_prompt(run, PASSWORD_PROMPT)
+            if ended:
+                return ended
+            run.send(password)
+            ended = self._until_prompt(run, ANY_PROMPT)
+            if ended:
+                return ended
+            if not CODE_PROMPT.search(run.partial):
+                return self._end(run, "the CLI asked for the password again, so it was not accepted")
+            return self._ask_for_code(run, "")
+        except BaseException:
+            self._abort(run)
+            raise
 
     def submit_code(self, code: str) -> Step:
+        code = "".join(code.split())  # "123 456" is the same code
         with self._mu:
             run = self._run
             if run is None or run.busy or not run.awaiting_code:
@@ -166,9 +173,35 @@ class SigninFlow:
             run.busy, run.awaiting_code = True, False
             if self._timer is not None:
                 self._timer.cancel()
-        run.send(code.strip())
-        ended = self._until_prompt(run, ANY_PROMPT)
-        return ended or self._end(run, "the CLI asked again, so the code was not accepted")
+        try:
+            run.send(code)
+            ended = self._until_prompt(run, ANY_PROMPT)
+            if ended:
+                return ended
+            if not CODE_PROMPT.search(run.partial):
+                return self._end(run, "the CLI asked for the password again, so the code was not accepted")
+            # The CLI asks for the code again: tell why, and keep the flow (a new login would cost a new password).
+            return self._ask_for_code(run, run.output(unfinished=False) or "the code was not accepted")
+        except BaseException:
+            self._abort(run)
+            raise
+
+    def _ask_for_code(self, run: _Run, message: str) -> Step:
+        with self._mu:
+            run.busy, run.awaiting_code = False, True
+            self._timer = threading.Timer(self._timeout, self._expire, (run,))
+            self._timer.daemon = True
+            self._timer.start()
+        return Step("need_code", message)
+
+    def _abort(self, run: _Run) -> None:
+        """End `run` after an unexpected exception: free the slot, stop the timer, kill the child."""
+        with self._mu:
+            if self._run is run:
+                self._run = None
+                if self._timer is not None:
+                    self._timer.cancel()
+        run.close()
 
     def _until_prompt(self, run: _Run, want: re.Pattern) -> Step | None:
         """None while the CLI waits at a prompt matching `want`; otherwise the final Step."""

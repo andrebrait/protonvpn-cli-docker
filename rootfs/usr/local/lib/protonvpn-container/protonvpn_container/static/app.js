@@ -442,7 +442,8 @@
   function handleStep(data) {
     if (data.state === "need_code") {
       codeStep = true;
-      message("acct-msg", data.message || "Enter the code from your authenticator app (or a recovery code).", "");
+      // the first ask has no message; a message means the CLI refused the last code and asks again
+      message("acct-msg", data.message || "Enter the code from your authenticator app (or a recovery code).", data.message ? "error" : "");
       if (last) renderAccount(last);
       $("signin-code").focus();
       return;

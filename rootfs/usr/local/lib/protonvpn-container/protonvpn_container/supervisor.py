@@ -34,6 +34,7 @@ TRAFFIC_EVERY = 5
 TRAFFIC_KEEP = 180  # 15 minutes
 # Cap for `protonvpn disconnect` during shutdown; the caller's total budget may be shorter.
 STOP_DISCONNECT_TIMEOUT = 5
+SIGNOUT_TIMEOUT = 30  # it holds the CLI lock: a hung signout must not block the loop for the default 120 s
 KILL_SWITCH_KEY = "kill-switch"  # the CLI refuses it while a connection is up
 CLI_REJECTED = (1, 2)  # click ClickException / UsageError; anything else (124, 127, ...) is transient
 # Checks a connect waits for settings that keep failing transiently; the tunnel has priority.
@@ -144,6 +145,19 @@ class Supervisor:
     def notify_signed_in(self) -> None:
         self._reapply = True
         self._next_check = 0.0
+
+    def sign_out(self) -> tuple[bool, str]:
+        """`protonvpn signout`, never overlapping a connect or `config set`; the next check follows at once."""
+        with self._cli_lock:
+            res = self._run("signout", timeout=SIGNOUT_TIMEOUT)
+            say(res.out)
+            if res.rc != 0:
+                return False, res.out.strip()
+            self._new_session()  # Proton resets its settings on signout: all are applied again at the next signin
+            with self._lock:
+                self._signed_in, self._account = False, ""
+            self._next_check = 0.0
+            return True, res.out.strip()
 
     def apply_setting(self, env: str, value: str) -> tuple[bool, str]:
         setting = next((s for s in SETTINGS if s.env == env), None)
