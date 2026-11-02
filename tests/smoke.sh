@@ -173,7 +173,7 @@ print(resp.read().decode())
 # webui_says <container> <path> <grep pattern>
 webui_says() { webui_get "$1" "$2" | grep -q -e "$3"; }
 webui_state_signed_out_with_banner() {
-  out=$(webui_get "$1" /api/state) || return 1
+  out=$(webui_get "$1" /api/v1/state) || return 1
   case $out in "200"*'"signed_in": false'*'"banner": true'*) return 0 ;; esac
   return 1
 }
@@ -263,7 +263,7 @@ assert "webui open: page served" webui_says t5-open / '<title>Proton VPN</title>
 assert "webui open: script served" webui_says t5-open /static/app.js '^200$'
 assert "webui open: traversal refused" webui_says t5-open /static/../webui.py '^404$'
 run_container t5-pw -e WEBUI_PASSWORD=x || { echo "FAIL webui password boot"; exit 1; }
-assert "webui password: state is 401" eventually 20 webui_says t5-pw /api/state '^401$'
+assert "webui password: state is 401" eventually 20 webui_says t5-pw /api/v1/state '^401$'
 assert "webui password: page still loads" webui_says t5-pw / '<title>Proton VPN</title>'
 assert "webui password: no open warning" not_logged t5-pw "$WEBUI_WARNING"
 assert "webui stops within the shutdown budget" graceful_stop t5-open

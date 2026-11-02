@@ -109,7 +109,7 @@
   async function poll() {
     if (document.hidden) return schedule(POLL_MS);
     try {
-      const { status, data } = await api("/api/state");
+      const { status, data } = await api("/api/v1/state");
       if (status === 200) {
         notice("");
         showApp();
@@ -366,7 +366,7 @@
     $("save").disabled = true;
     let failed = 0;
     for (const f of pending) {
-      const { data } = await api("/api/settings", { env: f.setting.env, value: valueOf(f) });
+      const { data } = await api("/api/v1/settings", { env: f.setting.env, value: valueOf(f) });
       f.result = { ok: Boolean(data.ok), text: data.message || (data.ok ? "Saved" : "Not saved") };
       if (data.ok) f.dirty = false;
       else failed += 1;
@@ -415,7 +415,7 @@
     button.disabled = true;
     message("acct-msg", "Signing in…", "");
     try {
-      const { data } = await api("/api/signin", { username: $("signin-user").value.trim(), password: $("signin-password").value });
+      const { data } = await api("/api/v1/signin", { username: $("signin-user").value.trim(), password: $("signin-password").value });
       $("signin-password").value = "";
       handleStep(data);
     } catch (_) {
@@ -430,7 +430,7 @@
     button.disabled = true;
     message("acct-msg", "Checking the code…", "");
     try {
-      const { data } = await api("/api/signin/code", { code: $("signin-code").value.trim() });
+      const { data } = await api("/api/v1/signin/code", { code: $("signin-code").value.trim() });
       $("signin-code").value = "";
       handleStep(data);
     } catch (_) {
@@ -462,7 +462,7 @@
     const button = event.submitter;
     button.disabled = true;
     try {
-      const { status, data } = await api("/api/login", { password: $("login-password").value });
+      const { status, data } = await api("/api/v1/login", { password: $("login-password").value });
       if (status === 200) {
         $("login-password").value = "";
         message("login-msg", "", "");
@@ -483,23 +483,23 @@
   $("signin-form").addEventListener("submit", signIn);
   $("code-form").addEventListener("submit", sendCode);
   $("settings-form").addEventListener("submit", saveSettings);
-  $("connect").addEventListener("click", (e) => run(e.currentTarget, () => api("/api/connect", {})));
-  $("disconnect").addEventListener("click", (e) => run(e.currentTarget, () => api("/api/disconnect", {})));
+  $("connect").addEventListener("click", (e) => run(e.currentTarget, () => api("/api/v1/connect", {})));
+  $("disconnect").addEventListener("click", (e) => run(e.currentTarget, () => api("/api/v1/disconnect", {})));
   $("copy").addEventListener("click", copyPort);
   $("banner-dismiss").addEventListener("click", (e) =>
     run(e.currentTarget, async () => {
-      await api("/api/banner/dismiss", {});
+      await api("/api/v1/banner/dismiss", {});
       $("banner").hidden = true;
     }),
   );
   $("signout").addEventListener("click", (e) =>
     run(e.currentTarget, async () => {
-      const { data } = await api("/api/signout", {});
+      const { data } = await api("/api/v1/signout", {});
       message("acct-msg", data.ok ? "Signed out." : data.message || "Sign-out failed.", data.ok ? "ok" : "error");
     }),
   );
   $("logout").addEventListener("click", async () => {
-    await api("/api/logout", {});
+    await api("/api/v1/logout", {});
     showLogin();
   });
 

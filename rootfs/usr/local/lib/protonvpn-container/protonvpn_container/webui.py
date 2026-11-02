@@ -1,8 +1,9 @@
 """WebUI: the static page and a small JSON API on a ThreadingHTTPServer.
 
-Every `/api/*` route except `login` needs a session cookie while a password is set. Every POST needs
-the `X-Requested-With` header (a cross-site form cannot send it) and a JSON object body. Log lines
-carry the request line and status only: never bodies, passwords or 2FA codes.
+The JSON API lives under `/api/v1/`; ROUTES (end of this module) is the one place listing every route.
+Every route except `login` needs a session cookie while a password is set. Every POST needs the
+`X-Requested-With` header (a cross-site form cannot send it) and a JSON object body. Log lines carry
+the request line and status only: never bodies, passwords or 2FA codes.
 """
 
 import hmac
@@ -14,7 +15,8 @@ import sys
 import threading
 import time
 import traceback
-from dataclasses import asdict
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from urllib.parse import urlsplit
@@ -42,17 +44,6 @@ CSP = (
     "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; "
     "base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 )
-POST_ROUTES = {
-    "/api/login": "login",
-    "/api/logout": "logout",
-    "/api/connect": "connect",
-    "/api/disconnect": "disconnect",
-    "/api/settings": "settings",
-    "/api/signin": "signin",
-    "/api/signin/code": "signin_code",
-    "/api/signout": "signout",
-    "/api/banner/dismiss": "banner_dismiss",
-}
 SETTINGS_BY_ENV = {s.env: s for s in SETTINGS}
 
 
@@ -147,7 +138,7 @@ class Handler(BaseHTTPRequestHandler):
         print(f"[webui] {self.client_address[0]} {format % args}", flush=True)
 
     def log_request(self, code="-", size="-"):
-        if self.command == "GET" and urlsplit(self.path).path == "/api/state" and str(code) == "200":
+        if self.command == "GET" and urlsplit(self.path).path == "/api/v1/state" and str(code) == "200":
             return  # the page polls this every 5 s; logging it would drown the container log
         super().log_request(code, size)
 
@@ -193,10 +184,13 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return True
 
-    # --- GET ---
+    # --- routing ---
 
     def do_GET(self) -> None:
         self._guarded(self._get)
+
+    def do_POST(self) -> None:
+        self._guarded(lambda: self._api("POST", urlsplit(self.path).path))
 
     def _get(self) -> None:
         path = urlsplit(self.path).path
@@ -204,11 +198,8 @@ class Handler(BaseHTTPRequestHandler):
             self._static("index.html")
         elif path.startswith("/static/"):
             self._static(path[len("/static/") :])
-        elif path == "/api/state":
-            if self._authorized():
-                self._json(200, self.ui.state())
         else:
-            self._json(404, {"ok": False, "message": "not found"})
+            self._api("GET", path)
 
     def _static(self, name: str) -> None:
         content_type = CONTENT_TYPES.get(os.path.splitext(name)[1])
@@ -221,21 +212,19 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(200, body, content_type, {"Cache-Control": "no-cache"})
 
-    # --- POST ---
-
-    def do_POST(self) -> None:
-        self._guarded(self._post)
-
-    def _post(self) -> None:
-        route = POST_ROUTES.get(urlsplit(self.path).path)
+    def _api(self, method: str, path: str) -> None:
+        route = ROUTE_INDEX.get((method, path))
         if route is None:
             self._json(404, {"ok": False, "message": "not found"})
-        elif self.headers.get(CSRF_HEADER) != CSRF_VALUE:
+            return
+        if method == "POST" and self.headers.get(CSRF_HEADER) != CSRF_VALUE:
             self._json(403, {"ok": False, "message": f"missing {CSRF_HEADER} header"})
-        elif route == "login" or self._authorized():
-            body = self._body()
-            if body is not None:
-                getattr(self, f"post_{route}")(body)
+            return
+        if route.auth and not self._authorized():  # answered 401
+            return
+        body = self._body() if method == "POST" else {}
+        if body is not None:
+            route.handler(self, body)
 
     def _body(self) -> dict | None:
         """The JSON object body, or None after answering 400/413."""
@@ -254,6 +243,9 @@ class Handler(BaseHTTPRequestHandler):
             self._json(400, {"ok": False, "message": "a JSON object body is required"})
             return None
         return data
+
+    def get_state(self, body: dict) -> None:
+        self._json(200, self.ui.state())
 
     def post_login(self, body: dict) -> None:
         if not self.ui.password:
@@ -329,6 +321,29 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"ok": False, "message": f"could not save the setting: {exc.strerror or exc}"})
         else:
             self._json(200, {"ok": True})
+
+
+@dataclass(frozen=True)
+class Route:
+    method: str
+    path: str
+    handler: Callable  # a Handler method, called as handler(self, body); body is {} for GET
+    auth: bool = True  # needs a session while a password is set
+
+
+ROUTES = (
+    Route("GET", "/api/v1/state", Handler.get_state),
+    Route("POST", "/api/v1/login", Handler.post_login, auth=False),
+    Route("POST", "/api/v1/logout", Handler.post_logout),
+    Route("POST", "/api/v1/connect", Handler.post_connect),
+    Route("POST", "/api/v1/disconnect", Handler.post_disconnect),
+    Route("POST", "/api/v1/settings", Handler.post_settings),
+    Route("POST", "/api/v1/signin", Handler.post_signin),
+    Route("POST", "/api/v1/signin/code", Handler.post_signin_code),
+    Route("POST", "/api/v1/signout", Handler.post_signout),
+    Route("POST", "/api/v1/banner/dismiss", Handler.post_banner_dismiss),
+)
+ROUTE_INDEX = {(route.method, route.path): route for route in ROUTES}
 
 
 def make_server(port: int, supervisor, store, signin_flow, password: str) -> ThreadingHTTPServer:

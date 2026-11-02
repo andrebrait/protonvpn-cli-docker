@@ -290,8 +290,8 @@ All output goes to stdout with `[protonvpn]`, `[natpmp]`, `[firewall]`, `[webui]
 ### WebUI
 
 - One page, plain HTML/CSS/JS shipped as static files in the package; no build step, no external
-  CDN (it must work while the tunnel is down). JSON API under `/api/`; the page polls
-  `/api/state` every 5 s.
+  CDN (it must work while the tunnel is down). JSON API under `/api/v1/`; the page polls
+  `/api/v1/state` every 5 s.
 - Shows: connection state; server, city and country, load, protocol (from `protonvpn status`);
   exit IP (from the connect output, kept until the next connect); forwarded port with a copy
   button; traffic totals since connect and a live up/down rate graph (inline SVG) over the last
@@ -339,7 +339,7 @@ health does not depend on the port (a failing NAT-PMP refresh is logged, not fat
 - Credential-free smoke test (CI, `tests/smoke.sh`): container starts, NetworkManager runs,
   `protonvpn status` prints `Status: Disconnected`, health is unhealthy with the signin hint in the
   logs, an outbound request to a public non-Proton address fails (firewall closed), the WebUI
-  answers on `WEBUI_PORT` (open without a password, `401` on `/api/state` with one).
+  answers on `WEBUI_PORT` (open without a password, `401` on `/api/v1/state` with one).
 - Manual credentialed checklist (`docs/manual-test.md`), run before each release: signin with 2FA
   from the WebUI and from the console; connect by country, by server, with `P2P`; DNS points at
   Proton; forwarded port file and WebUI populated and refreshed; traffic graph moves; session

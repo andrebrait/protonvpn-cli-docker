@@ -182,7 +182,7 @@ class StartWebuiTest(unittest.TestCase):
         with redirect_stdout(out):
             server = start_webui(StubSupervisor(), self.store, {"WEBUI_PORT": str(port), "WEBUI_PASSWORD": ""})
             self.assertIsNotNone(server)
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/state", timeout=5) as resp:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/v1/state", timeout=5) as resp:
                 self.assertTrue(json.load(resp)["banner"])
             server.shutdown()
             server.server_close()
