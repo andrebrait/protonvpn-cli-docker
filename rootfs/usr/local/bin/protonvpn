@@ -1,0 +1,5 @@
+#!/bin/sh
+# Lets `docker exec -it <ctr> protonvpn ...` reach the session bus started by the entrypoint.
+# shellcheck source=/dev/null
+. /run/session-bus.env
+exec /usr/bin/protonvpn "$@"

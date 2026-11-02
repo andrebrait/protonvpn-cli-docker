@@ -1,0 +1,6 @@
+#!/bin/sh
+# Docker bind-mounts /etc/resolv.conf, so NM cannot rename over it; copy in place instead.
+[ -r /run/NetworkManager/resolv.conf ] || exit 0
+case "$2" in
+  dns-change|up|down) cat /run/NetworkManager/resolv.conf > /etc/resolv.conf ;;
+esac
