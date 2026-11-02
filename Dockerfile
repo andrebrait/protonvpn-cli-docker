@@ -34,5 +34,7 @@ ENV HOME=/config \
     RECONNECT_INTERVAL=30 \
     LAN_NETWORKS=
 
+ENV PYTHONPATH=/usr/local/lib/protonvpn-container
+
 VOLUME /config
 ENTRYPOINT ["tini", "--", "/usr/local/bin/entrypoint.sh"]
