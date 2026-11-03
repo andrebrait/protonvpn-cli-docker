@@ -108,5 +108,7 @@ jobs:
           IMAGE: ghcr.io/andrebrait/protonvpn-cli-docker@${{ steps.publish.outputs.digest }}
         run: |
           for platform in linux/amd64 linux/arm64; do
+            # The runner's classic image store keeps one local image per digest: drop the previous platform's copy first.
+            docker image rm "$IMAGE" >/dev/null 2>&1 || true
             sh tests/versions.sh "$IMAGE" "$platform"
           done
