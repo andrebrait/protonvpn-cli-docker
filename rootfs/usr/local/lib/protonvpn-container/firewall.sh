@@ -1,0 +1,196 @@
+#!/bin/sh
+# Fail-closed kill switch. Sourced by entrypoint.sh; see "Kill switch" in the design spec.
+
+fw_log() { echo "[firewall] $*"; }
+
+# own_cgroup [file]: print the cgroup v2 path from /proc/self/cgroup; exit 1 without a 0:: line.
+own_cgroup() {
+  while IFS= read -r line; do
+    case $line in 0::*) printf '%s\n' "${line#0::}"; return 0 ;; esac
+  done < "${1:-/proc/self/cgroup}"
+  return 1
+}
+
+# webui_networks: print WEBUI_ALLOWED_NETWORKS normalized, one IP or CIDR per line; nothing when it is unset or empty (no source
+# restriction). Never resolves a name: every entry (an empty one too) must be an IP or a CIDR, or the status is 1 and a typo cannot
+# leave the WebUI open to all.
+webui_networks() {
+  [ -n "${WEBUI_ALLOWED_NETWORKS:-}" ] || return 0
+  python3 -c '
+import ipaddress, re, sys
+try:
+    for entry in sys.argv[1].split(","):
+        entry = entry.strip()
+        # Narrower than ipaddress: its netmask form ("/0.0.0.0" is "/0") and IPv6 zone ids are not CIDRs.
+        if not re.fullmatch(r"[0-9A-Fa-f:.]+(/[0-9]+)?", entry):
+            raise ValueError(f"{entry!r} is not an IP address or CIDR")
+        print(ipaddress.ip_network(entry, strict=False))
+except ValueError as err:
+    sys.exit(f"[firewall] WEBUI_ALLOWED_NETWORKS: {err}")
+' "$WEBUI_ALLOWED_NETWORKS"
+}
+
+# firewall_rules <4|6> <own_cgroup> [resolvers...]: print an iptables-restore *filter document; status 1 (nothing printed)
+# when WEBUI_ALLOWED_NETWORKS is invalid.
+# Reads LAN_NETWORKS (comma-separated CIDRs), WEBUI_ALLOWED_NETWORKS and WEBUI_PORT (default 8788) from the environment.
+firewall_rules() {
+  fam=$1 cg=$2; shift 2
+  allow=$(webui_networks) || return 1
+  set -f  # CIDR and resolver lists are expanded unquoted: no globbing
+  echo '*filter'
+  echo ':INPUT DROP [0:0]'
+  echo ':OUTPUT DROP [0:0]'
+  echo ':FORWARD DROP [0:0]'
+  echo ':WEBUI_HTTP - [0:0]'
+  # Every packet to the WebUI port is judged here first, so no accept below (lo, ESTABLISHED, LAN, tunnel) can wave it through.
+  # The tunnel never reaches the WebUI, allowed or not; with a list, what it does not name is dropped, loopback included.
+  # A listed source falls through to those accepts: the list only narrows who may connect, never adds an interface.
+  echo "-A INPUT -p tcp --dport ${WEBUI_PORT:-8788} -j WEBUI_HTTP"
+  echo '-A WEBUI_HTTP -i proton0 -j DROP'
+  if [ -n "$allow" ]; then
+    for net in $allow; do
+      case $net in *:*) [ "$fam" = 6 ] || continue ;; *) [ "$fam" = 4 ] || continue ;; esac
+      echo "-A WEBUI_HTTP -s $net -j RETURN"
+    done
+    echo '-A WEBUI_HTTP -j DROP'
+  fi
+  if [ "$fam" = 4 ]; then
+    # Docker's embedded DNS answers on lo but forwards outside the tunnel: own cgroup only.
+    echo "-A OUTPUT -o lo -d 127.0.0.11 -m cgroup --path $cg -j ACCEPT"
+    echo '-A OUTPUT -o lo -d 127.0.0.11 -j DROP'
+  fi
+  echo '-A OUTPUT -o lo -j ACCEPT'
+  echo '-A INPUT -i lo -j ACCEPT'
+  echo '-A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT'
+  # Replies leave eth0 only from this container's own sockets; attached flows get nothing here.
+  echo "-A OUTPUT -o eth0 -m conntrack --ctstate ESTABLISHED,RELATED -m cgroup --path $cg -j ACCEPT"
+  echo '-A OUTPUT -o proton0 -j ACCEPT'
+  echo '-A INPUT -i proton0 -j ACCEPT'
+  echo '-A OUTPUT -m mark --mark 0xea13b2c -j ACCEPT'
+  for net in $(echo "${LAN_NETWORKS:-}" | tr ',' ' '); do
+    case $net in *:*) [ "$fam" = 6 ] || continue ;; *) [ "$fam" = 4 ] || continue ;; esac
+    echo "-A OUTPUT -o eth0 -d $net -j ACCEPT"
+    echo "-A INPUT -i eth0 -s $net -j ACCEPT"
+  done
+  if [ "$fam" = 6 ]; then
+    # Neighbour discovery, or no IPv6 peer on the LAN is reachable (kernel-originated, no cgroup).
+    for t in neighbour-solicitation neighbour-advertisement; do
+      echo "-A OUTPUT -o eth0 -p ipv6-icmp --icmpv6-type $t -j ACCEPT"
+      echo "-A INPUT -i eth0 -p ipv6-icmp --icmpv6-type $t -j ACCEPT"
+    done
+  fi
+  echo "-A INPUT -i eth0 -p tcp --dport ${WEBUI_PORT:-8788} -j ACCEPT"
+  # The SYN-ACK of a listener carries no matchable cgroup, so WebUI replies are matched by port;
+  # ESTABLISHED limits this to flows that were opened inbound to the WebUI port.
+  echo "-A OUTPUT -o eth0 -p tcp --sport ${WEBUI_PORT:-8788} -m conntrack --ctstate ESTABLISHED -j ACCEPT"
+  echo "-A OUTPUT -o eth0 -m cgroup --path $cg -p tcp --dport 443 -j ACCEPT"
+  for r in "$@"; do
+    r=${r%%%*}  # drop an IPv6 zone id
+    case $r in
+      '') continue ;;
+      *[!0-9a-fA-F:.]*) continue ;;
+      *:*) [ "$fam" = 6 ] || continue ;;
+      *) [ "$fam" = 4 ] || continue ;;
+    esac
+    echo "-A OUTPUT -o eth0 -m cgroup --path $cg -p udp --dport 53 -d $r -j ACCEPT"
+    echo "-A OUTPUT -o eth0 -m cgroup --path $cg -p tcp --dport 53 -d $r -j ACCEPT"
+  done
+  echo 'COMMIT'
+  set +f
+}
+
+# keep_docker_resolver <resolv.conf> <NM resolv.conf> <saved>: keep Docker's resolv.conf at <saved> for the NM dispatcher.
+# /run and /etc/resolv.conf can outlive a container restart. Nothing runs yet, so NM's file is the previous run's, and a
+# resolv.conf identical to it is the tunnel DNS the dispatcher left behind, not Docker's: put the saved one back and
+# never overwrite the saved one with it. NM's stale file goes before NM starts.
+keep_docker_resolver() {
+  if [ -s "$3" ] && [ -s "$2" ] && cmp -s "$1" "$2"; then
+    cat "$3" > "$1"  # in place: it is a bind mount
+  else
+    cp "$1" "$3"
+  fi
+  chmod 644 "$3"
+  rm -f "$2"
+}
+
+# Docker's own routes (every route through eth0) live in this table, private to the container's namespace; see firewall_routes.
+FW_EGRESS_TABLE=7788
+
+# firewall_routes <4|6>: NetworkManager's WireGuard policy ("lookup main suppress_prefixlength 0", then "not fwmark <tunnel> lookup <tunnel table>",
+# priorities ~31000) sends every flow without the tunnel's fwmark into the tunnel, including the WebUI's replies and the LAN_NETWORKS flows
+# the filter lets out of eth0. Those flows must leave through eth0, but the main table cannot be trusted to pick it: Proton's kill-switch
+# interface puts its own default there (IPv6 metric 95, against Docker's 1024 on eth0), so "lookup main" would send them into the kill switch.
+# So eth0's routes are snapshotted into FW_EGRESS_TABLE (taken before NetworkManager runs, and "dev eth0" leaves out any
+# kill-switch or tunnel route an earlier run left in the main table), and two rules ahead of the tunnel policy send exactly those flows
+# there; all other traffic still follows the tunnel. Rebuilt from scratch, so a namespace that outlives a restart gets no duplicates.
+# Reads LAN_NETWORKS and WEBUI_PORT like firewall_rules.
+firewall_routes() {
+  fam=$1
+  for prio in 100 101; do
+    while ip -"$fam" rule del priority "$prio" 2>/dev/null; do :; done
+  done
+  # A table that holds nothing does not exist: showing it prints an error, flushing it fails.
+  [ -z "$(ip -"$fam" route show table "$FW_EGRESS_TABLE" 2>/dev/null)" ] || ip -"$fam" route flush table "$FW_EGRESS_TABLE" || return 1
+  # No eth0 (--network none) means no routes to keep. "show dev" leaves the device out of each line.
+  routes=$(ip -"$fam" route show dev eth0 2>/dev/null)
+  if [ -n "$routes" ]; then
+    printf '%s\n' "$routes" | sed "s/ expires [0-9]*sec//; s/\$/ dev eth0/; s/^/route replace table $FW_EGRESS_TABLE /" | ip -"$fam" -batch - || return 1
+  fi
+  # Even a broad LAN allowance must leave Proton's DNS/NAT-PMP gateway inside the tunnel.
+  if [ "$fam" = 4 ]; then
+    ip -4 route replace throw 10.2.0.1/32 table "$FW_EGRESS_TABLE" || return 1
+  fi
+  ip -"$fam" rule add priority 100 ipproto tcp sport "${WEBUI_PORT:-8788}" lookup "$FW_EGRESS_TABLE" || return 1
+  for net in $(echo "${LAN_NETWORKS:-}" | tr ',' ' '); do
+    case $net in *:*) [ "$fam" = 6 ] || continue ;; *) [ "$fam" = 4 ] || continue ;; esac
+    ip -"$fam" rule add priority 101 to "$net" lookup "$FW_EGRESS_TABLE" || return 1
+  done
+}
+
+# firewall_init: deny both families before validation or allow rules; exit on any failure.
+# iptables-restore without --noflush replaces only the filter table, so Docker's nat rules survive.
+firewall_init() {
+  # A failed atomic restore leaves the old table intact, including an initially unfiltered IPv6 table.
+  for cmd in iptables-restore ip6tables-restore; do
+    out=$(printf '%s\n' '*filter' ':INPUT DROP [0:0]' ':OUTPUT DROP [0:0]' ':FORWARD DROP [0:0]' COMMIT | "$cmd" 2>&1) || {
+      fw_log "$cmd deny baseline failed: $out"
+      # Without a working filter, stop external traffic in namespaces retained by attached apps.
+      links_failed=0
+      for link in /sys/class/net/*; do
+        [ "${link##*/}" = lo ] && continue
+        ip link set dev "${link##*/}" down || links_failed=1
+      done
+      if [ "$links_failed" -eq 0 ]; then
+        fw_log "non-loopback interfaces disabled; recreate the shared network namespace before retrying"
+      else
+        fw_log "WARNING: interface shutdown failed; cannot guarantee network containment"
+      fi
+      exit 1
+    }
+  done
+  # Share the listener's parser: xtables/iproute accept hex and octal ports that Python would interpret differently.
+  WEBUI_PORT=$(python3 -c '
+from protonvpn_container.__main__ import webui_port
+try:
+    print(webui_port())
+except ValueError as err:
+    raise SystemExit(f"[firewall] {err}")
+') || exit 1
+  export WEBUI_PORT
+  [ "$(stat -fc %T /sys/fs/cgroup 2>/dev/null)" = cgroup2fs ] || { fw_log "cgroup v2 required: /sys/fs/cgroup is not cgroup2fs"; exit 1; }
+  cg=$(own_cgroup) || { fw_log "cgroup v2 required: no 0:: line in /proc/self/cgroup"; exit 1; }
+  mkdir -p /run/protonvpn-container
+  keep_docker_resolver /etc/resolv.conf /run/NetworkManager/resolv.conf /run/protonvpn-container/resolv.conf.docker
+  resolvers=$(sed -n 's/^nameserver[[:space:]]\{1,\}\([^[:space:]]*\).*/\1/p' /etc/resolv.conf)
+  set -f
+  for fam in 4 6; do
+    cmd=iptables-restore
+    [ "$fam" = 6 ] && cmd=ip6tables-restore
+    # shellcheck disable=SC2086  # intentional word splitting of the resolver list
+    rules=$(firewall_rules "$fam" "$cg" $resolvers) || exit 1  # an empty document would load nothing; the reason is already printed
+    out=$(printf '%s\n' "$rules" | "$cmd" 2>&1) || { fw_log "$cmd failed: $out"; exit 1; }
+    firewall_routes "$fam" || { fw_log "ip -$fam rule failed: WebUI and LAN_NETWORKS replies would be lost while the VPN is up"; exit 1; }
+  done
+  set +f
+  fw_log "kill switch loaded (cgroup $cg)"
+}

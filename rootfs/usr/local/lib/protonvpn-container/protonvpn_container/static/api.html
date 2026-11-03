@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>API · Proton VPN</title>
+<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16.png">
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/api.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="top">
+  <div class="brand"><img src="/static/logo.png" alt="" width="40" height="40"><h1>Proton VPN <span class="note">API</span></h1></div>
+  <nav aria-label="Main"><a class="btn quiet" href="/">WebUI</a></nav>
+</header>
+<main id="main" class="stack api-docs">
+  <section class="card" aria-labelledby="h-start">
+    <h2 id="h-start">Use the API</h2>
+    <p>One API for the WebUI and scripts. <a href="/api/v1/openapi.json">Download OpenAPI 3.1 JSON</a>.</p>
+    <p>Generate a random key, set it as the container's <code>API_KEY</code> environment variable, and recreate the container (a restart does not change a container's environment). Keep it separate from <code>WEBUI_PASSWORD</code>. Never put secrets in URLs. Use HTTPS outside a trusted local network.</p>
+    <pre><code>openssl rand -hex 32</code></pre>
+    <p class="note">Without OpenSSL:</p>
+    <pre><code>docker run --rm python:3-alpine python -c "import secrets; print(secrets.token_urlsafe(32))"</code></pre>
+    <p>For the examples below, export <code>API_KEY</code> in your terminal to the generated key. Replace credential and code placeholders before running sign-in examples.</p>
+    <p>An empty <code>API_KEY</code> disables bearer authentication. It does not close an open WebUI: when <code>WEBUI_PASSWORD</code> is empty, anyone who can reach this port can control the VPN. With a password set, use a valid session cookie or bearer key.</p>
+  <p>This page and the OpenAPI document need no login, but they are still subject to <code>WEBUI_ALLOWED_NETWORKS</code>: when that list is set, clients outside it cannot load them.</p>
+    <p>Every POST needs a JSON object. Cookie and open-mode writes also need <code>X-Requested-With: protonvpn-webui</code>; only a valid bearer key skips that header. Errors use <code>{"error": "message"}</code> with a non-success HTTP status. No key or password is shown here.</p>
+  </section>
+  <section id="cookie-flow" class="card" aria-labelledby="h-cookie">
+    <h2 id="h-cookie">Password-only cookie flow</h2>
+    <p>With <code>WEBUI_PASSWORD</code> set and <code>API_KEY</code> empty, no bearer key is needed. Replace <code>your-webui-password</code> in the login JSON below. Run these commands in the same directory: log in, read status, request disconnect, then log out. Every protected endpoint also has a cookie example below.</p>
+    <p>Keep <code>cookies.txt</code> private: it grants access until logout or session expiry. The commands set restrictive file permissions. Cookie writes require both the JSON body and <code>X-Requested-With</code> header.</p>
+  </section>
+  <nav class="card" aria-label="Endpoints"><h2>Endpoints</h2><ul id="endpoint-links"></ul></nav>
+  <p id="docs-status" role="status">Loading API contract…</p>
+  <div id="endpoints" class="stack"></div>
+  <noscript><p>Enable JavaScript to render the endpoint reference, or download the OpenAPI JSON above.</p></noscript>
+</main>
+</body>
+</html>

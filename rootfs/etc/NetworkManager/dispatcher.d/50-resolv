@@ -1,0 +1,12 @@
+#!/bin/sh
+# Docker bind-mounts /etc/resolv.conf, so NM cannot rename over it; copy in place instead.
+# NM writes an empty file when no connection offers DNS: fall back to Docker's original then.
+saved=/run/protonvpn-container/resolv.conf.docker
+case "$2" in
+  dns-change|up|down)
+    if grep -q '^nameserver' /run/NetworkManager/resolv.conf 2>/dev/null; then
+      cat /run/NetworkManager/resolv.conf > /etc/resolv.conf
+    elif [ -r "$saved" ]; then
+      cat "$saved" > /etc/resolv.conf
+    fi ;;
+esac

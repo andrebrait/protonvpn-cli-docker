@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Proton VPN</title>
+<link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16.png">
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<header class="top">
+  <div class="brand">
+    <img src="/static/logo.png" alt="" width="40" height="40">
+    <h1>Proton VPN</h1>
+  </div>
+  <nav class="actions" aria-label="Main"><a class="btn quiet" href="/api">API</a>
+    <button type="button" id="logout" class="btn quiet" hidden>Log out</button>
+  </nav>
+</header>
+
+<div id="banner" class="banner" role="alert" hidden>
+  <p><strong>The WebUI is open.</strong> <code>WEBUI_PASSWORD</code> is not set, so anyone who can reach this port can control the VPN and sign in with your account. <span id="banner-msg" hidden></span></p>
+  <button type="button" id="banner-dismiss" class="btn">Dismiss</button>
+</div>
+<p id="notice" class="notice" role="status" hidden></p>
+
+<main id="main">
+  <section id="login" class="card narrow" aria-labelledby="h-login" hidden>
+    <h2 id="h-login">Log in</h2>
+    <form id="login-form" class="stack">
+      <div class="field">
+        <label for="login-password">Password</label>
+        <input id="login-password" name="password" type="password" autocomplete="current-password" required>
+      </div>
+      <p id="login-msg" class="note error" role="alert" hidden></p>
+      <button type="submit" class="btn primary">Log in</button>
+    </form>
+  </section>
+
+  <div id="app" class="grid" hidden>
+    <section class="card" aria-labelledby="h-conn">
+      <h2 id="h-conn">Connection</h2>
+      <p class="pill-row" aria-live="polite"><span id="pill" class="pill pill-off">Disconnected</span></p>
+      <p id="where" class="where"></p>
+      <div id="traffic" class="traffic" hidden>
+        <div class="traffic-head">
+          <span class="label">Traffic check</span>
+          <span id="traffic-pill" class="pill pill-sm pill-wait" aria-live="polite">Checking</span>
+        </div>
+        <p id="traffic-note" class="note"></p>
+      </div>
+      <dl class="facts">
+        <dt>Exit IP</dt><dd id="exit-ip" class="num">—</dd>
+        <dt>Load</dt><dd id="load" class="num">—</dd>
+        <dt>Protocol</dt><dd id="protocol">—</dd>
+      </dl>
+      <p id="last-error" class="note error" role="status" hidden></p>
+      <div class="actions">
+        <button type="button" id="connect" class="btn primary">Connect</button>
+        <button type="button" id="disconnect" class="btn">Disconnect</button>
+      </div>
+      <h3 class="sub-h" id="h-port">Forwarded port</h3>
+      <div class="port">
+        <output id="port" class="num" aria-labelledby="h-port">—</output>
+        <button type="button" id="copy" class="btn quiet" aria-describedby="port">Copy</button>
+        <span id="copied" class="note" role="status"></span>
+      </div>
+      <p id="port-note" class="note" hidden></p>
+    </section>
+
+    <section class="card" aria-labelledby="h-account">
+      <h2 id="h-account">Account</h2>
+      <div id="acct-in" hidden>
+        <p class="acct">Signed in as <strong id="acct-name"></strong></p>
+        <button type="button" id="signout" class="btn">Sign out</button>
+      </div>
+      <form id="signin-form" class="stack" hidden>
+        <div class="field">
+          <label for="signin-user">Proton username</label>
+          <input id="signin-user" name="username" type="text" autocomplete="username" autocapitalize="none" spellcheck="false" required>
+        </div>
+        <div class="field">
+          <label for="signin-password">Password</label>
+          <input id="signin-password" name="password" type="password" autocomplete="current-password" required>
+        </div>
+        <button type="submit" class="btn primary">Sign in</button>
+        <p class="note">With a security key, sign in from the console: <code>docker exec -it &lt;name&gt; protonvpn signin &lt;username&gt;</code></p>
+      </form>
+      <form id="code-form" class="stack" hidden>
+        <div class="field">
+          <label for="signin-code">Two-factor code</label>
+          <input id="signin-code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code" autocapitalize="none" spellcheck="false" required>
+        </div>
+        <button type="submit" class="btn primary">Verify</button>
+      </form>
+      <p id="acct-msg" class="note" role="status" hidden></p>
+    </section>
+
+    <section class="card wide" aria-labelledby="h-traffic">
+      <h2 id="h-traffic">Traffic</h2>
+      <div class="stats">
+        <div><span class="label">Download</span><span id="rx-rate" class="big num">—</span><span id="rx-total" class="note num"></span></div>
+        <div><span class="label">Upload</span><span id="tx-rate" class="big num">—</span><span id="tx-total" class="note num"></span></div>
+      </div>
+      <figure class="chart">
+        <svg id="chart" viewBox="0 0 600 160" preserveAspectRatio="none" role="img" aria-label="No traffic data yet">
+          <defs>
+            <linearGradient id="accent" gradientUnits="userSpaceOnUse" x1="0" y1="0" x2="600" y2="0">
+              <stop offset="0" stop-color="#8A6EFF"/>
+              <stop offset="1" stop-color="#2DD4BF"/>
+            </linearGradient>
+          </defs>
+          <g stroke="currentColor" stroke-width="1" opacity="0.25" vector-effect="non-scaling-stroke">
+            <line x1="0" y1="0.5" x2="600" y2="0.5" vector-effect="non-scaling-stroke"/>
+            <line x1="0" y1="80" x2="600" y2="80" vector-effect="non-scaling-stroke"/>
+            <line x1="0" y1="159.5" x2="600" y2="159.5" vector-effect="non-scaling-stroke"/>
+          </g>
+          <polyline id="line-down" fill="none" stroke="url(#accent)" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round" vector-effect="non-scaling-stroke" points=""/>
+          <polyline id="line-up" fill="none" stroke="url(#accent)" stroke-width="2" stroke-dasharray="6 5" stroke-linejoin="round" vector-effect="non-scaling-stroke" points=""/>
+        </svg>
+        <p id="chart-empty" class="chart-empty note">No data yet. The graph fills in a few seconds after the VPN connects.</p>
+        <figcaption class="note">
+          <span class="key"><svg width="22" height="8" aria-hidden="true"><line x1="0" y1="4" x2="22" y2="4" stroke="url(#accent)" stroke-width="2.5"/></svg>Download</span>
+          <span class="key"><svg width="22" height="8" aria-hidden="true"><line x1="0" y1="4" x2="22" y2="4" stroke="url(#accent)" stroke-width="2" stroke-dasharray="5 3"/></svg>Upload</span>
+          <span id="peak" class="num"></span>
+          <span class="span">Last 15 minutes</span>
+        </figcaption>
+      </figure>
+    </section>
+
+    <section class="card wide" aria-labelledby="h-settings">
+      <h2 id="h-settings">Settings</h2>
+      <p class="note">VPN protection is always on. The container blocks VPN-required traffic whenever the tunnel is unavailable, including after an intentional disconnect. Proton's additional kill switch is fixed to Standard; neither layer can be disabled here.</p>
+      <form id="settings-form" novalidate></form>
+    </section>
+  </div>
+</main>
+</body>
+</html>

@@ -1,0 +1,4 @@
+__pycache__/
+# Review workspace of the build process: reports, briefs and their screenshots are not product files.
+.superpowers/sdd/
+/screens/
