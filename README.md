@@ -276,7 +276,7 @@ The WebUI admits at most 32 simultaneous request handlers. Excess TCP connection
 
 `GET /metrics` serves Prometheus 0.0.4 text on the same `WEBUI_PORT`, suitable for VictoriaMetrics/vmagent or Prometheus. It uses the API's bearer/session authentication and `WEBUI_ALLOWED_NETWORKS`; it is not a public authentication bypass. Set both `WEBUI_PASSWORD` and `API_KEY` for protected scraping, because an empty WebUI password enables open mode.
 
-All metrics are gauges without labels containing account names, IP addresses, servers, errors, or credentials. A scrape reads the supervisor's current snapshot only; it does not run CLI commands or traffic probes.
+Metrics carry no labels containing account names, IP addresses, servers, errors, or credentials. A scrape reads the supervisor's current snapshot only; it does not run CLI commands or traffic probes.
 
 | Metric | Meaning |
 | --- | --- |
@@ -286,6 +286,7 @@ All metrics are gauges without labels containing account names, IP addresses, se
 | `protonvpn_user_disconnected` | `1` when a user disconnect has paused automatic connection, otherwise `0`. |
 | `protonvpn_port_forwarding_active` | `1` while a forwarded port is advertised, otherwise `0`. |
 | `protonvpn_health_check_age_seconds` | Seconds since the last traffic check; omitted until a check completes. |
+| `protonvpn_receive_bytes_total`, `protonvpn_transmit_bytes_total` | Counters of bytes received and sent through `proton0` on the current connection, from the 5-second traffic samples. They restart at each connection, which `rate()` handles as a counter reset; use `rate()` for bytes per second. Omitted until the first sample. |
 
 Example vmagent/Prometheus scrape configuration (store the VPN container's `API_KEY` in the referenced file, readable only by the scraper):
 

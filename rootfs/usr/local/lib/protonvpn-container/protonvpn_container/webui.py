@@ -293,20 +293,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def get_metrics(self, body: dict) -> None:
         state = self.ui.supervisor.snapshot()
+        last = state["traffic"][-1] if state["traffic"] else None  # [monotonic time, rx, tx] of proton0, newest last
         metrics = (
-            ("signed_in", "Whether Proton VPN is signed in.", int(state["signed_in"])),
-            ("connected", "Whether the CLI reports a connected tunnel.", int(state["connected"])),
-            ("tunnel_healthy", "Whether the tunnel has a fresh passing traffic check.", int(state["tunnel_healthy"] is True)),
-            ("user_disconnected", "Whether automatic connection is paused by a user disconnect.", int(state["user_disconnected"])),
-            ("port_forwarding_active", "Whether a forwarded port is currently advertised.", int(state["forwarded_port"] is not None)),
-            ("health_check_age_seconds", "Seconds since the last traffic check.", state["health_checked_ago"]),
+            ("signed_in", "gauge", "Whether Proton VPN is signed in.", int(state["signed_in"])),
+            ("connected", "gauge", "Whether the CLI reports a connected tunnel.", int(state["connected"])),
+            ("tunnel_healthy", "gauge", "Whether the tunnel has a fresh passing traffic check.", int(state["tunnel_healthy"] is True)),
+            ("user_disconnected", "gauge", "Whether automatic connection is paused by a user disconnect.", int(state["user_disconnected"])),
+            ("port_forwarding_active", "gauge", "Whether a forwarded port is currently advertised.", int(state["forwarded_port"] is not None)),
+            ("health_check_age_seconds", "gauge", "Seconds since the last traffic check.", state["health_checked_ago"]),
+            # WireGuard counters restart with each connection; Prometheus rate() treats that as a counter reset.
+            ("receive_bytes_total", "counter", "Bytes received through the tunnel on the current connection.", last and last[1]),
+            ("transmit_bytes_total", "counter", "Bytes sent through the tunnel on the current connection.", last and last[2]),
         )
         lines = []
-        for suffix, help_text, value in metrics:
+        for suffix, kind, help_text, value in metrics:
             if value is None:
                 continue
             name = "protonvpn_" + suffix
-            lines.extend((f"# HELP {name} {help_text}", f"# TYPE {name} gauge", f"{name} {value}"))
+            lines.extend((f"# HELP {name} {help_text}", f"# TYPE {name} {kind}", f"{name} {value}"))
         self._send(200, ("\n".join(lines) + "\n").encode(), "text/plain; version=0.0.4; charset=utf-8",
                    {"Cache-Control": "no-store"})
 

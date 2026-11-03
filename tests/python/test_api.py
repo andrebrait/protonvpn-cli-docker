@@ -172,6 +172,23 @@ class ApiTest(WebuiCase):
                 ):
                     self.assertNotIn(secret.encode(), raw)
 
+    def test_metrics_export_per_direction_traffic_counters(self):
+        traffic = "protonvpn_receive_bytes_total", "protonvpn_transmit_bytes_total"
+        cases = (
+            ([], {}),
+            ([[100, 1000, 2000]], dict(zip(traffic, (1000, 2000)))),
+            ([[100, 1000, 2000], [105, 1500, 2600]], dict(zip(traffic, (1500, 2600)))),
+        )
+        for samples, expected in cases:
+            with self.subTest(samples=samples):
+                self.sup.overrides = {"traffic": samples}
+                _, raw = self.api("GET", "/metrics")
+                lines = raw.decode().splitlines()
+                values = {name: float(value) for name, value in (l.split() for l in lines if not l.startswith("#"))}
+                types = dict(l.removeprefix("# TYPE ").split() for l in lines if l.startswith("# TYPE "))
+                self.assertEqual({k: v for k, v in values.items() if "bytes" in k}, expected)
+                self.assertEqual({k: types[k] for k in expected}, dict.fromkeys(expected, "counter"))
+
     def test_error_shape_at_http_boundary(self):
         self.environ["NETSHIELD"] = "off"
         cases = [
