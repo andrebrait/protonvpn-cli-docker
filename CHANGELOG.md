@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.0.1 — 2026-11-02
+## 0.0.1 — 2026-11-03
 
 ### Added
 
@@ -11,7 +11,7 @@
 - Independent WireGuard-bound traffic health in the WebUI, API and Docker healthcheck, separate from Proton's connection state and without probe-triggered reconnects.
 - Always-on container firewall, fixed Proton Standard kill switch, WireGuard-only connections and renewable TCP/UDP port forwarding.
 - Optional HTTP source-IP allowlist, with unconditional VPN-interface blocking on the control port while forwarded application TCP/UDP traffic remains allowed.
-- Unraid template, official Proton VPN icon and amd64/arm64 image builds.
+- Unraid template (in [andrebrait/unraid-templates](https://github.com/andrebrait/unraid-templates)), official Proton VPN icon and amd64/arm64 image builds.
 
 ### Fixed
 
