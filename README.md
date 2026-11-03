@@ -299,7 +299,7 @@ CLI logs are persisted at `/config/cache/VPN/logs/vpn-cli.log`. Check firewall s
 
 ## Unraid and release checks
 
-Use [the Unraid template](unraid/protonvpn-cli.xml) with `/config` mapped to `/mnt/user/appdata/protonvpn-cli`. Set `WEBUI_PASSWORD`, leave VPN setting variables empty for WebUI control, and open **WebUI** to sign in. Use **Console** for interactive CLI access. This repository also includes [a Community Applications profile](ca_profile.xml); inclusion in Community Applications is not implied.
+Use [the Unraid template](https://github.com/andrebrait/unraid-templates/blob/main/templates/protonvpn-cli.xml) from the [andrebrait/unraid-templates](https://github.com/andrebrait/unraid-templates) catalog, which also explains manual installation. Map `/config` to `/mnt/user/appdata/protonvpn-cli`. Set `WEBUI_PASSWORD`, leave VPN setting variables empty for WebUI control, and open **WebUI** to sign in. Use **Console** for interactive CLI access. The template is not yet listed in Community Applications.
 
 Before a release, complete [the credentialed manual checklist](docs/manual-test.md) on the target host. FIDO2 and real arm64 VPN behavior remain unverified unless separately recorded there.
 
