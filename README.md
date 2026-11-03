@@ -286,8 +286,7 @@ Metrics carry no labels containing account names, IP addresses, servers, errors,
 | `protonvpn_user_disconnected` | `1` when a user disconnect has paused automatic connection, otherwise `0`. |
 | `protonvpn_port_forwarding_active` | `1` while a forwarded port is advertised, otherwise `0`. |
 | `protonvpn_health_check_age_seconds` | Seconds since the last traffic check; omitted until a check completes. |
-| `protonvpn_receive_bytes_total`, `protonvpn_transmit_bytes_total` | Counters of bytes received and sent through `proton0` on the current connection, from the 5-second traffic samples. They restart at each connection, which `rate()` handles as a counter reset; omitted until the first sample. |
-| `protonvpn_receive_bytes_per_second`, `protonvpn_transmit_bytes_per_second` | Rate between the two newest traffic samples; omitted until a connection has two samples. For graphs over longer windows, prefer `rate()` on the counters. |
+| `protonvpn_receive_bytes_total`, `protonvpn_transmit_bytes_total` | Counters of bytes received and sent through `proton0` on the current connection, from the 5-second traffic samples. They restart at each connection, which `rate()` handles as a counter reset; use `rate()` for bytes per second. Omitted until the first sample. |
 
 Example vmagent/Prometheus scrape configuration (store the VPN container's `API_KEY` in the referenced file, readable only by the scraper):
 

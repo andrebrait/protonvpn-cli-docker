@@ -293,9 +293,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def get_metrics(self, body: dict) -> None:
         state = self.ui.supervisor.snapshot()
-        traffic = state["traffic"]  # [monotonic time, rx, tx] of the current connection's proton0, newest last
-        last, prev = (traffic[-1] if traffic else None), (traffic[-2] if len(traffic) > 1 else None)
-        elapsed = last[0] - prev[0] if prev else 0
+        last = state["traffic"][-1] if state["traffic"] else None  # [monotonic time, rx, tx] of proton0, newest last
         metrics = (
             ("signed_in", "gauge", "Whether Proton VPN is signed in.", int(state["signed_in"])),
             ("connected", "gauge", "Whether the CLI reports a connected tunnel.", int(state["connected"])),
@@ -306,10 +304,6 @@ class Handler(BaseHTTPRequestHandler):
             # WireGuard counters restart with each connection; Prometheus rate() treats that as a counter reset.
             ("receive_bytes_total", "counter", "Bytes received through the tunnel on the current connection.", last and last[1]),
             ("transmit_bytes_total", "counter", "Bytes sent through the tunnel on the current connection.", last and last[2]),
-            ("receive_bytes_per_second", "gauge", "Receive rate between the two newest traffic samples.",
-             (last[1] - prev[1]) / elapsed if elapsed > 0 else None),
-            ("transmit_bytes_per_second", "gauge", "Transmit rate between the two newest traffic samples.",
-             (last[2] - prev[2]) / elapsed if elapsed > 0 else None),
         )
         lines = []
         for suffix, kind, help_text, value in metrics:
