@@ -397,15 +397,17 @@ wg_handshaken() { [ "$(docker exec "$1" wg show wgq latest-handshakes | cut -f2)
 # are ESTABLISHED. The client reaches the product at 10.77.0.1 / fd77::1 through it, and the egress table that rule 100 selects for the
 # WebUI's replies routes them back into it (without that route the handshake could not complete, drop or no drop).
 proton0_pair() {
-  pk=$(docker exec "$1" wg genkey) && qk=$(docker exec "$2" wg genkey) || return 1
+  # Public test-only keys start with '+' to exercise the shell option boundary.
+  pk=+AEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEA=
+  qk=+AIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEA=
   ppub=$(echo "$pk" | docker exec -i "$1" wg pubkey) && qpub=$(echo "$qk" | docker exec -i "$2" wg pubkey) || return 1
-  docker exec -i "$2" sh -es "$qk" "$ppub" <<'EOF' || return 1
+  docker exec -i "$2" sh -es -- "$qk" "$ppub" <<'EOF' || return 1
 ip link add wgq type wireguard
 echo "$1" | wg set wgq private-key /dev/stdin listen-port 51820 peer "$2" allowed-ips 10.77.0.1/32,fd77::1/128
 ip addr add 10.77.0.2/32 dev wgq; ip -6 addr add fd77::2/128 dev wgq; ip link set wgq up
 ip route add 10.77.0.1/32 dev wgq; ip -6 route add fd77::1/128 dev wgq
 EOF
-  docker exec -i "$1" sh -es "$pk" "$qpub" "$(ip_of "$2")" <<'EOF' || return 1
+  docker exec -i "$1" sh -es -- "$pk" "$qpub" "$(ip_of "$2")" <<'EOF' || return 1
 egress_table() { ip -"$1" rule show | sed -n "s/.*sport 8788 lookup \([0-9][0-9]*\).*/\1/p"; }
 ip link add proton0 type wireguard
 echo "$1" | wg set proton0 private-key /dev/stdin listen-port 51821 fwmark 0xea13b2c peer "$2" endpoint "$3:51820" allowed-ips 10.77.0.2/32,fd77::2/128 persistent-keepalive 1
