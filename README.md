@@ -155,7 +155,7 @@ Container-only configuration is not editable in the WebUI:
 
 ### WebUI network allowlist
 
-`WEBUI_ALLOWED_NETWORKS` filters the source address of every TCP connection to `WEBUI_PORT` before the container accepts it. It covers the whole HTTP surface: the WebUI, the API, login and logout, the API documentation, the OpenAPI JSON, and static files. It is set when the container is created and is not editable in the WebUI or API.
+`WEBUI_ALLOWED_NETWORKS` filters the source address of every TCP connection to `WEBUI_PORT` before the container accepts it. It covers the whole HTTP surface: the WebUI, the API, metrics, login and logout, the API documentation, the OpenAPI JSON, and static files. It is set when the container is created and is not editable in the WebUI or API.
 
 ```bash
 WEBUI_ALLOWED_NETWORKS=127.0.0.1/32,10.0.0.0/8
@@ -272,6 +272,36 @@ WebUI login lockout is per client IP: five failed attempts in 60 seconds lock th
 
 The WebUI admits at most 32 simultaneous request handlers. Excess TCP connections are closed without an HTTP response; capacity returns when clients finish or the 30-second socket timeout expires. This contains resource use, not request rate: use the network allowlist and a rate-limiting HTTPS proxy when clients are untrusted.
 
+## Metrics
+
+`GET /metrics` serves Prometheus 0.0.4 text on the same `WEBUI_PORT`, suitable for VictoriaMetrics/vmagent or Prometheus. It uses the API's bearer/session authentication and `WEBUI_ALLOWED_NETWORKS`; it is not a public authentication bypass. Set both `WEBUI_PASSWORD` and `API_KEY` for protected scraping, because an empty WebUI password enables open mode.
+
+All metrics are gauges without labels containing account names, IP addresses, servers, errors, or credentials. A scrape reads the supervisor's current snapshot only; it does not run CLI commands or traffic probes.
+
+| Metric | Meaning |
+| --- | --- |
+| `protonvpn_signed_in` | `1` when signed in, otherwise `0`. |
+| `protonvpn_connected` | `1` when the CLI reports connected, otherwise `0`. |
+| `protonvpn_tunnel_healthy` | `1` only for a fresh passing traffic check; failed or unknown health is `0`. |
+| `protonvpn_user_disconnected` | `1` when a user disconnect has paused automatic connection, otherwise `0`. |
+| `protonvpn_port_forwarding_active` | `1` while a forwarded port is advertised, otherwise `0`. |
+| `protonvpn_health_check_age_seconds` | Seconds since the last traffic check; omitted until a check completes. |
+
+Example vmagent/Prometheus scrape configuration (store the VPN container's `API_KEY` in the referenced file, readable only by the scraper):
+
+```yaml
+scrape_configs:
+  - job_name: protonvpn
+    metrics_path: /metrics
+    bearer_token_file: /etc/vmagent/secrets/protonvpn_api_key
+    static_configs:
+      - targets: ["192.168.1.10:8788"]
+```
+
+Replace the target with your published VPN address and allow the scraper's source address in `WEBUI_ALLOWED_NETWORKS`. Use a trusted HTTPS reverse proxy and `scheme: https` outside a trusted local network.
+
+Unhealthy, signed-out, and unknown VPN states still return HTTP 200. Alert on `up{job="protonvpn"} == 0` for scrape/authentication/transport failures and on `protonvpn_tunnel_healthy{job="protonvpn"} == 0` for tunnel health failures; choose an alert duration long enough for startup and normal probe intervals. To ignore intentional disconnections, combine the tunnel expression with `and protonvpn_user_disconnected{job="protonvpn"} == 0`. Missing health-check age means no completed check, not a zero-second-old check.
+
 ## Health and troubleshooting
 
 Docker runs `healthcheck.sh` every 30 seconds, with a 10-second timeout, 60-second startup grace, and three retries. The container is healthy only when both of these hold:
@@ -283,9 +313,11 @@ The check runs every 30 seconds in a worker thread inside the supervisor. It use
 
 A failed CLI state check resets traffic-chart continuity before the next connected reading, even if it recovers on the same tunnel. Samples are not combined across a period when the connection cannot be verified.
 
-The probe depends on a third-party service. If `api.ipify.org` is down, blocked, or answers with something other than a public IPv4 address, the check fails and the container reports unhealthy even though the tunnel works. A failed check never disconnects or reconnects the VPN, never changes the CLI's `connected` state, never clears the forwarded port, and never overwrites the CLI's last error. Automatic reconnection still follows only the CLI's own state: the supervisor checks every `RECONNECT_INTERVAL` seconds and retries failed connections with backoff up to 300 seconds. A WebUI disconnect pauses automatic reconnection until you connect again or restart the container.
+The probe depends on a third-party service. If `api.ipify.org` is down, blocked, or answers with something other than a public IPv4 address, the check fails even though the tunnel may work. **Echo failure alone never reconnects the VPN**, clears the port, or overwrites the CLI's last error. After a failed echo, the worker sends a bounded UDP datagram through `proton0` to the numeric tunnel gateway and reads `wg show proton0 latest-handshakes`. A valid zero or unchanged handshake for 180 seconds on the same connection queues recovery; handshake progress or a successful echo resets the evidence. Missing, malformed, failed or timed-out observations, or a failed UDP send, are unknown rather than proof of a dead tunnel.
 
-**Docker health status does not trigger restarts.** `restart: unless-stopped` handles process exits, not an unhealthy status, and a failed traffic check does not restart or reconnect the VPN. The Docker restart policy alone does not heal an unhealthy status. A signed-out container intentionally remains unhealthy.
+The supervisor consumes that evidence separately from the health worker: it revokes connection, port and health publication, attempts a disconnect bounded to five seconds, then reconnects using the same credentials and configured target. It never signs out to recover. Failed disconnects do not connect over the old tunnel; failed recovery attempts retain the normal 30/60/120/300-second backoff, counted from completion, even if native status still says `Connected`. New connections get a fresh evidence window. Normal CLI-state reconnection still checks every `RECONNECT_INTERVAL` seconds; a WebUI disconnect pauses automatic recovery until you connect again or restart the container.
+
+**Docker health status does not trigger restarts.** `restart: unless-stopped` handles process exits, not an unhealthy status. The supervisor's corroborated tunnel recovery is independent of Docker health status; the restart policy alone does not heal an unhealthy status. A signed-out container intentionally remains unhealthy.
 
 ```bash
 docker logs --tail 100 protonvpn-cli

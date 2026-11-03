@@ -26,7 +26,7 @@
     example(cookieFlow, "4. Log out and clear the cookie jar", `curl --fail-with-body -b cookies.txt -c cookies.txt -X POST -H "Content-Type: application/json" -H "X-Requested-With: protonvpn-webui" -d '{}' ${quote(location.origin + "/api/v1/logout")}`);
     for (const [path, methods] of Object.entries(doc.paths)) {
       for (const [method, op] of Object.entries(methods)) {
-        const fullPath = doc.servers[0].url + path;
+        const fullPath = (op.servers || doc.servers)[0].url.replace(/\/$/, "") + path;
         const card = el("section", undefined, "card");
         card.id = op.operationId;
         card.setAttribute("aria-labelledby", `h-${op.operationId}`);

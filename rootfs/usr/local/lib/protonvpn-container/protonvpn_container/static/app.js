@@ -227,7 +227,7 @@
     const scope = `IPv4 HTTPS through the tunnel, ${checkedText(s.health_checked_ago)}`;
     $("traffic-note").textContent =
       s.tunnel_healthy === false
-        ? `${(s.health_error || "No successful check in the last 60 seconds").replace(/\.$/, "")}. ${scope}. The VPN stays connected; a failed check never reconnects it.`
+        ? `${(s.health_error || "No successful check in the last 60 seconds").replace(/\.$/, "")}. ${scope}. A failed traffic check alone does not trigger reconnection.`
         : scope;
   }
 

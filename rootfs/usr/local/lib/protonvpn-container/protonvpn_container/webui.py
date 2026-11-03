@@ -1,4 +1,4 @@
-"""WebUI: the static page and a small JSON API on a ThreadingHTTPServer.
+"""WebUI: the static page, JSON API and Prometheus metrics on a ThreadingHTTPServer.
 
 The JSON API lives under `/api/v1/`; ROUTES (end of this module) is the one place listing every route.
 Protected routes accept a session cookie or API bearer key while a password is set. POSTs need
@@ -291,6 +291,25 @@ class Handler(BaseHTTPRequestHandler):
             "tunnel_healthy", "health_error", "health_checked_ago",
         )})
 
+    def get_metrics(self, body: dict) -> None:
+        state = self.ui.supervisor.snapshot()
+        metrics = (
+            ("signed_in", "Whether Proton VPN is signed in.", int(state["signed_in"])),
+            ("connected", "Whether the CLI reports a connected tunnel.", int(state["connected"])),
+            ("tunnel_healthy", "Whether the tunnel has a fresh passing traffic check.", int(state["tunnel_healthy"] is True)),
+            ("user_disconnected", "Whether automatic connection is paused by a user disconnect.", int(state["user_disconnected"])),
+            ("port_forwarding_active", "Whether a forwarded port is currently advertised.", int(state["forwarded_port"] is not None)),
+            ("health_check_age_seconds", "Seconds since the last traffic check.", state["health_checked_ago"]),
+        )
+        lines = []
+        for suffix, help_text, value in metrics:
+            if value is None:
+                continue
+            name = "protonvpn_" + suffix
+            lines.extend((f"# HELP {name} {help_text}", f"# TYPE {name} gauge", f"{name} {value}"))
+        self._send(200, ("\n".join(lines) + "\n").encode(), "text/plain; version=0.0.4; charset=utf-8",
+                   {"Cache-Control": "no-store"})
+
     def get_port(self, body: dict) -> None:
         port = self.ui.supervisor.snapshot()["forwarded_port"]
         if parse_qs(urlsplit(self.path).query).get("format") == ["text"]:
@@ -400,6 +419,7 @@ class Route:
 
 
 ROUTES = (
+    Route("GET", "/metrics", Handler.get_metrics),
     Route("GET", "/api/v1/state", Handler.get_state),
     Route("GET", "/api/v1/status", Handler.get_status),
     Route("GET", "/api/v1/port", Handler.get_port),

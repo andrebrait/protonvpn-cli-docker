@@ -598,7 +598,7 @@ The credentialed manual checklist on Unraid runs after Task 7 with the user (led
 
 This extension supersedes the earlier CLI-only healthcheck and synchronous exit-address lookup.
 The live five-minute WireGuard outage kept native `connected=true`, so operational reachability
-must be a separate fact. The user chose observation only, not probe-triggered reconnection.
+must be a separate fact. Echo failure alone is observational; corroborated stalled-handshake recovery is specified below.
 
 **Backend ownership:** `supervisor.py`, new `health.py` / `healthcheck.py` where appropriate,
 `healthcheck.sh`, image-baked curl in `Dockerfile`, startup health-file invalidation, backend tests.
@@ -611,7 +611,11 @@ must be a separate fact. The user chose observation only, not probe-triggered re
 - One worker in the existing process, independent of CLI locks and the supervisor loop: probe
   every 30 seconds, first probe promptly after connection. Use curl bound to `if!proton0`,
   IPv4, five-second complete request limit, six-second process limit, no proxy, HTTPS ipify.
-  Require a valid public IPv4 literal. No interface fallback, no automatic reconnects.
+  Require a valid public IPv4 literal. No interface fallback; echo failure alone never reconnects.
+  On failure, bounded independent UDP stimulus plus valid unchanged/zero WireGuard handshakes
+  for 180 seconds on the same generation can queue supervisor-only disconnect/connect recovery.
+  Unknown evidence does not recover; advancing handshakes or echo success reset it. Preserve
+  credentials, target, kill switch, cancellation and completion-based failed-attempt backoff.
 - Freshness is 60 seconds. Disconnection, stop and new connection invalidate prior success;
   old in-flight results cannot update a new connection. Log changed health states/errors only.
 - Atomic `/run/protonvpn-container/health.json` with boolean `healthy` and monotonic `checked_at`
@@ -629,7 +633,7 @@ must be a separate fact. The user chose observation only, not probe-triggered re
   bound probe must fail even if ordinary direct HTTPS works.
 - [ ] **Step 4:** Real Unraid run: connected probe passes; block WireGuard UDP, observe CLI still
   connected but operational API/UI/Docker health fail; remove the block and recover without
-  reconnect/signin. Preserve the port-renewal timer and normal CLI state.
+  signing in. Verify corroborated recovery and backoff, no ipify-only reconnect, and independent port renewal.
 - [ ] **Step 5:** Scoped adversarial review, resolve findings, commit, update the PR and release
   `latest` / `0.0.1` only after CI and acceptance pass.
 

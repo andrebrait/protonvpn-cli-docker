@@ -8,7 +8,8 @@
 - Responsive light/dark WebUI showing connection, server, location, exit IP, forwarded port and live traffic.
 - Environment-controlled or saved preferences, with environment overrides visibly locked in the WebUI.
 - Versioned JSON API, optional separate bearer key and an OpenAPI 3.1 reference page with key-generation instructions.
-- Independent WireGuard-bound traffic health in the WebUI, API and Docker healthcheck, separate from Proton's connection state and without probe-triggered reconnects.
+- Independent WireGuard-bound traffic health in the WebUI, API and Docker healthcheck, separate from Proton's connection state. Echo failure alone does not reconnect; 180 seconds of corroborated stalled handshakes triggers bounded recovery without signing out, retaining failed-attempt backoff.
+- Authenticated Prometheus-compatible `/metrics` endpoint for VictoriaMetrics/Prometheus connectivity and traffic-health alerts, using snapshot-only gauges without sensitive labels.
 - Always-on container firewall, fixed Proton Standard kill switch, WireGuard-only connections and renewable TCP/UDP port forwarding.
 - Optional HTTP source-IP allowlist, with unconditional VPN-interface blocking on the control port while forwarded application TCP/UDP traffic remains allowed.
 - Unraid template (in [andrebrait/unraid-templates](https://github.com/andrebrait/unraid-templates)), official Proton VPN icon and amd64/arm64 image builds.

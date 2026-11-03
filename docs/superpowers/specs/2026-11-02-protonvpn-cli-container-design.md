@@ -418,8 +418,8 @@ The same Python process runs a separate worker every 30 seconds while connected,
 check promptly after connection. It uses image-baked curl with `--interface if!proton0 --ipv4
 --max-time 5 --noproxy '*' --fail --silent --show-error https://api.ipify.org` and an outer
 six-second subprocess bound. A missing interface must fail, never fall back to the host route.
-Only a valid public IPv4 literal counts as success. Probe I/O holds no CLI lock, cannot delay
-port renewal, and cannot trigger reconnects or change CLI-derived `connected` or `last_error`.
+Only a valid public IPv4 literal counts as success. Probe I/O holds no CLI lock and cannot delay
+port renewal. Echo failure alone cannot trigger reconnects or change CLI-derived `connected` or `last_error`.
 It also fills a missing exit address, replacing the old synchronous lookup.
 
 Snapshots and `/api/v1/status` expose `tunnel_healthy` (boolean or null before the first connected
@@ -432,9 +432,22 @@ Atomic ephemeral `/run/protonvpn-container/health.json` contains `healthy` and a
 `checked_at` for Docker's local check; missing, malformed or stale data is unhealthy. Startup,
 disconnect and stop revoke prior success. Log only health transitions or changed errors.
 
-This checks IPv4 HTTPS reachability, not every protocol. An echo-service outage can fail the check
-even if Proton still reports connected. Such failure is observable but does not cause automatic
-reconnection. Docker restart policies still do not restart a merely unhealthy container.
+This checks IPv4 HTTPS reachability, not every protocol. Echo failure alone remains observational.
+After a failed echo the worker sends one UDP datagram, with a one-second socket timeout and
+SO_BINDTODEVICE `proton0`, to numeric gateway `10.2.0.1:9`, then runs
+`wg show proton0 latest-handshakes` with a two-second timeout (never `dump`).
+Only a successful send and valid unchanged/zero handshake for 180 monotonic seconds on the same
+connection generation can queue recovery. A successful echo or changed handshake resets evidence;
+failed/malformed/absent observations and failed stimulus are unknown, not dead. New connections
+start a fresh evidence window; late results cannot affect another generation.
+
+Only the supervisor loop under its CLI lock consumes generation-specific recovery, rechecking
+health, signed-in/wanted state and stop. It revokes connection/port/health publication before a
+five-second-bounded disconnect, then uses the normal configured connect without signing out.
+Failed disconnects never connect over the old tunnel. Failed recovery retains completion-based
+30/60/120/300-second backoff despite misleading native Connected or further health probes.
+Intent changes cancel stale recovery, and existing late-connect compensation remains in force.
+Docker restart policies still do not restart a merely unhealthy container.
 
 ### Unraid template
 
