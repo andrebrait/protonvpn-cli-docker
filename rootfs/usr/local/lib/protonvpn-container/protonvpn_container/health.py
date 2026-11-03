@@ -6,6 +6,7 @@ Run as `python3 -m protonvpn_container.health`: exit status 0 when the superviso
 import ipaddress
 import json
 import os
+import socket
 import sys
 import time
 
@@ -42,6 +43,23 @@ def probe(tool, url: str = PROBE_URL) -> str:
     if ip is None or not ip.is_global or ip.is_multicast:
         raise ProbeError("the IP echo did not return a public IPv4 address")
     return str(ip)
+
+
+def active_handshake(tool) -> tuple[str, int] | None:
+    """Exercise the peer without DNS/echo, then read its handshake; unusable evidence is unknown."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+            udp.settimeout(1)
+            udp.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, f"{TUNNEL}\0".encode())
+            if udp.sendto(b"\0", ("10.2.0.1", 9)) != 1:
+                return None
+    except (OSError, AttributeError):  # SO_BINDTODEVICE is Linux-only
+        return None
+    res = tool("wg", "show", TUNNEL, "latest-handshakes", timeout=2)
+    fields = res.out.split()
+    if res.rc != 0 or len(fields) != 2 or len(fields[1]) > 20 or not fields[1].isascii() or not fields[1].isdigit():
+        return None  # proton0 has one peer; absent/ambiguous output is not a dead peer
+    return fields[0], int(fields[1])
 
 
 def write_health(path: str, healthy: bool, checked_at: float) -> None:

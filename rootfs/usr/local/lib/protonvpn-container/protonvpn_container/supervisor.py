@@ -21,7 +21,7 @@ import traceback
 
 from . import cli
 from .config import DEFAULTS, SETTINGS, SettingsStore, connect_args, is_true, settings_pairs
-from .health import FRESH_FOR, HEALTH_FILE, TUNNEL, ProbeError, probe, write_health
+from .health import FRESH_FOR, HEALTH_FILE, TUNNEL, ProbeError, active_handshake, probe, write_health
 from .parsing import (
     Status,
     parse_account,
@@ -41,6 +41,7 @@ NATPMP_LEASE = 60  # seconds a mapping lives without a renewal
 NATPMP_DELETE_TIMEOUT = 2
 HEALTH_EVERY = 30  # seconds between probes, counted from the end of one
 HEALTH_POLL = 1  # the worker looks for a newly connected tunnel this often
+RECOVERY_AFTER = 180  # unchanged handshake despite active tunnel traffic, not an echo-service outage
 TRAFFIC_EVERY = 5
 TRAFFIC_KEEP = 180  # 15 minutes
 # Cap for `protonvpn disconnect` during shutdown; the caller's total budget may be shorter.
@@ -133,6 +134,9 @@ class Supervisor:
         self._health_io = threading.Lock()  # serialises the file writes; taken before _lock
         self._health_published: bool | None = None  # what the file says; None: not written yet, or the write failed
         self._health_write_failed = False
+        self._handshake = self._handshake_since = None
+        self._recovery_gen: int | None = None
+        self._recovery_retry_at: float | None = None
         self._lease_end = self._lease_timer = None  # of the published port: the timer clears it unless a renewal replaced it
         self._traffic = collections.deque(maxlen=TRAFFIC_KEEP)
         self._settings_errors: dict[str, str] = {}
@@ -202,6 +206,8 @@ class Supervisor:
         with self._lock:
             self._user_disconnected = self._disconnect_pending = False
             self._failures = 0
+            self._recovery_gen = self._recovery_retry_at = None
+            self._handshake = self._handshake_since = None
         self._next_check = 0.0
         self._next_natpmp = 0.0
 
@@ -293,6 +299,8 @@ class Supervisor:
         with self._cli_lock:
             if self._stop.is_set():
                 return
+            if self._recover():
+                return  # unresolved recovery owns its deadline; never re-adopt native's misleading Connected
             self._forward_port()  # first: a slow state check must not make the lease run out
             now = self._clock()
             if now >= self._next_check:
@@ -387,6 +395,63 @@ class Supervisor:
                 self._exit_ip = ""  # the next connection, ours or adopted, has its own
         self._was_connected = connected
 
+
+    def _recover(self) -> bool:
+        """Consume health evidence under _cli_lock; failed attempts retain their own completion-based backoff."""
+        with self._lock:
+            if self._stop.is_set() or self._user_disconnected or self._disconnect_pending or not self._signed_in:
+                self._recovery_gen = self._recovery_retry_at = None
+                return False
+            if self._recovery_retry_at is not None:
+                if self._clock() < self._recovery_retry_at:
+                    return True
+            elif not (
+                self._recovery_gen == self._health_gen and self._st.connected and self._health_error
+                and self._handshake_since is not None and self._clock() - self._handshake_since >= RECOVERY_AFTER
+            ):
+                self._recovery_gen = None
+                return False
+            self._recovery_retry_at = float("inf")  # requests can cancel while bounded CLI calls are running
+        self._drop_connection(recovering=True)
+        self._was_connected = False
+        log("[protonvpn] tunnel handshake stalled; recovering without signing out")
+        info = self._run("info")
+        with self._lock:
+            if self._stop.is_set() or self._user_disconnected or self._recovery_retry_at is None:
+                return True
+            if info.rc == 0 and not parse_account(info.out):
+                self._signed_in, self._account = False, ""
+                self._recovery_retry_at = None
+                self._next_check = 0.0
+                return True
+        result = self._run("disconnect", timeout=STOP_DISCONNECT_TIMEOUT) if info.rc == 0 else info
+        say(result.out)
+        with self._lock:
+            if self._stop.is_set() or self._user_disconnected or self._recovery_retry_at is None:
+                return True
+        if result.rc == 0 and self._pin_protocol():
+            self._apply_settings(False)  # includes a kill-switch deferred while adopting a native connection
+            if self._connect():
+                with self._lock:
+                    connected = self._st.connected
+                    self._recovery_retry_at = None
+                if connected:
+                    self._failures = 0
+                    self._was_connected = True
+                    self._next_check = self._clock() + self._interval
+                    self._forward_port()
+                return True
+        with self._lock:
+            if self._stop.is_set() or self._user_disconnected:
+                self._recovery_retry_at = None
+                return True
+            delay = BACKOFF[min(self._failures, len(BACKOFF) - 1)]
+            self._failures += 1
+            self._recovery_retry_at = self._clock() + delay
+            self._last_error = result.out.strip() if result.rc else self._last_error
+        log(f"[protonvpn] tunnel recovery failed; retrying in {delay}s")
+        return True
+
     def _reject_protocol(self, st: Status) -> bool:
         if not st.connected or st.protocol.lower() == PROTOCOL:
             return False
@@ -458,8 +523,7 @@ class Supervisor:
     # --- tunnel health: its own thread, see the module docstring ---
 
     def health_tick(self) -> None:
-        """Probe the tunnel when due. A failed probe changes nothing but the health fields: it never disconnects or
-        reconnects, drops the port, or touches the CLI's own `last_error`. The same probe supplies a missing exit IP."""
+        """Probe without the CLI lock. Echo failure alone is observational; active handshake evidence can queue recovery."""
         now = self._clock()
         with self._lock:
             if not self._st.connected or now < self._next_probe:
@@ -470,6 +534,7 @@ class Supervisor:
             ip, error = probe(self._tool), ""
         except ProbeError as exc:
             ip, error = "", str(exc)
+        handshake = active_handshake(self._tool) if error else None
         found = ""
         with self._lock:
             if generation != self._health_gen or not self._st.connected or self._stop.is_set():
@@ -477,6 +542,13 @@ class Supervisor:
             done = self._clock()
             previous, first = self._health_error, self._health_at is None
             self._health_at, self._health_error, self._next_probe = done, error, done + HEALTH_EVERY
+            if not error or handshake is None or self._user_disconnected or self._disconnect_pending:
+                self._handshake = self._handshake_since = self._recovery_gen = None
+            elif handshake != self._handshake:
+                self._handshake, self._handshake_since, self._recovery_gen = handshake, done, None
+            elif self._handshake_since is not None and done - self._handshake_since >= RECOVERY_AFTER:
+                if self._recovery_gen is None and self._recovery_retry_at is None and self._signed_in:
+                    self._recovery_gen = generation
             if ip and not self._exit_ip:  # the connect output stays the primary source
                 self._exit_ip = found = ip
         if error and error != previous:  # one line per change, not per probe
@@ -510,6 +582,7 @@ class Supervisor:
         with self._lock:
             self._health_gen += 1
             self._health_at, self._health_error, self._next_probe = None, "", 0.0
+            self._handshake = self._handshake_since = self._recovery_gen = None
         self._publish_health()
 
     def _publish_health(self) -> None:
@@ -612,13 +685,15 @@ class Supervisor:
         if self._clock() >= self._next_natpmp:
             self._refresh_port()
 
-    def _drop_connection(self, ended: bool = True) -> None:
+    def _drop_connection(self, ended: bool = True, recovering: bool = False) -> None:
         """Forget the status, forwarded port and tunnel check of a connection that is going away or can no longer be vouched for.
 
         `ended`: it really is going away, so its exit IP is forgotten too.
         """
         with self._lock:
             self._st = Status()
+            if not recovering:
+                self._recovery_retry_at = None
             if ended:
                 self._exit_ip = ""
         self._reset_health()

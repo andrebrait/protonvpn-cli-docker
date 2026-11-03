@@ -92,6 +92,86 @@ class ApiTest(WebuiCase):
         self.assertEqual(self.api("GET", "/api/v1/port?format=text")[1], b"")
         self.assertEqual(self.api("GET", "/api/v1/traffic")[1], {"rx_bytes": 0, "tx_bytes": 0, "samples": []})
 
+    def test_metrics_use_the_same_bearer_cookie_and_open_mode_auth(self):
+        self.assertEqual(self.get("/metrics")[0], 401)
+        self.assertEqual(self.get("/metrics", "session=forged")[0], 401)
+        self.assertEqual(self.api("GET", "/metrics", token="wrong")[0].status, 401)
+        self.assertEqual(self.api("GET", "/metrics")[0].status, 200)
+        self.assertEqual(self.get("/metrics", self.login())[0], 200)
+        self.server.ui.api_key = ""
+        self.assertEqual(self.api("GET", "/metrics")[0].status, 401)
+        self.server.ui.password = ""
+        self.assertEqual(self.get("/metrics")[0], 200)
+
+    def test_metrics_export_snapshot_gauges_without_private_state(self):
+        cases = (
+            (
+                {},
+                {
+                    "protonvpn_signed_in": 0, "protonvpn_connected": 0, "protonvpn_tunnel_healthy": 0,
+                    "protonvpn_user_disconnected": 0, "protonvpn_port_forwarding_active": 0,
+                },
+            ),
+            (
+                {"signed_in": True, "connected": True, "tunnel_healthy": None},
+                {
+                    "protonvpn_signed_in": 1, "protonvpn_connected": 1, "protonvpn_tunnel_healthy": 0,
+                    "protonvpn_user_disconnected": 0, "protonvpn_port_forwarding_active": 0,
+                },
+            ),
+            (
+                {"signed_in": True, "connected": True, "tunnel_healthy": False, "health_checked_ago": 75.0},
+                {
+                    "protonvpn_signed_in": 1, "protonvpn_connected": 1, "protonvpn_tunnel_healthy": 0,
+                    "protonvpn_user_disconnected": 0, "protonvpn_port_forwarding_active": 0,
+                    "protonvpn_health_check_age_seconds": 75.0,
+                },
+            ),
+            (
+                {
+                    "signed_in": True, "connected": True, "tunnel_healthy": True,
+                    "forwarded_port": 41404, "health_checked_ago": 4.5,
+                },
+                {
+                    "protonvpn_signed_in": 1, "protonvpn_connected": 1, "protonvpn_tunnel_healthy": 1,
+                    "protonvpn_user_disconnected": 0, "protonvpn_port_forwarding_active": 1,
+                    "protonvpn_health_check_age_seconds": 4.5,
+                },
+            ),
+            (
+                {"signed_in": True, "user_disconnected": True, "health_checked_ago": 0.0},
+                {
+                    "protonvpn_signed_in": 1, "protonvpn_connected": 0, "protonvpn_tunnel_healthy": 0,
+                    "protonvpn_user_disconnected": 1, "protonvpn_port_forwarding_active": 0,
+                    "protonvpn_health_check_age_seconds": 0.0,
+                },
+            ),
+        )
+        for overrides, expected in cases:
+            with self.subTest(**overrides):
+                self.sup.overrides = {
+                    "account": "private@example.com", "server": "PRIVATE#123", "exit_ip": "203.0.113.42",
+                    "last_error": "private CLI error", "health_error": "private health error", **overrides,
+                }
+                resp, raw = self.api("GET", "/metrics")
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(resp.getheader("Content-Type"), "text/plain; version=0.0.4; charset=utf-8")
+                self.assertEqual(resp.getheader("Cache-Control"), "no-store")
+                self.assertTrue(raw.endswith(b"\n"))
+                lines = raw.decode().splitlines()
+                samples = dict(line.split() for line in lines if not line.startswith("#"))
+                self.assertEqual({name: float(value) for name, value in samples.items()}, expected)
+                helps = {line.split(" ", 3)[2]: line.split(" ", 3)[3] for line in lines if line.startswith("# HELP ")}
+                types = dict(line.removeprefix("# TYPE ").split() for line in lines if line.startswith("# TYPE "))
+                self.assertEqual(set(helps), set(expected))
+                self.assertTrue(all(helps.values()))
+                self.assertEqual(types, dict.fromkeys(expected, "gauge"))
+                for secret in (
+                    self.PASSWORD, self.API_KEY, "private@example.com", "PRIVATE#123", "203.0.113.42",
+                    "private CLI error", "private health error",
+                ):
+                    self.assertNotIn(secret.encode(), raw)
+
     def test_error_shape_at_http_boundary(self):
         self.environ["NETSHIELD"] = "off"
         cases = [
@@ -184,13 +264,18 @@ class ApiTest(WebuiCase):
                     operation_ids.add(operation["operationId"])
                     request = operation.get("requestBody", {}).get("content", {}).get("application/json", {})
                     body = {"password": self.PASSWORD} if path == "/login" else request.get("example")
-                    resp, data = self.api(method.upper(), "/api/v1" + path, body)
+                    servers = operation.get("servers", document["servers"])
+                    base = servers[0]["url"].rstrip("/")
+                    resp, data = self.api(method.upper(), base + path, body)
                     self.assertEqual(resp.status, 200, data)
-                    content = operation["responses"]["200"]["content"]["application/json"]
+                    content_type = resp.getheader("Content-Type").split(";")[0]
+                    content = operation["responses"]["200"]["content"][content_type]
+                    if isinstance(data, bytes):
+                        data = data.decode()
                     # The components travel with the schema so that its #/components/... references resolve.
                     schema = {**content["schema"], "components": document["components"]}
                     self.assertEqual(list(Draft202012Validator(schema).iter_errors(data)), [])
-        self.assertEqual(len(operation_ids), 15)
+        self.assertEqual(len(operation_ids), 16)
 
     def live_supervisor(self):
         """A real supervisor behind the server, with a connection and a forwarded port."""

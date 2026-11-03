@@ -19,6 +19,7 @@ CONNECT_OUT = "Connected to NL#914 in Amsterdam, Netherlands. \nYour new IP addr
 UDP = ("natpmpc", "-a", "1", "0", "udp", "60", "-g", "10.2.0.1")
 TCP = ("natpmpc", "-a", "1", "0", "tcp", "60", "-g", "10.2.0.1")
 WG = ("wg", "show", "proton0", "transfer")
+HANDSHAKE = ("wg", "show", "proton0", "latest-handshakes")
 SUPERVISOR = "protonvpn_container.supervisor"
 PROBE = ("curl",)
 ECHO_IP = "205.147.16.74"
@@ -1501,6 +1502,11 @@ class LeaseTest(SupervisorCase):
 class HealthCase(SupervisorCase):
     """Operational health runs on its own worker: these tests step `health_tick()` as the others step `tick()`."""
 
+    def setUp(self):
+        super().setUp()
+        self.socket = self.enterContext(mock.patch("socket.socket"))
+        self.socket.return_value.__enter__.return_value.sendto.return_value = 1
+
     def probe_now(self, advance=0):
         self.clock.now += advance
         with redirect_stdout(self.out):
@@ -1558,11 +1564,12 @@ class HealthTest(HealthCase):
         self.probe_now()
         self.assertEqual((PROBE in self.tool.calls, self.health()), (False, (False, "", None)))
 
-    def test_a_probe_failure_leaves_the_connection_port_and_native_error_alone_and_recovers(self):
+    def test_failed_echo_with_live_handshake_leaves_connection_port_and_native_error_alone(self):
         self.tool.responses[UDP] = self.tool.responses[TCP] = mapped(41404)
         self.make(environ={"PORT_FORWARDING": "on"})
         self.tick()
         self.tool.responses[PROBE] = BIND_FAILED
+        self.tool.responses[HANDSHAKE] = lambda n: Result(0, f"peer\t{100 + n}\n")
         self.probe_now()
         snap = self.sup.snapshot()
         reason = snap["health_error"]
@@ -1572,6 +1579,9 @@ class HealthTest(HealthCase):
         self.assertFalse(self.docker_says_healthy())
         self.tick(30)  # the state check still reads Connected and keeps the verdict: no reconnect is asked for
         self.assertEqual((self.sup.snapshot()["connected"], self.health()), (True, (False, reason, 30.0)))
+        for _ in range(7):
+            self.probe_now(30)
+            self.tick()
         self.tool.responses[PROBE] = PROBE_OK
         self.probe_now(30)
         self.assertEqual((self.health(), self.docker_says_healthy()), ((True, "", 0.0), True))
@@ -1723,6 +1733,230 @@ class HealthTest(HealthCase):
         self.assertEqual(self.health(), (True, "", 0.0))
         self.assertEqual(self.out.getvalue().count("[health] cannot write"), 1)
         self.assertFalse(self.docker_says_healthy())
+
+
+class RecoveryTest(HealthCase):
+    def stuck(self, handshake=0, environ=None):
+        self.make(environ=environ)
+        self.tick()
+        self.tool.responses[PROBE] = TIMED_OUT
+        self.tool.responses[HANDSHAKE] = Result(0, f"peer\t{handshake}\n")
+        self.probe_now()
+
+    def queue_recovery(self):
+        for _ in range(6):
+            self.probe_now(30)
+
+    def test_stale_or_zero_handshake_queues_once_after_180_seconds_and_keeps_credentials_and_target(self):
+        for handshake in (0, 123):
+            with self.subTest(handshake=handshake):
+                self.setUp()
+                self.stuck(handshake, {"COUNTRY": "Netherlands"})
+                original = self.cli.argvs("connect")[0]
+                self.probe_now(150)
+                self.probe_now(29)
+                self.tick()
+                self.assertEqual(len(self.cli.argvs("connect")), 1)
+                self.probe_now(1)
+                self.assertEqual(self.cli.argvs("disconnect"), [])  # worker only queues
+                self.tick()
+                self.assertEqual(self.cli.argvs("connect"), [original, original])
+                self.assertEqual(self.cli.argvs("disconnect"), [("disconnect",)])
+                self.assertEqual(self.cli.argvs("signin") + self.cli.argvs("signout"), [])
+                self.assertTrue(self.sup.snapshot()["connected"])
+                self.assertEqual(self.store.effective("COUNTRY"), "Netherlands")
+                self.tick()
+                self.assertEqual(len(self.cli.argvs("connect")), 2)
+
+    def test_ipify_dns_outage_with_advancing_handshake_never_reconnects(self):
+        self.stuck(123)
+        self.tool.responses[HANDSHAKE] = lambda n: Result(0, f"peer\t{123 + n}\n")
+        for _ in range(10):
+            self.probe_now(30)
+            self.tick()
+        self.assertEqual((len(self.cli.argvs("connect")), self.cli.argvs("disconnect")), (1, []))
+        self.assertFalse(self.sup.snapshot()["tunnel_healthy"])
+
+    def test_successful_echo_or_advancing_handshake_cancels_queued_recovery(self):
+        for live_echo in (True, False):
+            with self.subTest(live_echo=live_echo):
+                self.setUp()
+                self.stuck()
+                self.queue_recovery()
+                if live_echo:
+                    self.tool.responses[PROBE] = PROBE_OK
+                else:
+                    self.tool.responses[HANDSHAKE] = Result(0, "peer\t1\n")
+                self.probe_now(30)
+                self.tick()
+                self.assertEqual((len(self.cli.argvs("connect")), self.cli.argvs("disconnect")), (1, []))
+
+    def test_unknown_wireguard_or_failed_stimulus_does_not_accumulate_dead_evidence(self):
+        for result, stimulus_ok in ((Result(124, "timeout"), True), (Result(0, ""), True),
+                                     (Result(0, "malformed"), True), (Result(0, "peer\t0\n"), False)):
+            with self.subTest(result=result, stimulus_ok=stimulus_ok):
+                self.setUp()
+                self.stuck()
+                self.tool.responses[HANDSHAKE] = result
+                self.socket.return_value.__enter__.return_value.sendto.side_effect = None if stimulus_ok else OSError("no route")
+                self.probe_now(180)
+                self.tick()
+                self.assertEqual(self.cli.argvs("disconnect"), [])
+                self.tool.responses[HANDSHAKE] = Result(0, "peer\t0\n")
+                self.socket.return_value.__enter__.return_value.sendto.side_effect = None
+                self.probe_now(30)
+                self.tick()
+                self.assertEqual(self.cli.argvs("disconnect"), [])
+
+    def test_new_generation_and_successful_echo_restart_the_evidence_grace(self):
+        for new_connection in (True, False):
+            with self.subTest(new_connection=new_connection):
+                self.setUp()
+                self.stuck()
+                self.probe_now(150)
+                if new_connection:
+                    self.cli.connected = False
+                    self.tick()
+                else:
+                    self.tool.responses[PROBE] = PROBE_OK
+                    self.probe_now(30)
+                    self.tool.responses[PROBE] = TIMED_OUT
+                expected = len(self.cli.argvs("connect"))
+                self.probe_now(30)
+                self.probe_now(150)
+                self.tick()
+                self.assertEqual(len(self.cli.argvs("connect")), expected)
+
+    def test_intent_changes_cancel_queued_recovery(self):
+        for intent in ("disconnect", "signout", "stop"):
+            with self.subTest(intent=intent):
+                self.setUp()
+                self.stuck()
+                self.queue_recovery()
+                with redirect_stdout(self.out):
+                    if intent == "disconnect":
+                        self.sup.request_disconnect()
+                    elif intent == "signout":
+                        self.sup.sign_out()
+                    else:
+                        self.sup.stop()
+                before = len(self.cli.argvs("disconnect"))
+                self.tick()
+                self.assertEqual(len(self.cli.argvs("connect")), 1)
+                self.assertLessEqual(len(self.cli.argvs("disconnect")), before + (intent == "disconnect"))
+
+    def test_failed_recovery_backoff_survives_native_connected_and_further_probes(self):
+        for disconnect_fails in (True, False):
+            with self.subTest(disconnect_fails=disconnect_fails):
+                self.setUp()
+                self.stuck()
+                self.queue_recovery()
+                if disconnect_fails:
+                    self.cli.responses[("disconnect",)] = Result(124, "disconnect timed out")
+                    self.cli.slow[("disconnect",)] = 9
+                else:
+                    self.cli.connect_rc = 1
+                    self.cli.connect_duration = 7
+                for delay in (30, 60, 120, 300):
+                    self.tick()
+                    completed = self.clock.now
+                    attempts = len(self.cli.argvs("disconnect"))
+                    self.assertFalse(self.sup.snapshot()["connected"])
+                    self.cli.connected = True  # native Error retains a connection object
+                    self.sup.notify_signed_in()  # unrelated wake-up cannot defeat the recovery deadline
+                    self.probe_now(delay - 1)
+                    self.tick()
+                    self.assertEqual(len(self.cli.argvs("disconnect")), attempts)
+                    self.tick(1)
+                    self.assertEqual(self.cli.times("disconnect")[-1], completed + delay)
+                    if disconnect_fails:
+                        self.assertEqual(len(self.cli.argvs("connect")), 1)
+                self.assertTrue(all(timeout == 5 for args, timeout in self.cli.timeouts if args == ("disconnect",)))
+
+    def test_invalid_native_settings_are_preserved_and_block_recovery_with_backoff(self):
+        for raw in ('{"protocol": "openvpn-tcp",', '["openvpn-tcp"]', '\ud800'):
+            with self.subTest(raw=raw):
+                self.setUp()
+                self.cli.connected = True
+                self.stuck()  # adopt the connection, leaving the kill-switch deferred
+                applied = self.cli.argvs("config")
+                ks = ("config", "set", "kill-switch", "standard")
+                self.assertNotIn(ks, applied)
+                os.makedirs(os.path.dirname(self.native_settings), exist_ok=True)
+                original = raw.encode("utf-8", errors="surrogatepass")
+                with open(self.native_settings, "wb") as f:
+                    f.write(original)
+
+                def overwrite_native():
+                    with open(self.native_settings, "w") as f:
+                        json.dump({}, f)
+
+                self.cli.during[ks] = overwrite_native  # native setters can replace malformed JSON with defaults
+                self.queue_recovery()
+                started = self.clock.now
+                for advance, attempts in ((0, 1), (29, 1), (1, 2)):
+                    self.tick(advance)
+                    self.assertEqual(len(self.cli.argvs("disconnect")), attempts)
+                    self.assertEqual(self.cli.argvs("config"), applied)
+                    self.assertEqual(self.cli.argvs("connect"), [])
+                    snap = self.sup.snapshot()
+                    self.assertFalse(snap["connected"])
+                    self.assertIn("cannot set the wireguard protocol", snap["last_error"])
+                    with open(self.native_settings, "rb") as f:
+                        self.assertEqual(f.read(), original)
+                self.assertEqual(self.cli.times("disconnect"), [started, started + 30])
+
+    def test_recovery_revokes_publication_before_disconnect_and_preserves_late_connect_compensation(self):
+        self.tool.responses[UDP] = self.tool.responses[TCP] = mapped(41404)
+        self.stuck(environ={"PORT_FORWARDING": "on"})
+        self.queue_recovery()
+
+        def during_disconnect():
+            snap = self.sup.snapshot()
+            self.assertEqual((snap["connected"], snap["forwarded_port"], snap["tunnel_healthy"]), (False, None, False))
+            self.assertEqual(self.read_port_file(), "")
+            self.assertFalse(self.docker_says_healthy())
+
+        self.cli.during[("disconnect",)] = during_disconnect
+        original = self.cli.argvs("connect")[0]
+        self.cli.during[original] = self.sup.request_disconnect
+        self.tick()
+        self.assertFalse(self.sup.snapshot()["connected"])
+        self.assertEqual(len(self.cli.argvs("disconnect")), 2)
+
+    def test_late_handshake_result_cannot_recover_a_replacement_connection(self):
+        self.stuck()
+        self.probe_now(150)
+        gate = Gate(Result(0, "peer\t0\n"))
+        self.tool.responses[HANDSHAKE] = gate
+        self.clock.now += 30
+        worker = threading.Thread(target=self.sup.health_tick)
+        worker.start()
+        self.addCleanup(worker.join, 5)
+        self.addCleanup(gate.release.set)
+        self.assertTrue(gate.started.wait(5))
+        self.cli.connected = False
+        self.tick()
+        self.finish(gate, worker)
+        self.tick()
+        self.assertEqual((len(self.cli.argvs("connect")), self.cli.argvs("disconnect")), (2, []))
+
+    def test_slow_handshake_observation_blocks_neither_cli_nor_port_renewal(self):
+        self.tool.responses[UDP] = self.tool.responses[TCP] = mapped(41404)
+        self.stuck(environ={"PORT_FORWARDING": "on"})
+        gate = Gate(Result(0, "peer\t0\n"))
+        self.tool.responses[HANDSHAKE] = gate
+        self.clock.now += 30
+        worker = threading.Thread(target=self.sup.health_tick)
+        worker.start()
+        self.addCleanup(worker.join, 5)
+        self.addCleanup(gate.release.set)
+        self.assertTrue(gate.started.wait(5))
+        self.tick(15)
+        self.assertEqual(self.tool.calls.count(UDP), 2)
+        self.assertEqual(self.sup.snapshot()["forwarded_port"], 41404)
+        self.finish(gate, worker)
+        self.assertFalse(gate.timed_out)
 
 
 class ExitIpTest(HealthCase):

@@ -4,6 +4,7 @@ import tempfile
 import threading
 import unittest
 
+from unittest import mock
 from protonvpn_container import health
 from protonvpn_container.cli import Result, run_tool
 from protonvpn_container.health import ProbeError, is_healthy, probe, write_health
@@ -44,6 +45,35 @@ class ProbeTest(unittest.TestCase):
         with self.assertRaises(ProbeError) as raised:
             probe(answering(1, "curl: (1) " + "x" * 5000))
         self.assertLessEqual(len(str(raised.exception)), health.REASON_MAX)
+
+class HandshakeTest(unittest.TestCase):
+    def test_stimulus_is_bounded_bound_to_tunnel_and_independent_of_dns(self):
+        tool = mock.Mock()
+        with mock.patch.object(health.socket, "socket") as socket:
+            udp = socket.return_value.__enter__.return_value
+            udp.sendto.return_value = 1
+            tool.return_value = Result(0, "peer\t123\n")
+            self.assertEqual(health.active_handshake(tool), ("peer", 123))
+            udp.settimeout.assert_called_once_with(1)
+            udp.setsockopt.assert_called_once_with(health.socket.SOL_SOCKET, health.socket.SO_BINDTODEVICE, b"proton0\0")
+            udp.sendto.assert_called_once_with(b"\0", ("10.2.0.1", 9))
+            tool.assert_called_once_with("wg", "show", "proton0", "latest-handshakes", timeout=2)
+
+    def test_missing_malformed_failed_or_timed_out_handshakes_are_unknown(self):
+        with mock.patch.object(health.socket, "socket") as socket:
+            socket.return_value.__enter__.return_value.sendto.return_value = 1
+            for rc, body in ((0, ""), (0, "peer"), (0, "peer\t-1"), (0, "peer\tnan"),
+                             (0, "peer\t1\nother\t2"), (1, "peer\t123"), (124, "timed out")):
+                with self.subTest(rc=rc, body=body):
+                    self.assertIsNone(health.active_handshake(answering(rc, body)))
+            self.assertEqual(health.active_handshake(answering(0, "peer\t0\n")), ("peer", 0))
+
+    def test_failed_stimulus_does_not_trust_even_a_valid_handshake(self):
+        with mock.patch.object(health.socket, "socket") as socket:
+            socket.return_value.__enter__.return_value.sendto.side_effect = OSError("no route")
+            tool = mock.Mock(return_value=Result(0, "peer\t123\n"))
+            self.assertIsNone(health.active_handshake(tool))
+            tool.assert_not_called()
 
 
 class Echo(http.server.BaseHTTPRequestHandler):
