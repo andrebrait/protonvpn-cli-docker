@@ -287,6 +287,9 @@ Metrics carry no labels containing account names, IP addresses, servers, errors,
 | `protonvpn_port_forwarding_active` | `1` while a forwarded port is advertised, otherwise `0`. |
 | `protonvpn_health_check_age_seconds` | Seconds since the last traffic check; omitted until a check completes. |
 | `protonvpn_receive_bytes_total`, `protonvpn_transmit_bytes_total` | Counters of bytes received and sent through `proton0` on the current connection, from the 5-second traffic samples. They restart at each connection, which `rate()` handles as a counter reset; use `rate()` for bytes per second. Omitted until the first sample. |
+| `protonvpn_connect_attempts_total`, `protonvpn_connect_failures_total` | Counters of `protonvpn connect` runs since the container started, and of those that did not leave a WireGuard tunnel connected. Connects canceled by a user disconnect or shutdown are not counted. |
+| `protonvpn_recovery_attempts_total` | Counter of stalled-tunnel recovery attempts since the container started. |
+| `protonvpn_health_checks_total`, `protonvpn_health_check_failures_total` | Counters of traffic checks, every 30 seconds while signed in and not user-disconnected, and of failed ones. While that wanted tunnel is not connected, each check counts as failed without probing, so the failure ratio covers outages too. |
 
 Example vmagent/Prometheus scrape configuration (store the VPN container's `API_KEY` in the referenced file, readable only by the scraper):
 
@@ -301,7 +304,7 @@ scrape_configs:
 
 Replace the target with your published VPN address and allow the scraper's source address in `WEBUI_ALLOWED_NETWORKS`. Use a trusted HTTPS reverse proxy and `scheme: https` outside a trusted local network.
 
-Unhealthy, signed-out, and unknown VPN states still return HTTP 200. Alert on `up{job="protonvpn"} == 0` for scrape/authentication/transport failures and on `protonvpn_tunnel_healthy{job="protonvpn"} == 0` for tunnel health failures; choose an alert duration long enough for startup and normal probe intervals. To ignore intentional disconnections, combine the tunnel expression with `and protonvpn_user_disconnected{job="protonvpn"} == 0`. Missing health-check age means no completed check, not a zero-second-old check.
+Unhealthy, signed-out, and unknown VPN states still return HTTP 200. Alert on `up{job="protonvpn"} == 0` for scrape/authentication/transport failures and on `protonvpn_signed_in{job="protonvpn"} == 0` for a lost sign-in. For tunnel health, prefer the counters to the instantaneous gauges: `increase(protonvpn_health_check_failures_total[15m]) / increase(protonvpn_health_checks_total[15m])` is the failed fraction, and `1 -` that ratio over a longer window is the real uptime. A container start makes one connect; repeated `increase(protonvpn_connect_attempts_total[1h]) > 2` means a flapping tunnel. Counters restart with the container, which `increase()` handles as a counter reset. `protonvpn_tunnel_healthy{job="protonvpn"} == 0` remains available for instantaneous checks; combine it with `and protonvpn_user_disconnected{job="protonvpn"} == 0` to ignore intentional disconnections. Missing health-check age means no completed check, not a zero-second-old check.
 
 ## Health and troubleshooting
 

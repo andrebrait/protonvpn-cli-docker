@@ -189,6 +189,17 @@ class ApiTest(WebuiCase):
                 self.assertEqual({k: v for k, v in values.items() if "bytes" in k}, expected)
                 self.assertEqual({k: types[k] for k in expected}, dict.fromkeys(expected, "counter"))
 
+    def test_metrics_export_every_supervisor_counter(self):
+        self.assertEqual(set(webui.COUNTERS), set(Supervisor(self.store).snapshot()["counters"]))
+        self.sup.overrides = {"counters": {"connect_attempts_total": 3, "health_check_failures_total": 0}}
+        _, raw = self.api("GET", "/metrics")
+        lines = raw.decode().splitlines()
+        values = {name: float(value) for name, value in (l.split() for l in lines if not l.startswith("#"))}
+        types = dict(l.removeprefix("# TYPE ").split() for l in lines if l.startswith("# TYPE "))
+        expected = {"protonvpn_connect_attempts_total": 3, "protonvpn_health_check_failures_total": 0}
+        self.assertEqual({k: values[k] for k in expected}, expected)
+        self.assertEqual({k: types[k] for k in expected}, dict.fromkeys(expected, "counter"))
+
     def test_error_shape_at_http_boundary(self):
         self.environ["NETSHIELD"] = "off"
         cases = [

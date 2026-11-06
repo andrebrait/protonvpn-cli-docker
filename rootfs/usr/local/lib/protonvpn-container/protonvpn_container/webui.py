@@ -48,6 +48,13 @@ SETTINGS_BY_ENV = {s.env: s for s in SETTINGS}
 # Client-controlled text in log lines is escaped like the stdlib does: no forged lines, no terminal control codes.
 LOG_ESCAPES = {c: f"\\x{c:02x}" for c in (*range(0x20), *range(0x7F, 0xA0))} | {ord("\\"): "\\\\"}
 CUSTOM_DNS_SYNTAX = "must be off, on, or on --dns <comma-separated IPv4/IPv6 addresses>, e.g. on --dns 1.1.1.1,8.8.8.8"
+COUNTERS = {  # Supervisor.snapshot()["counters"]: counted since the container started
+    "connect_attempts_total": "Connect commands run since the container started.",
+    "connect_failures_total": "Connect commands that did not leave a WireGuard tunnel connected.",
+    "recovery_attempts_total": "Stalled-tunnel recovery attempts since the container started.",
+    "health_checks_total": "Traffic checks while a tunnel is wanted; with no connection a check fails without probing.",
+    "health_check_failures_total": "Failed traffic checks, including checks made while a wanted tunnel was down.",
+}
 
 
 def custom_dns_ok(value: str) -> bool:
@@ -304,6 +311,7 @@ class Handler(BaseHTTPRequestHandler):
             # WireGuard counters restart with each connection; Prometheus rate() treats that as a counter reset.
             ("receive_bytes_total", "counter", "Bytes received through the tunnel on the current connection.", last and last[1]),
             ("transmit_bytes_total", "counter", "Bytes sent through the tunnel on the current connection.", last and last[2]),
+            *((name, "counter", COUNTERS[name], value) for name, value in state["counters"].items()),
         )
         lines = []
         for suffix, kind, help_text, value in metrics:

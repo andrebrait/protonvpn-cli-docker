@@ -140,6 +140,11 @@ class Supervisor:
         self._lease_end = self._lease_timer = None  # of the published port: the timer clears it unless a renewal replaced it
         self._traffic = collections.deque(maxlen=TRAFFIC_KEEP)
         self._settings_errors: dict[str, str] = {}
+        # Lifetime counters for /metrics, under _lock; keys are the metric names without the prefix.
+        self._counters = dict.fromkeys((
+            "connect_attempts_total", "connect_failures_total", "recovery_attempts_total",
+            "health_checks_total", "health_check_failures_total",
+        ), 0)
         self._user_disconnected = self._disconnect_pending = False
         # Loop state, only touched under _cli_lock (or by single float stores from requests).
         self._mappings: dict[str, float] = {}  # known per-protocol leases, independent of API/file publication
@@ -200,6 +205,7 @@ class Supervisor:
                 "tunnel_healthy": tunnel_healthy,
                 "health_error": health_error,
                 "health_checked_ago": health_checked_ago,
+                "counters": dict(self._counters),
             }
 
     def request_connect(self) -> None:
@@ -412,6 +418,7 @@ class Supervisor:
                 self._recovery_gen = None
                 return False
             self._recovery_retry_at = float("inf")  # requests can cancel while bounded CLI calls are running
+            self._counters["recovery_attempts_total"] += 1
         self._drop_connection(recovering=True)
         self._was_connected = False
         log("[protonvpn] tunnel handshake stalled; recovering without signing out")
@@ -503,10 +510,13 @@ class Supervisor:
         with self._lock:
             canceled = canceled or self._stop.is_set() or self._user_disconnected
             if not canceled:
+                self._counters["connect_attempts_total"] += 1
                 if rejected:
+                    self._counters["connect_failures_total"] += 1
                     return False
                 self._st = st
                 ok = res.rc == 0 and st.connected
+                self._counters["connect_failures_total"] += not ok
                 self._last_error = "" if ok else (res.out.strip() or f"connect failed (exit code {res.rc})")
                 if ok:
                     self._exit_ip, self._check_error = parse_exit_ip(res.out), ""
@@ -526,7 +536,14 @@ class Supervisor:
         """Probe without the CLI lock. Echo failure alone is observational; active handshake evidence can queue recovery."""
         now = self._clock()
         with self._lock:
-            if not self._st.connected or now < self._next_probe:
+            if now < self._next_probe:
+                return
+            if not self._st.connected:
+                if self._signed_in and not (self._user_disconnected or self._disconnect_pending or self._stop.is_set()):
+                    # A wanted tunnel that is down counts as a failed check, so failure ratios cannot hide an outage.
+                    self._next_probe = now + HEALTH_EVERY
+                    self._counters["health_checks_total"] += 1
+                    self._counters["health_check_failures_total"] += 1
                 return
             generation = self._health_gen
             self._next_probe = now + HEALTH_EVERY  # also when the probe breaks: it must not spin
@@ -542,6 +559,8 @@ class Supervisor:
             done = self._clock()
             previous, first = self._health_error, self._health_at is None
             self._health_at, self._health_error, self._next_probe = done, error, done + HEALTH_EVERY
+            self._counters["health_checks_total"] += 1
+            self._counters["health_check_failures_total"] += bool(error)
             if not error or handshake is None or self._user_disconnected or self._disconnect_pending:
                 self._handshake = self._handshake_since = self._recovery_gen = None
             elif handshake != self._handshake:
