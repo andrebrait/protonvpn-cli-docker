@@ -2292,6 +2292,39 @@ class CountersTest(HealthCase):
         self.assertEqual(
             (self.counters()["connect_attempts_total"], self.counters()["connect_failures_total"]), (3, 2)
         )
+        key = self.cli.argvs("connect")[-1]
+        self.cli.connected = False
+        self.cli.during[key] = self.sup.request_disconnect  # canceled while running: neither counter moves
+        self.tick(30)
+        self.assertEqual(len(self.cli.argvs("connect")), 4)
+        self.assertEqual(
+            (self.counters()["connect_attempts_total"], self.counters()["connect_failures_total"]), (3, 2)
+        )
+
+    def test_repeated_state_checks_of_a_down_tunnel_do_not_add_checks(self):
+        self.make()
+        self.tick()
+        self.cli.connected = False
+        self.cli.connect_rc = 1
+        self.tick(30)  # the state check finds it down; the reconnect fails
+        self.probe_now()
+        self.assertEqual(self.counters()["health_check_failures_total"], 1)
+        self.clock.now += 10
+        self.sup._drop_connection()  # what each later state check of the down tunnel does
+        self.probe_now()
+        self.assertEqual(self.counters()["health_check_failures_total"], 1)
+        self.probe_now(20)
+        self.assertEqual(self.counters()["health_check_failures_total"], 2)
+
+    def test_probes_during_a_failed_user_disconnect_are_not_counted(self):
+        self.make()
+        self.tick()
+        self.cli.responses[("disconnect",)] = Result(1, "Error: temporary agent failure\n")
+        self.sup.request_disconnect()
+        self.tick(1)
+        self.assertTrue(self.sup.snapshot()["connected"])  # still up, but no longer wanted
+        self.probe_now(30)
+        self.assertEqual(self.counters()["health_checks_total"], 0)
 
     def test_a_wanted_tunnel_that_is_down_counts_as_failed_checks_every_30_seconds(self):
         def checks():

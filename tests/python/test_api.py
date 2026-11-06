@@ -191,12 +191,13 @@ class ApiTest(WebuiCase):
 
     def test_metrics_export_every_supervisor_counter(self):
         self.assertEqual(set(webui.COUNTERS), set(Supervisor(self.store).snapshot()["counters"]))
-        self.sup.overrides = {"counters": {"connect_attempts_total": 3, "health_check_failures_total": 0}}
+        counters = dict(zip(webui.COUNTERS, (3, 2, 1, 5, 0)))
+        self.sup.overrides = {"counters": counters}
         _, raw = self.api("GET", "/metrics")
         lines = raw.decode().splitlines()
         values = {name: float(value) for name, value in (l.split() for l in lines if not l.startswith("#"))}
         types = dict(l.removeprefix("# TYPE ").split() for l in lines if l.startswith("# TYPE "))
-        expected = {"protonvpn_connect_attempts_total": 3, "protonvpn_health_check_failures_total": 0}
+        expected = {"protonvpn_" + name: value for name, value in counters.items()}
         self.assertEqual({k: values[k] for k in expected}, expected)
         self.assertEqual({k: types[k] for k in expected}, dict.fromkeys(expected, "counter"))
 

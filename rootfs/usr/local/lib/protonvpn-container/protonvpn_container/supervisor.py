@@ -131,6 +131,7 @@ class Supervisor:
         self._health_at: float | None = None  # when the current connection's last probe completed
         self._health_error = ""  # that probe's failure; "" when it passed
         self._next_probe = 0.0
+        self._next_outage_check = 0.0  # counting a down tunnel; unlike _next_probe, no state check resets it
         self._health_io = threading.Lock()  # serialises the file writes; taken before _lock
         self._health_published: bool | None = None  # what the file says; None: not written yet, or the write failed
         self._health_write_failed = False
@@ -536,14 +537,15 @@ class Supervisor:
         """Probe without the CLI lock. Echo failure alone is observational; active handshake evidence can queue recovery."""
         now = self._clock()
         with self._lock:
-            if now < self._next_probe:
-                return
+            wanted = self._signed_in and not (self._user_disconnected or self._disconnect_pending or self._stop.is_set())
             if not self._st.connected:
-                if self._signed_in and not (self._user_disconnected or self._disconnect_pending or self._stop.is_set()):
+                if wanted and now >= self._next_outage_check:
                     # A wanted tunnel that is down counts as a failed check, so failure ratios cannot hide an outage.
-                    self._next_probe = now + HEALTH_EVERY
+                    self._next_outage_check = now + HEALTH_EVERY
                     self._counters["health_checks_total"] += 1
                     self._counters["health_check_failures_total"] += 1
+                return
+            if now < self._next_probe:
                 return
             generation = self._health_gen
             self._next_probe = now + HEALTH_EVERY  # also when the probe breaks: it must not spin
@@ -559,8 +561,9 @@ class Supervisor:
             done = self._clock()
             previous, first = self._health_error, self._health_at is None
             self._health_at, self._health_error, self._next_probe = done, error, done + HEALTH_EVERY
-            self._counters["health_checks_total"] += 1
-            self._counters["health_check_failures_total"] += bool(error)
+            if self._signed_in and not (self._user_disconnected or self._disconnect_pending):  # only a wanted tunnel's checks
+                self._counters["health_checks_total"] += 1
+                self._counters["health_check_failures_total"] += bool(error)
             if not error or handshake is None or self._user_disconnected or self._disconnect_pending:
                 self._handshake = self._handshake_since = self._recovery_gen = None
             elif handshake != self._handshake:
