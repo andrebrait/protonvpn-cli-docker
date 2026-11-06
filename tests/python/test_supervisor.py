@@ -2276,3 +2276,96 @@ class ProtocolTest(SupervisorCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CountersTest(HealthCase):
+    def counters(self):
+        return self.sup.snapshot()["counters"]
+
+    def test_connect_attempts_count_failures_and_successes(self):
+        self.make()
+        self.cli.connect_rc = 1
+        self.next_connect()
+        self.next_connect()
+        self.cli.connect_rc = 0
+        self.next_connect()
+        self.assertEqual(
+            (self.counters()["connect_attempts_total"], self.counters()["connect_failures_total"]), (3, 2)
+        )
+        key = self.cli.argvs("connect")[-1]
+        self.cli.connected = False
+        self.cli.during[key] = self.sup.request_disconnect  # canceled while running: neither counter moves
+        self.tick(30)
+        self.assertEqual(len(self.cli.argvs("connect")), 4)
+        self.assertEqual(
+            (self.counters()["connect_attempts_total"], self.counters()["connect_failures_total"]), (3, 2)
+        )
+
+    def test_repeated_state_checks_of_a_down_tunnel_do_not_add_checks(self):
+        self.make()
+        self.tick()
+        self.cli.connected = False
+        self.cli.connect_rc = 1
+        self.tick(30)  # the state check finds it down; the reconnect fails
+        self.probe_now()
+        self.assertEqual(self.counters()["health_check_failures_total"], 1)
+        self.clock.now += 10
+        self.sup._drop_connection()  # what each later state check of the down tunnel does
+        self.probe_now()
+        self.assertEqual(self.counters()["health_check_failures_total"], 1)
+        self.probe_now(20)
+        self.assertEqual(self.counters()["health_check_failures_total"], 2)
+
+    def test_probes_during_a_failed_user_disconnect_are_not_counted(self):
+        self.make()
+        self.tick()
+        self.cli.responses[("disconnect",)] = Result(1, "Error: temporary agent failure\n")
+        self.sup.request_disconnect()
+        self.tick(1)
+        self.assertTrue(self.sup.snapshot()["connected"])  # still up, but no longer wanted
+        self.probe_now(30)
+        self.assertEqual(self.counters()["health_checks_total"], 0)
+
+    def test_a_wanted_tunnel_that_is_down_counts_as_failed_checks_every_30_seconds(self):
+        def checks():
+            return self.counters()["health_checks_total"], self.counters()["health_check_failures_total"]
+
+        self.make()
+        self.tick()
+        self.probe_now()
+        self.assertEqual(checks(), (1, 0))
+        self.tool.responses[PROBE] = TIMED_OUT
+        self.probe_now(30)
+        self.assertEqual(checks(), (2, 1))
+        self.cli.connected = False
+        self.cli.connect_rc = 1
+        self.tick(30)  # the reconnect fails: no tunnel, so no probe
+        calls = self.tool.calls.count(PROBE)
+        for advance, expected in ((0, (3, 2)), (10, (3, 2)), (20, (4, 3))):
+            self.probe_now(advance)
+            self.assertEqual(checks(), expected)
+        self.assertEqual(self.tool.calls.count(PROBE), calls)
+        self.sup.request_disconnect()  # an intentional disconnect is not downtime
+        self.probe_now(30)
+        self.assertEqual(checks(), (4, 3))
+
+    def test_nothing_is_counted_while_signed_out(self):
+        self.cli.signed_in = False
+        self.make()
+        self.tick()
+        self.probe_now()
+        self.probe_now(30)
+        self.assertEqual((self.counters()["health_checks_total"], self.counters()["health_check_failures_total"]), (0, 0))
+
+    def test_each_stalled_tunnel_recovery_is_counted(self):
+        self.make()
+        self.tick()
+        self.tool.responses[PROBE] = TIMED_OUT
+        self.tool.responses[HANDSHAKE] = Result(0, "peer\t0\n")
+        self.probe_now()
+        self.probe_now(150)
+        self.probe_now(30)
+        self.assertEqual(self.counters()["recovery_attempts_total"], 0)
+        self.tick()
+        self.assertEqual(self.counters()["recovery_attempts_total"], 1)
+        self.assertEqual(len(self.cli.argvs("connect")), 2)

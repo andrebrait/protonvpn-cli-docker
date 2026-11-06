@@ -46,6 +46,7 @@ class StubSupervisor:
             "tunnel_healthy": False,
             "health_error": "",
             "health_checked_ago": None,
+            "counters": {},
             **self.overrides,
         }
 
