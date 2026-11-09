@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.0 — 2026-11-09
+
+### Added
+
+- Prometheus-compatible `/metrics` endpoint on the existing HTTP port, exposing connectivity, traffic health and port-forwarding state without sensitive labels. Authentication is required when `WEBUI_PASSWORD` is set; leaving it empty enables open access.
+- Per-direction tunnel byte counters for traffic rates, plus connect, recovery and traffic-check counters for failure ratios and availability monitoring.
+- OpenAPI documentation and scrape configuration examples for the metrics endpoint.
+
+### Fixed
+
+- Stalled VPN tunnels now recover without signing out when failed traffic checks and independently stimulated WireGuard handshakes corroborate a stall for 180 seconds. Recovery preserves credentials, user disconnect intent and retry backoff; an echo-service failure alone does not reconnect.
+- Published-image version checks now remove the previous platform's local image before checking the next architecture.
+- Unraid documentation now links to the renamed Proton VPN template.
+
 ## 0.0.1 — 2026-11-03
 
 ### Added
@@ -8,8 +22,7 @@
 - Responsive light/dark WebUI showing connection, server, location, exit IP, forwarded port and live traffic.
 - Environment-controlled or saved preferences, with environment overrides visibly locked in the WebUI.
 - Versioned JSON API, optional separate bearer key and an OpenAPI 3.1 reference page with key-generation instructions.
-- Independent WireGuard-bound traffic health in the WebUI, API and Docker healthcheck, separate from Proton's connection state. Echo failure alone does not reconnect; 180 seconds of corroborated stalled handshakes triggers bounded recovery without signing out, retaining failed-attempt backoff.
-- Authenticated Prometheus-compatible `/metrics` endpoint for VictoriaMetrics/Prometheus connectivity and traffic-health alerts, with per-direction tunnel byte counters, connect, recovery and traffic-check counters, without sensitive labels.
+- Independent WireGuard-bound traffic health in the WebUI, API and Docker healthcheck, separate from Proton's connection state and without probe-triggered reconnects.
 - Always-on container firewall, fixed Proton Standard kill switch, WireGuard-only connections and renewable TCP/UDP port forwarding.
 - Optional HTTP source-IP allowlist, with unconditional VPN-interface blocking on the control port while forwarded application TCP/UDP traffic remains allowed.
 - Unraid template (in [andrebrait/unraid-templates](https://github.com/andrebrait/unraid-templates)), official Proton VPN icon and amd64/arm64 image builds.
