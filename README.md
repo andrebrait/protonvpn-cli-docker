@@ -10,6 +10,14 @@ Every build installs exactly one reviewed Proton release: **CLI 1.1.0** with **A
 
 **Proton does not officially support headless use.** This project supplies the container integration; an upstream CLI change can break it. It is not affiliated with Proton AG. The icon is Proton AG's trademark, used to identify the Proton VPN service.
 
+## Dependency update proposals
+
+The **Dependency updates** GitHub Actions workflow checks Proton's stable repository and ShellCheck daily at 05:17 UTC, or on manual dispatch. It opens or updates one review PR with newer pins, keeps the Proton repository bootstrap version and SHA256 together, and updates the README's Proton versions. It never proposes downgrades or merges an update automatically.
+
+Dependabot checks GitHub Actions versions and the Debian base image tag weekly. Unpinned Debian packages and the current base image tag continue to receive available updates through the existing weekly rebuild.
+
+The scheduled workflow needs **Settings → Actions → General → Workflow permissions → Allow GitHub Actions to create and approve pull requests** enabled. It uses the repository's `GITHUB_TOKEN`; no personal token is required. It explicitly dispatches CI on the update branch because token-created PRs do not trigger normal PR workflows. Review the CI run and upstream release notes before approving or merging.
+
 ## Requirements and compatibility
 
 - Linux Docker host with cgroup v2, the `xt_cgroup` iptables match, WireGuard kernel support (`wireguard`), `/dev/net/tun`, Linux pidfd support and readable procfs for identity-safe daemon shutdown.

@@ -1,0 +1,55 @@
+name: Dependency updates
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependency-updates
+  cancel-in-progress: false
+
+jobs:
+  check:
+    if: github.repository == 'andrebrait/protonvpn-cli-docker'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Check reviewed dependency pins
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/check_updates.py
+      - uses: peter-evans/create-pull-request@v8
+        id: pr
+        with:
+          token: ${{ github.token }}
+          branch: automation/dependency-updates
+          commit-message: 'chore: update Proton and ShellCheck pins'
+          title: 'Update Proton and ShellCheck pins'
+          body: |
+            New stable upstream versions were detected by the scheduled dependency check.
+
+            Review the version changes and Proton bootstrap checksum in the diff.
+            CI is dispatched explicitly because pull requests created with GITHUB_TOKEN do not trigger pull_request workflows.
+            Review upstream release notes and CLI compatibility before approving and merging. This workflow never auto-merges.
+          reviewers: andrebrait
+          add-paths: |
+            Dockerfile
+            README.md
+            tests/lint.sh
+      - name: Run CI for the proposed update
+        if: steps.pr.outputs.pull-request-operation == 'created' || steps.pr.outputs.pull-request-operation == 'updated'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run ci.yml --ref automation/dependency-updates

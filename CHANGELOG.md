@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Daily review-only update PRs for pinned Proton packages, the repository bootstrap checksum and ShellCheck, plus weekly Dependabot PRs for GitHub Actions and the Debian base image.
+
 ## 0.1.0 — 2026-11-09
 
 ### Added
