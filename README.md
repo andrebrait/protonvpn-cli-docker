@@ -6,7 +6,7 @@ Run the official Proton VPN CLI in Docker, with a WebUI and a shared VPN network
 
 The image uses Debian 13 slim and includes the CLI, NetworkManager, WireGuard tools, firewall tools, and all runtime dependencies at build time. It does not install packages on startup. A supervisor manages connections and NAT-PMP port forwarding; the WebUI handles sign-in, settings, status, and traffic.
 
-Every build installs exactly one reviewed Proton release: **CLI 1.1.0** with **API core 6.1.1**, pinned in the [`Dockerfile`](Dockerfile) and printed in the build output. A new Proton release is adopted by changing those pins after it is tested, never by merely rebuilding. Published tags are `latest` and, for each release, `X.Y.Z` and `X.Y` (the first is `0.0.1`). The Debian 13 slim base is refreshed at every build.
+Every build installs exactly one reviewed Proton release: **CLI 1.1.0** with **API core 6.1.1**, pinned in the [`Dockerfile`](Dockerfile) and printed in the build output. A new Proton release is adopted by changing those pins after it is tested, never by merely rebuilding. Published tags are `latest` and, for each release, `X.Y.Z` and `X.Y` (currently `0.1.0` and `0.1`). The Debian 13 slim base is refreshed at every build.
 
 **Proton does not officially support headless use.** This project supplies the container integration; an upstream CLI change can break it. It is not affiliated with Proton AG. The icon is Proton AG's trademark, used to identify the Proton VPN service.
 
