@@ -4,7 +4,7 @@
 
 ### Added
 
-- Authenticated Prometheus-compatible `/metrics` endpoint on the existing HTTP port, exposing connectivity, traffic health and port-forwarding state without sensitive labels.
+- Prometheus-compatible `/metrics` endpoint on the existing HTTP port, exposing connectivity, traffic health and port-forwarding state without sensitive labels. Authentication is required when `WEBUI_PASSWORD` is set; leaving it empty enables open access.
 - Per-direction tunnel byte counters for traffic rates, plus connect, recovery and traffic-check counters for failure ratios and availability monitoring.
 - OpenAPI documentation and scrape configuration examples for the metrics endpoint.
 
