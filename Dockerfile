@@ -6,7 +6,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 # (https://protonvpn.com/support/linux-vpn-debian-ubuntu); change it together with PROTON_RELEASE_VERSION.
 ARG PROTON_RELEASE_VERSION=1.0.10
 ARG PROTON_RELEASE_SHA256=c8a9fffb4ebdd63db08ce7f11c9b0ac394064ae6a210feb9ab63a0f7d8d060a7
-ARG PROTON_CLI_VERSION=1.1.0
+ARG PROTON_CLI_VERSION=1.1.1
 ARG PROTON_API_CORE_VERSION=6.1.1
 
 # proton-vpn-daemon only provides split tunneling (unsupported by the CLI) and pulls BCC/LLVM; satisfy it with an empty package.
