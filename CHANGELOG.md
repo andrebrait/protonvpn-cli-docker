@@ -1,10 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.1.1 — 2026-11-17
 
 ### Added
 
 - Daily review-only update PRs for pinned Proton packages, the repository bootstrap checksum and ShellCheck, plus weekly Dependabot PRs for GitHub Actions and the Debian base image.
+
+### Changed
+
+- Updated the pinned Proton VPN CLI package (`PROTON_CLI_VERSION`) from `1.1.0` to `1.1.1`.
 
 ## 0.1.0 — 2026-11-09
 
